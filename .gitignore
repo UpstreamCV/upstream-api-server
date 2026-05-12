@@ -1,11 +1,25 @@
-node_modules/
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
 dist/
-*.log
-.DS_Store
+build/
 
+# Env
 .env
 .env.local
 .env.*.local
 
+# OS / editor
+.DS_Store
+*.log
+
+# Supabase
 supabase/.branches/
 supabase/.temp/
