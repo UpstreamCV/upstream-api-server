@@ -41,10 +41,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or get_settings()
     configure_logging(level=settings.log_level, json_logs=settings.is_production)
 
+    # Interactive docs (Swagger UI, ReDoc) are dev-only. The machine-readable
+    # OpenAPI spec is always available for tooling (Postman, codegen, etc.).
     app = FastAPI(
         title="Upstream API",
         version="0.1.0",
         lifespan=lifespan,
+        docs_url=None if settings.is_production else "/docs",
+        redoc_url=None if settings.is_production else "/redoc",
+        openapi_url="/openapi.json",
     )
     app.state.settings = settings
 

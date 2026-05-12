@@ -20,6 +20,12 @@ api.upstreamcv.com {
     encode zstd gzip
     request_header X-Real-IP {http.request.remote.host}
 
+    # JSON request bodies cap at 1 MiB. Phase 3 will need a larger cap on
+    # /v1/snapshots; add a matcher then.
+    request_body {
+        max_size 1MB
+    }
+
     @public path / /healthz /readyz /docs /openapi.json
     rate_limit @public {
         zone public_burst {

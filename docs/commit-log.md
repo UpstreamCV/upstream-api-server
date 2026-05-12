@@ -4,6 +4,31 @@ Reverse chronological. Newest at top. Every meaningful commit gets an entry foll
 
 ---
 
+## 2026-05-12 - Disable interactive docs in production + cap request body at 1 MB
+
+### Summary
+Two hardening tweaks. (1) `/docs` (Swagger UI) and `/redoc` are now 404 when `UPSTREAM_ENVIRONMENT=production`; both stay on in development. `/openapi.json` is kept available everywhere so tooling (Postman, codegen, the future agent SDK) can still introspect the schema. (2) Caddy now rejects any request body over 1 MiB with HTTP 413 before forwarding to FastAPI — a body-size DoS guard since pydantic doesn't enforce one and `metadata: dict[str, Any]` fields are unbounded.
+
+### Files touched
+- `src/upstream_api/app.py` — `FastAPI(...)` constructor now sets `docs_url=None` / `redoc_url=None` when `settings.is_production`, leaving `openapi_url="/openapi.json"` always on.
+- `deploy/Caddyfile` — added `request_body { max_size 1MB }` inside the `api.upstreamcv.com` site block.
+
+### System interaction notes
+The interactive Swagger UI was the friendliest abuse surface — anyone could paste a stolen token into the "Authorize" button and start firing requests. Closing it doesn't add real protection (the token is still the actual gate) but cuts off lazy/scripted abuse. The 1 MB body cap is enforced at Caddy so a malicious 100 MB body is dropped at the edge before consuming any FastAPI process memory. When `/v1/snapshots` lands in Phase 3, that endpoint will need a higher cap via a Caddy matcher — noted as a TODO.
+
+### Testing/checks
+- `ruff check`, `ruff format --check`, `mypy --strict`, `pytest -q` clean (26 tests).
+- After deploy:
+  - `GET /` → 200, `GET /openapi.json` → 200, `GET /healthz` → 200.
+  - `GET /docs` → 404, `GET /redoc` → 404.
+  - `POST /v1/agents/register` with a 2 MB body → HTTP 413 from Caddy (does not reach FastAPI).
+
+### Follow-up TODOs
+- Raise the body-size cap on `/v1/snapshots` (Phase 3) via a Caddy matcher — the global default is too small for a JPEG frame upload.
+- Consider switching pydantic models from `extra="ignore"` (default) to `extra="forbid"` for a stricter contract; trade-off is forward compatibility for explicit-contract clarity.
+
+---
+
 ## 2026-05-12 - Caddy IP rate limiting (custom build with caddy-ratelimit plugin)
 
 ### Summary
