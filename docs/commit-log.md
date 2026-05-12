@@ -4,6 +4,26 @@ Reverse chronological. Newest at top. Every meaningful commit gets an entry foll
 
 ---
 
+## 2026-05-12 - Add top-level README
+
+### Summary
+Wrote a comprehensive README at the repo root. Acts as the entry point for new contributors and coding agents: explains the service's role in the wider Upstream architecture, the stack, a copy-pasteable quickstart, the project layout, the Make targets, where each doc lives, the env-var inventory, and the current phase status. All deep content stays in `docs/`; the README only summarizes and links.
+
+### Files touched
+- `README.md` — new.
+
+### System interaction notes
+No runtime change. The README enforces the docs-per-commit policy by pointing every reader at `docs/commit-log.md` and the per-area docs, so a newcomer follows the doc map rather than reading code.
+
+### Testing/checks
+- Eyeballed for broken doc links (all five `docs/*.md` references resolve to files that exist).
+- No code touched; CI checks unaffected.
+
+### Follow-up TODOs
+- Add a CI badge once the GitHub Actions workflow has run at least once on `main`.
+
+---
+
 ## 2026-05-12 - ruff format pass + recorded api.upstreamcv.com DNS pointer
 
 ### Summary
