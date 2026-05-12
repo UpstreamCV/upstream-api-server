@@ -1,0 +1,28 @@
+# Production Caddyfile. Caddy auto-fetches a Let's Encrypt cert for the host
+# below on first request; cert renewal is automatic. ACME email is set per-host
+# so Let's Encrypt can contact us about expiring certs.
+
+{
+    email ops@upstreamcv.com
+}
+
+api.upstreamcv.com {
+    encode zstd gzip
+
+    # Forward useful client info to FastAPI. The default reverse_proxy already
+    # sets X-Forwarded-For / X-Forwarded-Proto, so we only add Real-IP for
+    # convenience in logs.
+    request_header X-Real-IP {http.request.remote.host}
+
+    reverse_proxy api:4000 {
+        # Bubble up health-check failures rather than hanging.
+        fail_duration 30s
+        max_fails 3
+    }
+
+    log {
+        output stdout
+        format console
+        level INFO
+    }
+}

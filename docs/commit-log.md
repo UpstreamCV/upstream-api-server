@@ -4,6 +4,92 @@ Reverse chronological. Newest at top. Every meaningful commit gets an entry foll
 
 ---
 
+## 2026-05-12 - Fix gunicorn control-socket permission warning
+
+### Summary
+gunicorn 26+ writes a control socket at `$HOME/.gunicorn/...` on startup. The runtime stage of the Dockerfile chowns the copied files to `app:app` but not `/app` itself (created by `WORKDIR` as root), so the non-root `app` user couldn't write to its home. Added `RUN chown app:app /app` after the COPY. Rebuilt the image on the box, redeployed — the `Permission denied: '/app/.gunicorn'` line is replaced by `Control socket listening at /app/.gunicorn/gunicorn.ctl`.
+
+### Files touched
+- `Dockerfile` — one new `RUN chown app:app /app` in the runtime stage, with a comment explaining the WORKDIR vs COPY ownership quirk.
+
+### System interaction notes
+No behaviour change for the API itself. Cleans up startup logs and gives gunicorn's runtime control plumbing a place to live.
+
+### Testing/checks
+- `docker compose build api && docker compose up -d` on the box.
+- API container restarts healthy; no permission denied line in `docker compose logs api`.
+- `curl https://api.upstreamcv.com/healthz` still returns `{"status":"ok"}`.
+
+### Follow-up TODOs
+None for this one.
+
+---
+
+## 2026-05-12 - First production deploy — api.upstreamcv.com live behind Let's Encrypt
+
+### Summary
+With `deploy/.env` filled in from the Supabase dashboard (project URL, publishable key, secret key, asymmetric JWT key id, session-pooler DB URL), `docker compose build api && docker compose up -d` brought the stack up on the EC2 host. Caddy obtained a Let's Encrypt cert for `api.upstreamcv.com` on the first request; `/healthz` and `/readyz` return 200 from the public internet. `/readyz` confirms the box reaches Supabase Postgres via the session pooler.
+
+### Files touched
+None. This is the runtime bring-up of artifacts already committed (`deploy/docker-compose.yml`, `deploy/Caddyfile`, `Dockerfile`).
+
+### System interaction notes
+- Build path: `uv sync --frozen --no-dev` in the builder stage, then `COPY --from=builder` into the slim runtime layer. Image tag `upstream-api:latest` on the host.
+- Stack: Caddy (host ports 80/443) → docker network `internal` → `api:4000` (gunicorn + 2 uvicorn workers). Caddy waits on the api healthcheck before accepting traffic.
+- Lifespan opens the asyncpg pool against the Supabase session-pooler URL successfully → DB reachable.
+- Non-fatal log at startup: `Control server error: [Errno 13] Permission denied: '/app/.gunicorn'`. gunicorn 26 tries to create a control socket in `$HOME`; the non-root `app` user can't write to `/app` because the Dockerfile chowns `/app/*` but not `/app` itself. Harmless — gunicorn still serves traffic.
+
+### Testing/checks
+- `docker compose ps`: `upstream-api-api-1` Up healthy, `upstream-api-caddy-1` Up.
+- `curl https://api.upstreamcv.com/healthz` → `{"status":"ok"}`, HTTP 200, TLS verified.
+- `curl https://api.upstreamcv.com/readyz` → `{"status":"ok"}` (DB ping ≤500 ms).
+
+### Follow-up TODOs
+- Silence the gunicorn control-server warning (`RUN chown app:app /app` in the runtime stage, or `gunicorn.conf.py` pointing pidfile/socket at a writable path).
+- Add a systemd unit so `docker compose up -d` runs on host boot.
+- Migrate `deploy/.env` secrets into AWS Systems Manager Parameter Store; source at container start.
+- Update `security/supabase_jwt.py` to verify via JWKS when Phase 4 dashboard reads land (Supabase project is on asymmetric signing).
+- Add CloudWatch metrics / alarm on the host (disk / cpu / memory).
+
+---
+
+## 2026-05-12 - Add deploy config (docker-compose + Caddy) + prep EC2 host
+
+### Summary
+Wrote the deploy configuration that runs the API in production: a `deploy/` folder containing `docker-compose.yml` (FastAPI built from the project `Dockerfile` + Caddy 2 fronting it), a `Caddyfile` for `api.upstreamcv.com` with automatic Let's Encrypt, and `.env.production.example` documenting every variable. On the EC2 host, installed git + docker + docker compose v2, cloned the repo via the new deploy key, copied the deploy config in, and generated a real `.env` with random internal secrets pre-filled. Supabase values are still placeholders pending dashboard paste.
+
+### Files touched
+- `deploy/docker-compose.yml` — new. Two services (`api`, `caddy`), internal docker network, named volumes for Caddy data/config, healthcheck on the api container so Caddy waits for it.
+- `deploy/Caddyfile` — new. Reverse-proxies `api.upstreamcv.com` → `api:4000` with HSTS, request logging, zstd/gzip encode, fail-fast on backend errors.
+- `deploy/.env.production.example` — new. Documents every `UPSTREAM_*` variable with where to source it.
+- `.gitignore` — added `deploy/.env` so secrets never land in git.
+- `docs/deployment.md` — replaced the "what is on the box" stub with a real inventory of what's installed and the first-time bring-up command.
+
+### On the EC2 host
+- `dnf install git docker` + enable docker + add `ec2-user` to the docker group.
+- Installed docker compose v2.32.4 to `/usr/local/lib/docker/cli-plugins/`.
+- `git clone git@github.com:UpstreamCV/upstream-api-server.git` via the deploy key (GitHub auth verified `Hi UpstreamCV/upstream-api-server!`).
+- `scp`'d the three deploy files to `~ec2-user/upstream-api-server/deploy/`.
+- Wrote `deploy/.env` with random `UPSTREAM_SESSION_JWT_SECRET`, `UPSTREAM_STREAMID_HMAC_KEY`, `UPSTREAM_MEDIAMTX_WEBHOOK_SECRET`, `UPSTREAM_PROCESSOR_WEBHOOK_SECRET`, `UPSTREAM_PROMETHEUS_AUTH_TOKEN` (each `secrets.token_urlsafe(32)`). Mode 0600.
+
+### System interaction notes
+The Caddy reverse-proxy sits in front of FastAPI/gunicorn. Caddy is the only thing bound to public ports (80/443); the API container exposes 4000 only on the internal docker network. TLS is fully Caddy's responsibility — first request to `https://api.upstreamcv.com` triggers a Let's Encrypt HTTP-01 challenge over port 80, after which the cert is cached in the `caddy_data` named volume.
+
+### Testing/checks
+- `docker --version`, `docker compose version` on the box — OK.
+- `ssh -T git@github.com` from the box — `Hi UpstreamCV/upstream-api-server!`.
+- Box repo `git log --oneline -3` matches the GitHub remote.
+- Stack not yet started — pending Supabase secrets in `.env`.
+
+### Follow-up TODOs
+- User pastes Supabase values into `deploy/.env` on the box (URL, ANON_KEY, SERVICE_ROLE_KEY, JWT_SECRET, DATABASE_URL).
+- `docker compose up -d` to bring the stack up and observe Caddy issuing a Let's Encrypt cert.
+- Add a systemd unit so the stack restarts on host reboot.
+- Move secrets out of the on-disk `.env` and into AWS Systems Manager Parameter Store (Phase 7-ish hardening).
+- Create an IAM user `upstream-deploy` and rotate the root AWS credentials currently in use.
+
+---
+
 ## 2026-05-12 - Add top-level README
 
 ### Summary
