@@ -4,6 +4,53 @@ Reverse chronological. Newest at top. Every meaningful commit gets an entry foll
 
 ---
 
+## 2026-05-12 - Caddy IP rate limiting (custom build with caddy-ratelimit plugin)
+
+### Summary
+Built a small custom Caddy image with the official `caddy-ratelimit` plugin baked in via `xcaddy`, swapped it in for `caddy:2-alpine` in `deploy/docker-compose.yml`, and wired two IP-keyed zones in the Caddyfile: `public_burst` (30 req/min/IP on `/`, `/healthz`, `/readyz`, `/docs`, `/openapi.json`) and `api_per_ip` (600 req/min/IP on `/v1/*`). This is coarse defense-in-depth so a single bot can't burn CPU by hammering anonymous endpoints; per-token application limits will land in Phase 6 via slowapi.
+
+### Files touched
+- `deploy/caddy/Dockerfile` — new. Two-stage build using `caddy:2-builder` + `xcaddy build --with github.com/mholt/caddy-ratelimit`, output copied into `caddy:2-alpine`.
+- `deploy/docker-compose.yml` — `caddy` service now `build`s from `./caddy` and tags `upstream-caddy:latest` instead of pulling `caddy:2-alpine`.
+- `deploy/Caddyfile` — added `order rate_limit before basicauth` in the global block; declared `@public` and `@api` matchers with their own `rate_limit { zone … }` directives.
+
+### System interaction notes
+Rate limiting happens at Caddy before the request ever reaches the FastAPI container. The plugin uses in-process storage — fine for one Caddy instance; needs a distributed backend (Redis) once we horizontally scale Caddy. Zone keys are `{http.request.remote.host}` (the client's real public IP at the edge). Caddy returns 429 with no body on limit exceeded — clients can inspect `Retry-After` header (the plugin sets it automatically).
+
+### Testing/checks
+- `docker compose build caddy` succeeded; image `upstream-caddy:latest` produced.
+- `docker compose up -d` swapped Caddy with no API downtime; api container stayed healthy throughout.
+- Burst test against `/healthz`: requests 1–30 → HTTP 200, requests 31–32 → HTTP 429 (matches the 30 events / 1 min config).
+- `/v1/*` request from the same caller IP during the burst still routed through to FastAPI (returned 404 because `/v1/anything-here` doesn't exist) — confirming the two zones are independent.
+- Local `ruff` + `mypy --strict` + `pytest -q` still clean (no app-side change).
+
+### Follow-up TODOs
+- Per-token application rate limits via slowapi (Phase 6).
+- When we go multi-Caddy, point `rate_limit` at a Redis backend (the plugin supports it).
+
+---
+
+## 2026-05-12 - Add GET / service-info endpoint
+
+### Summary
+Anyone hitting `https://api.upstreamcv.com/` used to get a 404. Added a small landing endpoint that returns the service name, version, environment, and pointers to `/docs`, `/openapi.json`, `/healthz`, `/readyz`.
+
+### Files touched
+- `src/upstream_api/routers/admin.py` — added `GET /` returning a service-info dict. Pulls version from `upstream_api.__version__` and environment from `app.state.settings`.
+- `tests/test_app_routes.py` — added `/:GET` to the expected-routes set.
+
+### System interaction notes
+No new dependencies, no DB access. Lives on the existing `admin` router, so it inherits the same middleware chain. Doesn't reveal anything beyond what FastAPI's OpenAPI doc already would. Cached as a normal handler — no special caching needed.
+
+### Testing/checks
+- `ruff check`, `ruff format --check`, `mypy --strict`, `pytest -q` all clean (26 tests).
+- After rebuild on the box: `curl https://api.upstreamcv.com/` returns the JSON above, HTTP 200.
+
+### Follow-up TODOs
+None.
+
+---
+
 ## 2026-05-12 - Fix gunicorn control-socket permission warning
 
 ### Summary

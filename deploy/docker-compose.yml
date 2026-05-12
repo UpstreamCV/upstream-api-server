@@ -19,7 +19,10 @@ services:
       start_period: 10s
 
   caddy:
-    image: caddy:2-alpine
+    build:
+      context: ./caddy
+      dockerfile: Dockerfile
+    image: upstream-caddy:latest
     restart: always
     ports:
       - "80:80"

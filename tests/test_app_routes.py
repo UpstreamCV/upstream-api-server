@@ -7,6 +7,7 @@ def test_expected_routes_are_mounted() -> None:
     app = create_app()
     paths = {f"{r.path}:{','.join(sorted(r.methods or set()))}" for r in app.routes}  # type: ignore[attr-defined]
     expected = {
+        "/:GET",
         "/healthz:GET",
         "/readyz:GET",
         "/v1/agents/register:POST",
