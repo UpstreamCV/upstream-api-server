@@ -1,0 +1,1 @@
+-- Seed data for local Supabase. Runs on `supabase db reset`.
