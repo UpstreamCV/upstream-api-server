@@ -34,15 +34,55 @@ User is `ec2-user`. Password authentication is disabled by default on AL2023.
 
 ## What is on the box
 
-_Nothing yet besides the AL2023 base image._ Next steps (not yet executed):
+Installed as of 2026-05-12:
+- `git` (2.50.1)
+- `docker` (25.0.14) — daemon enabled at boot
+- `docker compose` plugin v2 — installed at `/usr/local/lib/docker/cli-plugins/docker-compose`
+- `ec2-user` added to the `docker` group
+- Repo cloned to `~ec2-user/upstream-api-server` via deploy key (GitHub: read-only)
 
-1. Install Docker + docker-compose plugin.
-2. Install Caddy for TLS termination.
-3. Add the FastAPI service via `docker-compose.yml` + a Caddyfile.
-4. Pull `UPSTREAM_*` secrets from AWS Systems Manager Parameter Store on boot.
-5. Add a systemd unit to start the stack at boot.
+Deploy config (also tracked in the repo at `deploy/`):
+- `~ec2-user/upstream-api-server/deploy/docker-compose.yml` — `api` (FastAPI built from `Dockerfile`) + `caddy` (TLS termination, ports 80/443)
+- `~ec2-user/upstream-api-server/deploy/Caddyfile` — reverse-proxies `api.upstreamcv.com` to the `api` container on port 4000; auto Let's Encrypt
+- `~ec2-user/upstream-api-server/deploy/.env` — production secrets, mode 0600, **not in git**
 
-Once installed, this section will list the systemd units, the Caddyfile location, the Parameter Store paths, and the deploy command.
+Not yet installed (planned):
+- systemd unit so `docker compose` comes up on reboot (today: manual `docker compose up -d`)
+- AWS Systems Manager Parameter Store for secrets (today: secrets live in the `.env` file on disk)
+- Automatic deploys on push to `main` (today: manual `git pull && docker compose up -d --build`)
+
+## Bringing the stack up the first time
+
+After `deploy/.env` has all real values (random secrets are pre-filled; Supabase values come from the dashboard):
+
+```sh
+ssh -i <ssh-key> ec2-user@<api-ip>
+cd ~/upstream-api-server/deploy
+docker compose build api
+docker compose up -d
+docker compose logs -f
+```
+
+In a separate shell:
+
+```sh
+# DNS check
+dig +short api.upstreamcv.com  # → <api-ip>
+
+# TLS cert is acquired automatically on the first https request
+curl -v https://api.upstreamcv.com/healthz
+```
+
+## Updating the running service
+
+```sh
+cd ~/upstream-api-server
+git pull
+cd deploy
+docker compose up -d --build api
+```
+
+Caddy keeps running; only the `api` container restarts.
 
 ## Pointing a domain
 
