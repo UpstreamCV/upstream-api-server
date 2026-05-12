@@ -58,7 +58,8 @@ async def register_agent(
         version=row["version"],
         os=row["os"],
         python_version=row["python_version"],
-        capabilities=row["capabilities"] if isinstance(row["capabilities"], dict)
+        capabilities=row["capabilities"]
+        if isinstance(row["capabilities"], dict)
         else json.loads(row["capabilities"]),
         status=row["status"],
         last_seen_at=row["last_seen_at"],

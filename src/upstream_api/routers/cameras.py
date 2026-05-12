@@ -30,7 +30,8 @@ def _camera_to_response(row: dict) -> CameraResponse:  # type: ignore[type-arg]
         default_fps=row["default_fps"],
         default_codec=row["default_codec"],
         default_bitrate_kbps=row["default_bitrate_kbps"],
-        metadata=row["metadata"] if isinstance(row["metadata"], dict)
+        metadata=row["metadata"]
+        if isinstance(row["metadata"], dict)
         else json.loads(row["metadata"]),
         status=row["status"],
         created_at=row["created_at"],
@@ -99,9 +100,17 @@ async def register_camera(
                           default_width, default_height, default_fps, default_codec,
                           default_bitrate_kbps, metadata, status, created_at, updated_at
                 """,
-                auth.account_id, body.agent_id, body.name, body.external_id, body.device_path,
-                body.default_width, body.default_height, body.default_fps, body.default_codec,
-                body.default_bitrate_kbps, json.dumps(body.metadata),
+                auth.account_id,
+                body.agent_id,
+                body.name,
+                body.external_id,
+                body.device_path,
+                body.default_width,
+                body.default_height,
+                body.default_fps,
+                body.default_codec,
+                body.default_bitrate_kbps,
+                json.dumps(body.metadata),
             )
         else:
             row = await conn.fetchrow(
@@ -120,9 +129,16 @@ async def register_camera(
                           default_width, default_height, default_fps, default_codec,
                           default_bitrate_kbps, metadata, status, created_at, updated_at
                 """,
-                existing["id"], auth.account_id, body.name, body.device_path,
-                body.default_width, body.default_height, body.default_fps, body.default_codec,
-                body.default_bitrate_kbps, json.dumps(body.metadata),
+                existing["id"],
+                auth.account_id,
+                body.name,
+                body.device_path,
+                body.default_width,
+                body.default_height,
+                body.default_fps,
+                body.default_codec,
+                body.default_bitrate_kbps,
+                json.dumps(body.metadata),
             )
 
     assert row is not None

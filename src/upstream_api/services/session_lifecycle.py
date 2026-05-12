@@ -93,15 +93,11 @@ async def start_session(
             code="camera_already_streaming",
         )
 
-    approved = await check_session_start(
-        conn, account_id=account_id, requested=requested
-    )
+    approved = await check_session_start(conn, account_id=account_id, requested=requested)
 
     session_id = uuid4()
     jti = uuid4()
-    expires_at = datetime.now(tz=UTC) + timedelta(
-        seconds=settings.session_token_ttl_seconds
-    )
+    expires_at = datetime.now(tz=UTC) + timedelta(seconds=settings.session_token_ttl_seconds)
 
     session_token, claims = mint_session_token(
         secret=settings.session_jwt_secret.get_secret_value(),
@@ -138,10 +134,24 @@ async def start_session(
         )
         returning id, state, expires_at, started_at, ended_at
         """,
-        session_id, account_id, agent_id, camera_id,
-        requested.width, requested.height, requested.fps, requested.codec, requested.bitrate_kbps,
-        approved.width, approved.height, approved.fps, approved.codec, approved.bitrate_kbps,
-        streamid, srt_url, jti, expires_at,
+        session_id,
+        account_id,
+        agent_id,
+        camera_id,
+        requested.width,
+        requested.height,
+        requested.fps,
+        requested.codec,
+        requested.bitrate_kbps,
+        approved.width,
+        approved.height,
+        approved.fps,
+        approved.codec,
+        approved.bitrate_kbps,
+        streamid,
+        srt_url,
+        jti,
+        expires_at,
     )
     assert row is not None  # insert ... returning always returns a row
 
@@ -208,7 +218,8 @@ async def stop_session(
              where id = $1
              returning state, ended_at
             """,
-            session_id, reason,
+            session_id,
+            reason,
         )
         assert updated is not None
         state = updated["state"]
@@ -243,15 +254,17 @@ async def stop_session(
         started_at=row["started_at"],
         ended_at=ended_at,
         requested=RequestedStream(
-            width=row["req_width"], height=row["req_height"],
-            fps=row["req_fps"], codec=row["req_codec"],
+            width=row["req_width"],
+            height=row["req_height"],
+            fps=row["req_fps"],
+            codec=row["req_codec"],
             bitrate_kbps=row["req_bitrate_kbps"],
         ),
         approved=LimitsSnapshot(
-            width=row["lim_width"], height=row["lim_height"],
-            fps=row["lim_fps"], codec=row["lim_codec"],
+            width=row["lim_width"],
+            height=row["lim_height"],
+            fps=row["lim_fps"],
+            codec=row["lim_codec"],
             bitrate_kbps=row["lim_bitrate_kbps"],
         ),
     )
-
-

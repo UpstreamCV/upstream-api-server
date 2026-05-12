@@ -130,12 +130,18 @@ async def get_session(
         started_at=row["started_at"],
         ended_at=row["ended_at"],
         requested=RequestedStream(
-            width=row["req_width"], height=row["req_height"], fps=row["req_fps"],
-            codec=row["req_codec"], bitrate_kbps=row["req_bitrate_kbps"],
+            width=row["req_width"],
+            height=row["req_height"],
+            fps=row["req_fps"],
+            codec=row["req_codec"],
+            bitrate_kbps=row["req_bitrate_kbps"],
         ),
         approved=LimitsSnapshot(
-            width=row["lim_width"], height=row["lim_height"], fps=row["lim_fps"],
-            codec=row["lim_codec"], bitrate_kbps=row["lim_bitrate_kbps"],
+            width=row["lim_width"],
+            height=row["lim_height"],
+            fps=row["lim_fps"],
+            codec=row["lim_codec"],
+            bitrate_kbps=row["lim_bitrate_kbps"],
         ),
     )
     return _row_to_response(streamsession)

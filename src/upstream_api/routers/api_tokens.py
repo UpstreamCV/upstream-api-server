@@ -55,8 +55,14 @@ async def create_token(
             returning id, account_id, name, prefix, last_four, scopes,
                       last_used_at, expires_at, revoked_at, created_at
             """,
-            body.account_id, body.name, issued.prefix, issued.hash, issued.last_four,
-            body.scopes, body.expires_at, user.user_id,
+            body.account_id,
+            body.name,
+            issued.prefix,
+            issued.hash,
+            issued.last_four,
+            body.scopes,
+            body.expires_at,
+            user.user_id,
         )
     assert row is not None
 
