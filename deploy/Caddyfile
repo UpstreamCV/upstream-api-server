@@ -1,21 +1,44 @@
 # Production Caddyfile. Caddy auto-fetches a Let's Encrypt cert for the host
 # below on first request; cert renewal is automatic. ACME email is set per-host
 # so Let's Encrypt can contact us about expiring certs.
+#
+# Rate limiting is provided by the caddy-ratelimit plugin baked into our
+# custom Caddy build (see deploy/caddy/Dockerfile). Two zones:
+#   - public_burst — anon landing + health endpoints, 30 req/min/IP. Well
+#                    above any real monitor; well below what one bot can flood.
+#   - api_per_ip   — /v1/* endpoints, 600 req/min/IP. Leaves headroom for
+#                    many cameras heart-beating from a single office NAT.
+# Per-token rate limits will land in FastAPI via slowapi in Phase 6; these
+# IP-level limits are defense-in-depth, not the primary boundary.
 
 {
     email ops@upstreamcv.com
+    order rate_limit before basicauth
 }
 
 api.upstreamcv.com {
     encode zstd gzip
-
-    # Forward useful client info to FastAPI. The default reverse_proxy already
-    # sets X-Forwarded-For / X-Forwarded-Proto, so we only add Real-IP for
-    # convenience in logs.
     request_header X-Real-IP {http.request.remote.host}
 
+    @public path / /healthz /readyz /docs /openapi.json
+    rate_limit @public {
+        zone public_burst {
+            key    {http.request.remote.host}
+            events 30
+            window 1m
+        }
+    }
+
+    @api path /v1/*
+    rate_limit @api {
+        zone api_per_ip {
+            key    {http.request.remote.host}
+            events 600
+            window 1m
+        }
+    }
+
     reverse_proxy api:4000 {
-        # Bubble up health-check failures rather than hanging.
         fail_duration 30s
         max_fails 3
     }
