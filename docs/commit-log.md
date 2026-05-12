@@ -4,6 +4,65 @@ Reverse chronological. Newest at top. Every meaningful commit gets an entry foll
 
 ---
 
+## 2026-05-12 - ruff format pass + recorded api.upstreamcv.com DNS pointer
+
+### Summary
+CI's `ruff format --check` step caught five files that I had only run `ruff check` against locally. Applied `ruff format` (no semantic changes, only line breaks / argument wrapping). Also recorded that `api.upstreamcv.com` now has an A record pointing at the EC2 Elastic IP `18.225.104.21`.
+
+### Files touched
+- `src/upstream_api/routers/agents.py` — formatter line-wrapping only.
+- `src/upstream_api/routers/api_tokens.py` — formatter line-wrapping only.
+- `src/upstream_api/routers/cameras.py` — formatter line-wrapping only.
+- `src/upstream_api/routers/stream_sessions.py` — formatter line-wrapping only.
+- `src/upstream_api/services/session_lifecycle.py` — formatter line-wrapping only.
+- `docs/deployment.md` — recorded `api.upstreamcv.com` A record + updated the "Pointing a domain" section.
+
+### System interaction notes
+None — no runtime behavior changed. The DNS pointer is informational; nothing on the EC2 box is actually serving on 80/443 yet, so `https://api.upstreamcv.com` won't resolve to anything useful until Caddy is installed and the API is deployed.
+
+### Testing/checks
+- `ruff format --check src tests` → clean.
+- `ruff check src tests` → clean.
+- `mypy --strict src tests` → clean (41 files).
+- `pytest -q` → 26 passed.
+
+### Follow-up TODOs
+- Locally I should make a habit of running `make format` (or `ruff format`) before pushing; CI was the wrong place to catch this.
+
+---
+
+## 2026-05-12 - Provisioned production EC2 host on AWS
+
+### Summary
+Stood up the production hosting target on AWS us-east-2: one t4g.small ARM instance running AL2023, fronted by a stable Elastic IP, behind a fresh security group that allows SSH/HTTP/HTTPS from the public internet. Nothing is installed on the box yet — this commit is just the bare infrastructure. Full resource inventory lives in `docs/deployment.md`.
+
+### Files touched
+- `docs/deployment.md` — new. Source of truth for the deployed infra: instance ID, AMI, IP, security group, key pair, SSH command, teardown playbook.
+
+### Resources created (AWS)
+- Key pair `upstream-api` (ed25519). Private key at `~/.ssh/upstream-api.pem` mode 0400.
+- Security group `sg-0236c95fe7b168503` (`upstream-api-sg`): ingress 22/80/443 from `0.0.0.0/0`.
+- Elastic IP `eipalloc-00c601da170d052ae` → `18.225.104.21`.
+- Instance `i-07434302e4b0785e8` (t4g.small, AL2023 ARM64, 16 GiB gp3, IMDSv2-only).
+
+### System interaction notes
+The instance is empty — no Docker, Caddy, or app code yet. Follow-up commits will install the runtime stack, deploy the API, and document each step here. Custom domain is not yet pointed at the EIP; pointing it is a DNS-side change documented in `deployment.md`.
+
+### Testing/checks
+- SSH verified: `ssh -i ~/.ssh/upstream-api.pem ec2-user@18.225.104.21` returns AL2023 kernel info.
+- Instance state: `running` in `us-east-2b`.
+- No services exposed yet — port scans on 80/443 will refuse connection until the runtime is installed.
+
+### Follow-up TODOs
+- Install Docker + docker-compose plugin on the box.
+- Install Caddy and write the Caddyfile pointing at uvicorn.
+- Move `UPSTREAM_*` secrets into AWS Systems Manager Parameter Store and load them at service start.
+- Add a systemd unit (or rely on `docker compose --restart=always`) so the stack survives reboots.
+- Stop using the AWS root account — create an `upstream-deploy` IAM user with scoped permissions.
+- Point a real DNS A record at `18.225.104.21` once a domain is chosen.
+
+---
+
 ## 2026-05-12 - Audit pass: token-prefix fix, transaction-safety fix, local verification
 
 ### Summary
