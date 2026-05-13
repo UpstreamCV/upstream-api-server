@@ -20,14 +20,17 @@ from upstream_api.errors import (
 from upstream_api.observability.logging import configure_logging, get_logger
 from upstream_api.observability.middleware import AccessLogMiddleware, RequestIdMiddleware
 from upstream_api.routers import (
+    accounts,
     admin,
     agents,
     api_tokens,
     cameras,
+    dashboard,
     heartbeats,
     ingest,
     snapshots,
     stream_sessions,
+    users,
 )
 
 _logger = get_logger("app")
@@ -87,7 +90,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(stream_sessions.router)
     app.include_router(api_tokens.router)
     app.include_router(heartbeats.router)
+    app.include_router(heartbeats.history_router)  # /v1/agents/{id}/heartbeats etc.
     app.include_router(snapshots.router)
+    app.include_router(snapshots.camera_router)  # /v1/cameras/{id}/latest-frame
     app.include_router(ingest.router)
+    app.include_router(users.router)
+    app.include_router(accounts.router)
+    app.include_router(dashboard.router)
 
     return app

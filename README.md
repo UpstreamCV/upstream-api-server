@@ -54,9 +54,11 @@ supabase db reset
 cp .env.example .env
 $EDITOR .env
 
-# 5. Mint a local API token for the seeded dev account, insert it into the DB
-uv run python scripts/seed_dev_token.py | docker exec -i supabase_db_upstream-api-server psql -U postgres
-# (The plaintext token is printed to stderr — copy it.)
+# 5. Provision a dev user, populated tenant, and a fresh API token
+make dev-account
+# (Creates `dev@upstream.test` / `upstream-dev-password`; prints the API
+#  token plaintext to stdout. Re-run safely; use `make dev-account-reset`
+#  to wipe and re-seed.)
 
 # 6. Run the API
 make dev

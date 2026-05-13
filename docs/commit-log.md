@@ -4,6 +4,58 @@ Reverse chronological. Newest at top. Every meaningful commit gets an entry foll
 
 ---
 
+## 2026-05-13 - Phase 4.5 dashboard convenience endpoints + dev-account seeder
+
+### Summary
+Eight new GET endpoints close the gap between the dashboard's design-doc API contract and what the api-server actually exposed. Today the dashboard queries Supabase Postgres directly under RLS for token lists, latest frames, validations, and dashboard counts; once it migrates to these endpoints, authorization lives in one place. Also lands a `scripts/seed_dev_account.py` (run via `make dev-account`) that creates a stable Supabase Auth user (`dev@upstream.test`), lets the existing `handle_new_user` trigger provision the tenant, then populates the account with one agent, one camera, one active stream session, three heartbeats, one passing validation, an API token, and a placeholder snapshot — so a fresh dashboard isn't empty when a developer logs in for visual testing.
+
+### Files touched
+- `src/upstream_api/security/deps.py` — extracted `require_account_role(user, account_id, *allowed)` from the inline `_require_admin` in `routers/api_tokens.py`. Both POST/DELETE and the new GET reuse it. Same error envelope (`forbidden.role`).
+- `src/upstream_api/routers/users.py` (new) — `GET /v1/me` returning `{ user_id, aal, amr, memberships[] }`. Auth: `current_user` only.
+- `src/upstream_api/routers/accounts.py` (new) — `GET /v1/account`, `GET /v1/account/limits`. Auth: `current_caller`. Uses `resolve_account(account_id_hint)` so agents and dashboard users both work.
+- `src/upstream_api/routers/dashboard.py` (new) — `GET /v1/dashboard/summary`. Single round-trip with a multi-subquery SELECT counting cameras by status, recent online agents, active sessions, and 24h validation failures.
+- `src/upstream_api/routers/api_tokens.py` — added `GET /v1/api-tokens` (admin-only, mirrors POST gate). Replaced the inline admin check with `require_account_role`. Selects only safe columns (never `hash`).
+- `src/upstream_api/routers/heartbeats.py` — added `GET /v1/agents/{agent_id}/heartbeats` and `GET /v1/cameras/{camera_id}/heartbeats` (mounted via the new `history_router` to match the design doc's nested path scheme). Ownership-checked. Filters: `limit` (1-500, default 50) and optional `before` ISO datetime cursor.
+- `src/upstream_api/routers/snapshots.py` — added `GET /v1/cameras/{camera_id}/latest-frame` mounted via the new `camera_router`. Returns metadata + a short-lived (~60 s) Supabase Storage signed URL minted server-side via a new `services.storage.create_signed_url` helper.
+- `src/upstream_api/routers/stream_sessions.py` — added `GET /v1/stream-sessions/{session_id}/validations`. Newest first.
+- `src/upstream_api/schemas/{users,accounts,dashboard,stream_validations}.py` (new) — typed response models.
+- `src/upstream_api/schemas/{api_tokens,heartbeats,snapshots}.py` — extended with list / latest-frame response envelopes.
+- `src/upstream_api/services/storage.py` — added `create_signed_url(settings, bucket, storage_key, expires_in=60)`. Wraps supabase-py's `create_signed_url` in `asyncio.to_thread` to match the existing `upload_bytes` pattern.
+- `src/upstream_api/app.py` — mounts the three new routers (`users`, `accounts`, `dashboard`) plus the two sub-routers (`heartbeats.history_router`, `snapshots.camera_router`).
+- `tests/test_app_routes.py` — extended the expected route set with the 9 new entries.
+- `scripts/seed_dev_account.py` (new) — `make dev-account` / `make dev-account-reset` / `python scripts/seed_dev_account.py --token-only`. Uses Supabase Admin API (`auth.admin.create_user(...)` with `email_confirm=true`) so the dev user can sign in without going through email confirmation. Idempotent at the user level; `--reset` wipes through the `account_members` cascade then re-creates. Snapshot upload tolerates a missing bucket (logs a warning, skips that one fixture row, continues).
+- `scripts/seed_dev_token.py` — replaced with a thin deprecation shim that calls `seed_dev_account.main(['--token-only'])` so existing instructions still work.
+- `Makefile` — added `dev-account` and `dev-account-reset` phony targets.
+- `README.md` — Quickstart step 5 simplified from "`seed_dev_token.py | psql`" to `make dev-account`.
+- `docs/api-contracts.md` — new "Phase 4.5" section documenting all 8 new endpoints with request/response shapes.
+- `docs/commit-log.md` — this entry.
+
+### System interaction notes
+- All eight endpoints use `current_caller` (the dual-auth dep) where possible, so an agent token can also hit them when useful. `/v1/me` is the exception — uses `current_user` only because there's no agent equivalent. `/v1/api-tokens` GET adds a role gate on top.
+- The `latest-frame` endpoint deliberately returns the signed URL in the response body (not a 302 redirect) so callers can cache the URL until ~`expires_at` without following the redirect on every page render.
+- `dashboard.summary` counts come from a single SELECT with subqueries — one round-trip per request, suitable for the dashboard's 10-second poll cadence.
+- The seeder embeds a 1×1 black JPEG (~870 bytes) as a Python `bytes` literal. Hosted Supabase needs the `snapshots` bucket created in Studio first; local Supabase CLI doesn't auto-create buckets either — that's why the seeder logs a warning and proceeds without the snapshot fixture when the bucket is missing. Cleaner than failing the whole seed.
+- `scripts/seed_dev_account.py` uses `auth.admin.delete_user` on `--reset` to wipe the auth.users row; the cascade then takes out `account_members` → `accounts` → all dependent fixtures via FK chains.
+- `_resolve_account_for_user` in `routers/api_tokens.py` mirrors `CallerAuth.resolve_account` for the user-only endpoint. Could fold this into a single helper later, but the duplication keeps the user-only path obvious.
+
+### How to verify
+```sh
+make db-start && make db-reset
+make dev-account                    # creates dev@upstream.test + fixtures + token
+make dev                            # in another shell
+curl -H "Authorization: Bearer <token-from-stdout>" \
+  http://localhost:4000/v1/dashboard/summary
+# returns { "total_cameras": 1, "active_streams": 1, ... }
+```
+Idempotency: `make dev-account` re-run is a no-op. `make dev-account-reset` wipes + re-creates with fresh fixture UUIDs.
+
+### Not addressed in this commit
+- Dashboard migration to use these endpoints (still queries Supabase directly for four of them) — separate change in `upstream-dashboard`.
+- `GET /v1/stream-sessions/{id}/playback` — still blocked on the streaming-server WHEP URL convention.
+- `snapshots` bucket auto-creation — out-of-band Studio step for hosted.
+
+---
+
 ## 2026-05-13 - Grant authenticated SELECT on dashboard tables + snapshots storage policy
 
 ### Summary

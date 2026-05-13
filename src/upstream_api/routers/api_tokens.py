@@ -1,29 +1,86 @@
 from __future__ import annotations
 
+from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Query
 
 from upstream_api.errors import ForbiddenError, NotFoundError
 from upstream_api.schemas.api_tokens import (
     ApiTokenCreateRequest,
     ApiTokenCreateResponse,
+    ApiTokenListResponse,
     ApiTokenSummary,
 )
 from upstream_api.security.api_tokens import ALLOWED_SCOPES, issue_token_async
-from upstream_api.security.deps import CurrentUser, PoolDep, SettingsDep
+from upstream_api.security.deps import (
+    CurrentUser,
+    PoolDep,
+    SettingsDep,
+    require_account_role,
+)
 
 router = APIRouter(prefix="/v1/api-tokens", tags=["api-tokens"])
 
 
-def _require_admin(user: CurrentUser, account_id: UUID) -> None:
-    role = user.memberships.get(account_id)
-    if role not in {"owner", "admin"}:
-        raise ForbiddenError(
-            "Insufficient role for this account.",
-            code="forbidden.role",
-            details={"required": ["owner", "admin"], "account_id": str(account_id)},
+def _resolve_account_for_user(user: CurrentUser, account_id: UUID | None) -> UUID:
+    """Pick the account scope for a user-only endpoint.
+
+    Mirrors `CallerAuth.resolve_account` semantics but for routes that don't
+    accept agent tokens.
+    """
+    if account_id is not None:
+        if account_id not in user.memberships:
+            raise ForbiddenError(
+                "User is not a member of this account.",
+                code="forbidden_account",
+            )
+        return account_id
+    if len(user.memberships) == 1:
+        return next(iter(user.memberships))
+    raise ForbiddenError(
+        "account_id query parameter is required for users with multiple accounts.",
+        code="account_id_required",
+    )
+
+
+@router.get("", response_model=ApiTokenListResponse)
+async def list_tokens(
+    user: CurrentUser,
+    pool: PoolDep,
+    account_id: Annotated[UUID | None, Query()] = None,
+) -> ApiTokenListResponse:
+    """List API tokens for the active account. Owner/admin only."""
+    scope_account = _resolve_account_for_user(user, account_id)
+    require_account_role(user, scope_account, "owner", "admin")
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            select id, account_id, name, prefix, last_four, scopes,
+                   last_used_at, expires_at, revoked_at, created_at
+              from api_tokens
+             where account_id = $1
+             order by created_at desc
+            """,
+            scope_account,
         )
+    tokens = [
+        ApiTokenSummary(
+            id=r["id"],
+            account_id=r["account_id"],
+            name=r["name"],
+            prefix=r["prefix"],
+            last_four=r["last_four"],
+            scopes=list(r["scopes"]),
+            last_used_at=r["last_used_at"],
+            expires_at=r["expires_at"],
+            revoked_at=r["revoked_at"],
+            created_at=r["created_at"],
+        )
+        for r in rows
+    ]
+    return ApiTokenListResponse(tokens=tokens)
 
 
 @router.post("", response_model=ApiTokenCreateResponse, status_code=201)
@@ -33,7 +90,7 @@ async def create_token(
     pool: PoolDep,
     settings: SettingsDep,
 ) -> ApiTokenCreateResponse:
-    _require_admin(user, body.account_id)
+    require_account_role(user, body.account_id, "owner", "admin")
 
     unknown_scopes = set(body.scopes) - ALLOWED_SCOPES
     if unknown_scopes:

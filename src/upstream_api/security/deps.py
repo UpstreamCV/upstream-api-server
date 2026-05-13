@@ -254,6 +254,25 @@ async def current_caller(
 CurrentCaller = Annotated[CallerAuth, Depends(current_caller)]
 
 
+def require_account_role(
+    user: UserAuth,
+    account_id: UUID,
+    *allowed: str,
+) -> None:
+    """Raise ForbiddenError if the user's role on `account_id` isn't in `allowed`.
+
+    Shared by routes that need finer-grained gating than CallerAuth provides —
+    e.g. POST /v1/api-tokens (owner/admin only), GET /v1/api-tokens (same).
+    """
+    role = user.memberships.get(account_id)
+    if role not in allowed:
+        raise ForbiddenError(
+            "Insufficient role for this account.",
+            code="forbidden.role",
+            details={"required": sorted(allowed), "account_id": str(account_id)},
+        )
+
+
 def bind_agent_context(auth: AgentAuth, agent_id: UUID) -> None:
     """Bind agent + account into logging context vars for the rest of the request."""
     account_id_var.set(auth.account_id)
