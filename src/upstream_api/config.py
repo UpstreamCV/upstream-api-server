@@ -45,6 +45,9 @@ class Settings(BaseSettings):
     db_pool_min_size: int = 5
     db_pool_max_size: int = 20
 
+    supabase_storage_bucket: str = "snapshots"
+    snapshot_max_bytes: int = 5 * 1024 * 1024  # 5 MB; Caddy must allow >= this on /v1/snapshots
+
     @property
     def is_production(self) -> bool:
         return self.environment == "production"

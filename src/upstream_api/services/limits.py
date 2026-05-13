@@ -37,6 +37,7 @@ class RequestedStream:
     fps: int
     codec: str
     bitrate_kbps: int
+    latency_mode: str = "balanced"
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,6 +49,7 @@ class LimitsSnapshot:
     fps: int
     codec: str
     bitrate_kbps: int
+    latency_mode: str = "balanced"
 
 
 async def load_account_limits(conn: asyncpg.Connection, account_id: UUID) -> AccountLimits:
@@ -157,6 +159,7 @@ async def check_session_start(
         fps=requested.fps,
         codec=requested.codec,
         bitrate_kbps=requested.bitrate_kbps,
+        latency_mode=requested.latency_mode,
     )
 
 

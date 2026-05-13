@@ -19,7 +19,16 @@ from upstream_api.errors import (
 )
 from upstream_api.observability.logging import configure_logging, get_logger
 from upstream_api.observability.middleware import AccessLogMiddleware, RequestIdMiddleware
-from upstream_api.routers import admin, agents, api_tokens, cameras, stream_sessions
+from upstream_api.routers import (
+    admin,
+    agents,
+    api_tokens,
+    cameras,
+    heartbeats,
+    ingest,
+    snapshots,
+    stream_sessions,
+)
 
 _logger = get_logger("app")
 
@@ -77,5 +86,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(cameras.router)
     app.include_router(stream_sessions.router)
     app.include_router(api_tokens.router)
+    app.include_router(heartbeats.router)
+    app.include_router(snapshots.router)
+    app.include_router(ingest.router)
 
     return app

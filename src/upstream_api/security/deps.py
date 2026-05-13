@@ -18,7 +18,7 @@ from fastapi.security.utils import get_authorization_scheme_param
 
 from upstream_api.config import Settings, get_settings
 from upstream_api.db.pool import get_pool
-from upstream_api.errors import UnauthorizedError
+from upstream_api.errors import ForbiddenError, UnauthorizedError
 from upstream_api.observability.context import account_id_var, agent_id_var
 from upstream_api.security.api_tokens import split_token, verify_secret_async
 from upstream_api.security.shared_secret import verify_shared_secret
@@ -191,6 +191,67 @@ async def current_processor(
 
 
 CurrentProcessor = Annotated[ProcessorAuth, Depends(current_processor)]
+
+
+# ---------------------------------------------------------------------------
+# Dual auth: agent token OR dashboard user JWT.
+#
+# Read endpoints (GET /v1/cameras, /v1/agents, /v1/stream-sessions) are useful
+# both for the agent (discovering its own registered cameras after re-install)
+# and the dashboard. Disambiguating on token shape (agent tokens begin with
+# ``ups_``) keeps one dependency rather than two near-duplicate routes.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class CallerAuth:
+    agent: AgentAuth | None
+    user: UserAuth | None
+
+    @property
+    def is_agent(self) -> bool:
+        return self.agent is not None
+
+    def resolve_account(self, account_id_hint: UUID | None) -> UUID:
+        """Pick the account this call should operate on.
+
+        Agents are scoped to a single account by their token. Users may belong
+        to several, so they must hint via a query parameter unless they only
+        have one membership.
+        """
+        if self.agent is not None:
+            return self.agent.account_id
+        assert self.user is not None
+        memberships = self.user.memberships
+        if account_id_hint is None:
+            if len(memberships) == 1:
+                return next(iter(memberships))
+            raise ForbiddenError(
+                "account_id query parameter is required for users with multiple accounts.",
+                code="account_id_required",
+            )
+        if account_id_hint not in memberships:
+            raise ForbiddenError(
+                "User is not a member of this account.",
+                code="forbidden_account",
+            )
+        return account_id_hint
+
+
+async def current_caller(
+    pool: PoolDep,
+    settings: SettingsDep,
+    authorization: Annotated[str | None, Header()] = None,
+) -> CallerAuth:
+    plaintext = _extract_bearer(authorization)
+    if plaintext.startswith("ups_"):
+        agent_auth = await current_agent(pool=pool, authorization=authorization)
+        return CallerAuth(agent=agent_auth, user=None)
+    user_auth = await current_user(pool=pool, settings=settings, authorization=authorization)
+    return CallerAuth(agent=None, user=user_auth)
+
+
+CurrentCaller = Annotated[CallerAuth, Depends(current_caller)]
 
 
 def bind_agent_context(auth: AgentAuth, agent_id: UUID) -> None:

@@ -51,6 +51,13 @@ Every non-2xx response uses this shape:
 | 404 | `account_limits_missing` | `account_limits` row not present for the account |
 | 409 | `camera_already_streaming` | another active session exists for the camera |
 | 409 | `agent_account_mismatch` | agent_id given doesn't belong to the calling account |
+| 409 | `stream_state_invalid` | ingest webhook fired on a session in the wrong state (e.g. `stream-started` on an already-ended session) |
+| 403 | `forbidden_account` | dashboard user is not a member of the `account_id` they queried |
+| 403 | `account_id_required` | dashboard user has multiple memberships but did not pass `?account_id=` |
+| 403 | `forbidden_resource` | heartbeat references a `camera_id` or `session_id` not owned by the agent |
+| 413 | `snapshot_too_large` | snapshot upload exceeds `UPSTREAM_SNAPSHOT_MAX_BYTES` |
+| 415 | `invalid_content_type` | snapshot upload was not `image/jpeg` |
+| 429 | `snapshot_quota_exceeded` | trailing-30-day snapshot bytes would exceed `account_limits.snapshot_storage_mb` |
 | 422 | `validation_error` | pydantic request validation failed |
 | 500 | `internal_error` | unhandled exception |
 
@@ -283,22 +290,195 @@ Ingest connections set `streamid=publish:<jwt>` (the literal prefix `publish:` f
 | `UPSTREAM_DB_POOL_MIN_SIZE` | no | Default 5 |
 | `UPSTREAM_DB_POOL_MAX_SIZE` | no | Default 20 |
 | `UPSTREAM_ALLOWED_ORIGINS` | no | CSV list of CORS origins (default `http://localhost:3000`) |
+| `UPSTREAM_SUPABASE_STORAGE_BUCKET` | no | Supabase Storage bucket for snapshot uploads (default `snapshots`) |
+| `UPSTREAM_SNAPSHOT_MAX_BYTES` | no | Per-request snapshot size limit (default 5 MB) |
 | `UPSTREAM_SENTRY_DSN` | no | Sentry exception reporting |
 
+## Endpoints — Phase 2: ingest webhooks (auth: `current_ingest`)
+
+Streaming server -> API. All require `X-Upstream-Webhook-Secret`.
+
+### `POST /v1/ingest/validate-stream`
+
+Preflight: should this incoming SRT connection be accepted?
+
+Request:
+```json
+{ "streamid": "publish:<jwt>", "remote_addr": "203.0.113.42" }
+```
+
+Response 200 (accepted):
+```json
+{
+  "accept": true,
+  "session_id": "uuid",
+  "expected": {
+    "codec": "h264",
+    "width": 1280, "height": 720, "fps": 30,
+    "bitrate_kbps": 3000, "latency_mode": "balanced"
+  }
+}
+```
+
+Response 200 (rejected — always 200 with `accept: false`, never 4xx, because the streaming server treats this as a decision, not an error):
+```json
+{
+  "accept": false,
+  "session_id": "uuid",
+  "reason": "Session is in state 'ended', expected 'approved'.",
+  "reason_code": "stream_state_invalid"
+}
+```
+
+Reason codes: `streamid_malformed`, `invalid_session_token`, `session_not_found`, `token_jti_mismatch`, `stream_state_invalid`, `session_expired`.
+
+### `POST /v1/ingest/stream-started`
+
+Streaming server has accepted the publish and ffprobe matched the expected params. Transition `approved → streaming`.
+
+Request:
+```json
+{
+  "session_id": "uuid",
+  "observed": { "codec": "h264", "width": 1280, "height": 720, "fps": 29.97, "bitrate_kbps": 2980 },
+  "started_at": "2026-05-12T20:00:01Z"
+}
+```
+
+Response 200: `{ "session_id": "...", "state": "streaming" }`.
+
+Errors: `session_not_found`, `stream_state_invalid`.
+
+### `POST /v1/ingest/stream-ended`
+
+SRT connection closed. Transition `approved|streaming → ended`. Idempotent — returns the current state if already terminal.
+
+Request:
+```json
+{
+  "session_id": "uuid",
+  "ended_at": "2026-05-12T20:05:30Z",
+  "duration_seconds": 329.2,
+  "bytes_sent": 123456789,
+  "reason": "client_disconnect"
+}
+```
+
+Response 200: `{ "session_id": "...", "state": "ended" }`.
+
+A `usage_events` row of type `stream_seconds` is written with `quantity=int(duration_seconds)`.
+
+### `POST /v1/ingest/validation-failed`
+
+ffprobe (or a later validator) rejected the stream. Transition `approved|streaming → failed` and write a failing `stream_validations` row.
+
+Request:
+```json
+{
+  "session_id": "uuid",
+  "observed": { "codec": "h265", "width": 1280, "height": 720, "fps": 30, "bitrate_kbps": 3000 },
+  "mismatch_fields": ["codec"],
+  "failure_code": "codec_mismatch",
+  "failure_message": "expected h264, observed h265"
+}
+```
+
+Response 200: `{ "session_id": "...", "state": "failed" }`.
+
+## Endpoints — Phase 3: telemetry (auth: `current_agent`)
+
+### `POST /v1/heartbeats?agent_id=<uuid>`
+
+Batched, max 100 per call. The query param identifies the agent within the calling token's account.
+
+Request:
+```json
+{
+  "heartbeats": [
+    {
+      "camera_id": "uuid",
+      "session_id": "uuid",
+      "status": "streaming",
+      "fps": 29.97,
+      "bitrate_kbps": 2950,
+      "width": 1280, "height": 720, "codec": "h264",
+      "agent_version": "0.1.4",
+      "reported_at": "2026-05-12T20:00:30Z"
+    }
+  ]
+}
+```
+
+`status` must be one of `online | streaming | error | reconnecting`. `camera_id` / `session_id` are optional but if provided must belong to this agent.
+
+Response 200: `{ "accepted": 1, "server_time": "..." }`.
+
+Errors: `forbidden_resource` (camera/session not owned by this agent).
+
+### `POST /v1/snapshots`
+
+Multipart form. Bytes are uploaded to Supabase Storage; the row references the storage key.
+
+Form fields:
+- `camera_id`: UUID
+- `agent_id`: UUID (must own the camera under the calling account)
+- `session_id`: UUID, optional
+- `captured_at`: ISO datetime
+- `width`, `height`: int, optional
+- `file`: JPEG, `Content-Type: image/jpeg`, ≤ `UPSTREAM_SNAPSHOT_MAX_BYTES` (default 5 MB)
+
+Response 201: `SnapshotUploadResponse`:
+```json
+{
+  "id": "uuid",
+  "camera_id": "uuid",
+  "session_id": "uuid",
+  "storage_key": "<account_id>/<camera_id>/20260512/<uuid>.jpg",
+  "bytes": 187432,
+  "width": 1280,
+  "height": 720,
+  "captured_at": "2026-05-12T20:00:30Z",
+  "created_at": "2026-05-12T20:00:31Z"
+}
+```
+
+Errors: `camera_not_found`, `agent_account_mismatch`, `invalid_content_type`, `snapshot_too_large`, `snapshot_quota_exceeded`, `account_limits_missing`.
+
+## Endpoints — Phase 4: reads (auth: `current_agent` OR `current_user`)
+
+These three accept either an agent token (scoped to that agent's account) or a dashboard user JWT (must pass `?account_id=` unless the user has a single membership).
+
+### `GET /v1/agents`
+
+Query: `account_id` (UUID, required for multi-account users), `status` (str), `limit` (1-200, default 50).
+
+Response: `{ "agents": [AgentResponse, ...] }`.
+
+### `GET /v1/agents/{agent_id}`
+
+Query: `account_id` (UUID, required for multi-account users).
+
+Response: `AgentResponse`.
+
+### `GET /v1/cameras`
+
+Query: `account_id`, `agent_id` (filter), `status` (filter), `limit`.
+
+Response: `{ "cameras": [CameraResponse, ...] }`.
+
+### `GET /v1/cameras/{camera_id}`
+
+Query: `account_id`.
+
+Response: `CameraResponse`. Includes `default_latency_mode`.
+
+### `GET /v1/stream-sessions`
+
+Query: `account_id`, `agent_id`, `camera_id`, `state` (`approved|streaming|ended|expired|failed`), `limit`.
+
+Response: `{ "sessions": [StreamSessionResponse, ...] }`.
+
 ## Future endpoints (planned)
-
-### Phase 2 — streaming server callbacks (auth: `current_ingest`)
-- `POST /v1/ingest/validate-stream` — synchronous; returns whether to accept the streamid and what the expected stream params are.
-- `POST /v1/ingest/stream-started` — transitions session to `streaming` after ffprobe match.
-- `POST /v1/ingest/stream-ended` — transitions session to `ended`; writes duration.
-- `POST /v1/ingest/validation-failed` — transitions session to `failed`.
-
-### Phase 3 — agent telemetry (auth: `current_agent`)
-- `POST /v1/heartbeats` — batched, up to 100 per call.
-- `POST /v1/snapshots` — multipart upload of a JPEG frame; quota-checked.
-
-### Phase 4 — dashboard reads (auth: `current_user`)
-- `GET /v1/agents`, `/v1/cameras`, `/v1/stream-sessions`, `/v1/heartbeats` — cursor-paginated, filtered by `account_id`.
 
 ### Phase 5 — processor (auth: `current_processor`)
 - `GET /v1/processor/sessions/active`

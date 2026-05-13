@@ -126,9 +126,48 @@ There are three kinds of token in the system:
 |---|---|---|
 | 0 | FastAPI scaffold | done |
 | 1 | Agent auth + session creation | done |
-| 2 | MediaMTX ingest webhooks | not started |
-| 3 | Heartbeats + snapshots | not started |
-| 4 | Dashboard reads (Supabase JWT, RLS) | not started |
+| 2 | MediaMTX ingest webhooks | done |
+| 3 | Heartbeats + snapshots | done |
+| 4 | Dashboard reads (Supabase JWT, RLS) | done — `GET /v1/agents`, `/v1/cameras`, `/v1/stream-sessions` accept either an agent token or a user JWT via `CurrentCaller` (security/deps.py) |
 | 5 | Processor surface + usage rollup | not started |
 | 6 | Observability + rate limiting | partial (structlog + middleware in; Prometheus + slowapi not yet) |
 | 7 | Hardening (token rotation, revocation list, mTLS) | not started |
+
+## Phase 2 — MediaMTX ingest webhook flow
+
+```
+agent ──SRT publish, streamid=publish:<jwt>──► upstream-streaming-server
+                                                        │
+   POST /v1/ingest/validate-stream                      │ X-Upstream-Webhook-Secret
+   { "streamid": "publish:<jwt>" }                      │
+   ◄── { "accept": true, "expected": { "codec":..., "width":..., ... } }
+                                                        │
+                                                        │ accept publish, run ffprobe
+                                                        │
+   POST /v1/ingest/stream-started                       │
+   { "session_id":..., "observed": { ... }, "started_at": ... }
+   ◄── { "session_id":..., "state": "streaming" }       │
+                                                        │
+                                                        │ stream runs ...
+                                                        │
+   POST /v1/ingest/stream-ended                         │
+   { "session_id":..., "ended_at":..., "duration_seconds":..., "bytes_sent":..., "reason":... }
+   ◄── { "session_id":..., "state": "ended" }           │
+```
+
+If ffprobe finds a mismatch, the streaming server calls `validation-failed` instead of `stream-started`; the session transitions to `failed`, a row lands in `stream_validations` with `passed=false`, and the SRT connection is dropped.
+
+## Phase 3 — Heartbeats + snapshots
+
+- **Heartbeats**: agent posts batches of up to 100 every few seconds. Each item carries `status`, `fps`, `bitrate_kbps`, `width`, `height`, `codec`, `last_error`, `agent_version`, `reported_at`. The handler updates `agents.last_seen_at` once per batch — not per heartbeat — to avoid hot-row contention on chatty fleets.
+- **Snapshots**: agent (or, optionally, the streaming server in a later phase) uploads a JPEG as multipart. Bytes go to Supabase Storage at `{account_id}/{camera_id}/{yyyymmdd}/{uuid}.jpg`; metadata + `storage_key` land in `snapshots`. Quota is `account_limits.snapshot_storage_mb` summed across the trailing 30 days. Max upload is `UPSTREAM_SNAPSHOT_MAX_BYTES` (default 5 MB). **Caddy must allow `>= snapshot_max_bytes` on `/v1/snapshots` specifically** — the global 1 MB body cap stays in place everywhere else.
+
+## Latency modes
+
+Cameras carry `default_latency_mode` (`low | balanced | stable`); each session snapshots it onto `req_latency_mode` and `lim_latency_mode`. The SRT URL builder maps the mode to a `latency=<ms>` parameter:
+
+| Mode | SRT `latency` | Use when |
+|---|---|---|
+| low | 80 ms | low end-to-end delay over a healthy link |
+| balanced (default) | 200 ms | typical web/dashboard viewing |
+| stable | 1500 ms | weak Wi-Fi / cellular; tolerates jitter and packet loss |

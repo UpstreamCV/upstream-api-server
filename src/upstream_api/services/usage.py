@@ -45,7 +45,7 @@ async def record_event(
     account_id: UUID,
     event_type: str,
     session_id: UUID | None = None,
-    quantity: float = 1.0,
+    quantity: int | float = 1,
     unit: str = "count",
     metadata: dict[str, Any] | None = None,
 ) -> None:
@@ -56,6 +56,9 @@ async def record_event(
             account_id=str(account_id),
         )
         return
+    # `quantity` is bigint in the schema; coerce here so callers can pass a
+    # float (e.g. raw duration in seconds) without tripping asyncpg's strict
+    # type check on the bind.
     await conn.execute(
         """
         insert into usage_events
@@ -65,7 +68,7 @@ async def record_event(
         account_id,
         event_type,
         session_id,
-        quantity,
+        int(quantity),
         unit,
         None if metadata is None else json.dumps(metadata),
     )

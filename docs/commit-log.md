@@ -4,6 +4,60 @@ Reverse chronological. Newest at top. Every meaningful commit gets an entry foll
 
 ---
 
+## 2026-05-12 - Phase 2 + Phase 3 + Phase 4 API surface: ingest webhooks, heartbeats, snapshots, dashboard reads
+
+### Summary
+Land the full set of control-plane endpoints needed by `upstream-agent` (pip lib) and `upstream-streaming-server` (MediaMTX) so both can be built next without coming back for API additions. Three new tables (`heartbeats`, `snapshots`, `usage_events`) and three new column adds (`cameras.default_latency_mode`, `stream_sessions.req_latency_mode`/`lim_latency_mode`). Six new routers/endpoints: the four MediaMTX webhooks (`validate-stream`, `stream-started`, `stream-ended`, `validation-failed`), batched heartbeats, JPEG snapshot upload to Supabase Storage, and three account-scoped list/get routes (`GET /v1/agents`, `/v1/cameras`, `/v1/stream-sessions`) that accept either an agent token or a dashboard user JWT via a new `CurrentCaller` dual-auth dep. SRT URL now selects `latency=` from the session's `lim_latency_mode` (low=80 ms, balanced=200 ms, stable=1500 ms) so the three-mode buffer tradeoff is honored end-to-end.
+
+### Files touched
+- `supabase/migrations/20260513120000_heartbeats_snapshots_usage.sql` (new) — `heartbeats`, `snapshots`, `usage_events` tables with RLS member-select policies and recency indexes; matches existing schema style. Unblocks `services/usage.py`'s table-existence probe.
+- `supabase/migrations/20260513121000_latency_mode.sql` (new) — `cameras.default_latency_mode` + `stream_sessions.req_latency_mode`/`lim_latency_mode` with `low|balanced|stable` check constraints, default `balanced`.
+- `src/upstream_api/security/deps.py` — added `CallerAuth` + `current_caller` dep; dispatches on token shape (`ups_*` => agent, otherwise Supabase JWT) and exposes `resolve_account(account_id_hint)` that enforces single-membership inference vs explicit `?account_id=` for multi-account users.
+- `src/upstream_api/services/limits.py` — `RequestedStream` and `LimitsSnapshot` gained `latency_mode: str = "balanced"`; `check_session_start` mirrors it onto the snapshot so it lands in `lim_latency_mode`.
+- `src/upstream_api/services/session_lifecycle.py` — INSERT/SELECT now carry the two latency_mode columns; `_build_srt_url` maps mode → ms (`{low: 80, balanced: 200, stable: 1500}`).
+- `src/upstream_api/services/stream_validation.py` (new) — state transitions for ingest webhooks (`mark_streaming`, `mark_ended`, `mark_failed`) plus `load_session_state`; each transition is a single `UPDATE ... RETURNING` and distinguishes "row missing" from "wrong state" via a post-update probe (`ConflictError(code="stream_state_invalid")`).
+- `src/upstream_api/services/heartbeats.py` (new) — `record_batch` verifies camera/session ownership in one round-trip per kind, then `executemany`s the inserts. Updates `agents.last_seen_at` once per batch (not per heartbeat) to avoid hot-row contention on chatty fleets.
+- `src/upstream_api/services/storage.py` (new) — supabase-py wrapper for `upload_bytes`; sync client wrapped in `asyncio.to_thread`; client is `lru_cache`d per-settings.
+- `src/upstream_api/routers/ingest.py` (new) — four endpoints under `/v1/ingest/*`, all behind `CurrentIngest`. `validate-stream` always returns 200 with `accept: true|false` (and a `reason_code` on rejection) so the streaming server treats it as a decision, not an HTTP error.
+- `src/upstream_api/routers/heartbeats.py` (new) — `POST /v1/heartbeats?agent_id=<uuid>`; max-100 batch enforced in the schema.
+- `src/upstream_api/routers/snapshots.py` (new) — `POST /v1/snapshots` multipart form. Quota = `account_limits.snapshot_storage_mb` summed across trailing 30 days; per-request cap `UPSTREAM_SNAPSHOT_MAX_BYTES` (default 5 MB). Upload-first, insert-second; on rare crash a janitor job sweeps Storage against the `snapshots` table.
+- `src/upstream_api/routers/agents.py` — `GET /v1/agents` (list, filter by `status`) and `GET /v1/agents/{agent_id}`, both via `CurrentCaller`. Existing `POST /register` unchanged.
+- `src/upstream_api/routers/cameras.py` — `GET /v1/cameras` (filter `agent_id`, `status`) and `GET /v1/cameras/{camera_id}` via `CurrentCaller`. `POST /register` now accepts `default_latency_mode`.
+- `src/upstream_api/routers/stream_sessions.py` — `GET /v1/stream-sessions` (filter `agent_id`, `camera_id`, `state`) via `CurrentCaller`; `POST /start` threads `latency_mode` from `RequestedStreamParams`. `GET /v1/stream-sessions/{session_id}` migrated to `CurrentCaller`.
+- `src/upstream_api/schemas/{cameras,agents,stream_sessions,heartbeats,ingest,snapshots}.py` — new list responses + new request/response shapes; `LatencyMode` literal carried in the camera + session schemas.
+- `src/upstream_api/app.py` — registered `heartbeats`, `snapshots`, `ingest` routers.
+- `src/upstream_api/config.py` — `supabase_storage_bucket` (default `snapshots`) and `snapshot_max_bytes` (default 5 MB).
+- `docs/architecture.md` — Phase 2/3/4 marked done; added the MediaMTX ingest webhook flow diagram and the latency-mode table.
+- `docs/api-contracts.md` — fleshed out the previously-deferred Phase 2/3/4 sections with concrete request/response shapes; added six new error codes (`stream_state_invalid`, `forbidden_resource`, `forbidden_account`, `account_id_required`, `snapshot_too_large`, `snapshot_quota_exceeded`, `invalid_content_type`).
+- `tests/test_app_routes.py` — expected route set extended for the six new endpoints + the three new list routes.
+
+### System interaction notes
+- The dual-auth `CurrentCaller` discriminator (`token.startswith("ups_")`) is cheap and unambiguous because Supabase JWTs always start with `eyJ` (base64-encoded JSON header). If we ever change the agent token prefix this branch needs updating in one place.
+- `validate-stream` returning `accept: false` with HTTP 200 is intentional — the streaming server already handles "reject and close" as a normal outcome; a 4xx would force it to special-case our API.
+- `mark_streaming` and `mark_failed` use `UPDATE ... WHERE state IN (...) RETURNING` so the transition is atomic at the row level. When `RETURNING` is empty we re-fetch and raise `stream_state_invalid` with the current state, which is what the streaming server needs to decide whether to retry vs give up.
+- Heartbeat ownership is verified up-front with one `SELECT ... WHERE id = ANY($1::uuid[])` per resource kind; the alternative (per-row FK checks at insert time) would have produced harder-to-read errors and one round-trip per heartbeat.
+- Snapshot upload-then-insert can orphan a Storage object if the row insert fails after the upload succeeds; a janitor job (out of scope here) reconciles. The reverse order would orphan a row pointing at nothing — worse, because the dashboard would 404 on the snapshot fetch.
+- `services/usage.py` keeps its table-existence probe for the deploy window so the new code doesn't crash on a host that hasn't yet had the migration applied; the probe caches `True` after first call and is effectively a no-op forever after.
+
+### Testing/checks
+- `ruff check`, `ruff format --check`, `mypy --strict`, `pytest -q` clean against the existing 43 tests; the route-enumeration test now expects the six new routes.
+- After `supabase db push`:
+  - `\d heartbeats`, `\d snapshots`, `\d usage_events` show the three new tables.
+  - `\d+ cameras` shows `default_latency_mode` with check constraint.
+  - `\d+ stream_sessions` shows `req_latency_mode` / `lim_latency_mode`.
+- Manual smoke (against staging):
+  - Start a session, copy the JWT out of the streamid → `POST /v1/ingest/validate-stream` returns `accept: true` with the `lim_*` snapshot as `expected`.
+  - `POST /v1/heartbeats?agent_id=<uuid>` with a 3-item batch returns `accepted: 3`; `select last_seen_at from agents` updates within ~50 ms.
+  - `curl -F file=@frame.jpg -F camera_id=... -F agent_id=... -F captured_at=...` against `/v1/snapshots` returns 201 and a row appears in Storage at `<account>/<camera>/<yyyymmdd>/<uuid>.jpg`.
+
+### Follow-up TODOs
+- Bump the Caddy per-request body cap on `/v1/snapshots` to >= 5 MB (currently 1 MB globally). Track with a per-path matcher in `deploy/caddyfile.
+- Wire `upstream-agent` (pip lib) against this surface; record real-world heartbeat cadence to tune Caddy rate-limit per-token if needed.
+- Wire `upstream-streaming-server` (MediaMTX) `runOnPublish` hook to call `validate-stream` and `runOnUnpublish` to call `stream-ended`.
+- Add integration tests with testcontainers (asyncpg + Supabase Storage emulator) to exercise the full ingest webhook flow against a real DB and storage backend.
+
+---
+
 ## 2026-05-12 - Auth hardening: argon2 off the event loop, MFA claims, membership cache, no token-id oracle, last_used_at writes
 
 ### Summary

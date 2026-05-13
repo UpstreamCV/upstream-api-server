@@ -49,9 +49,25 @@ class StartSessionResult:
     srt_url: str
 
 
-def _build_srt_url(streamid: str, ingest_host: str = "ingest.upstream.tv", port: int = 8890) -> str:
+# SRT latency in milliseconds per mode. Lower = lower glass-to-glass delay,
+# higher = better tolerance for jitter / packet loss on weaker links.
+_LATENCY_MS_BY_MODE = {
+    "low": 80,
+    "balanced": 200,
+    "stable": 1500,
+}
+
+
+def _build_srt_url(
+    streamid: str,
+    *,
+    latency_mode: str = "balanced",
+    ingest_host: str = "ingest.upstream.tv",
+    port: int = 8890,
+) -> str:
     # URL-safe streamid; SRT carries the streamid as a UTF-8 string.
-    return f"srt://{ingest_host}:{port}?streamid={streamid}&latency=200"
+    latency_ms = _LATENCY_MS_BY_MODE.get(latency_mode, _LATENCY_MS_BY_MODE["balanced"])
+    return f"srt://{ingest_host}:{port}?streamid={streamid}&latency={latency_ms}"
 
 
 async def start_session(
@@ -117,21 +133,21 @@ async def start_session(
     )
 
     streamid = build_streamid(session_token)
-    srt_url = _build_srt_url(streamid)
+    srt_url = _build_srt_url(streamid, latency_mode=approved.latency_mode)
 
     try:
         row = await conn.fetchrow(
             """
             insert into stream_sessions (
               id, account_id, agent_id, camera_id, state,
-              req_width, req_height, req_fps, req_codec, req_bitrate_kbps,
-              lim_width, lim_height, lim_fps, lim_codec, lim_bitrate_kbps,
+              req_width, req_height, req_fps, req_codec, req_bitrate_kbps, req_latency_mode,
+              lim_width, lim_height, lim_fps, lim_codec, lim_bitrate_kbps, lim_latency_mode,
               streamid, srt_url, session_token_jti, expires_at
             ) values (
               $1, $2, $3, $4, 'approved',
-              $5, $6, $7, $8, $9,
-              $10, $11, $12, $13, $14,
-              $15, $16, $17, $18
+              $5, $6, $7, $8, $9, $10,
+              $11, $12, $13, $14, $15, $16,
+              $17, $18, $19, $20
             )
             returning id, state, expires_at, started_at, ended_at
             """,
@@ -144,11 +160,13 @@ async def start_session(
             requested.fps,
             requested.codec,
             requested.bitrate_kbps,
+            requested.latency_mode,
             approved.width,
             approved.height,
             approved.fps,
             approved.codec,
             approved.bitrate_kbps,
+            approved.latency_mode,
             streamid,
             srt_url,
             jti,
@@ -206,8 +224,8 @@ async def stop_session(
         """
         select id, account_id, agent_id, camera_id, state, srt_url, streamid,
                expires_at, started_at, ended_at,
-               req_width, req_height, req_fps, req_codec, req_bitrate_kbps,
-               lim_width, lim_height, lim_fps, lim_codec, lim_bitrate_kbps
+               req_width, req_height, req_fps, req_codec, req_bitrate_kbps, req_latency_mode,
+               lim_width, lim_height, lim_fps, lim_codec, lim_bitrate_kbps, lim_latency_mode
           from stream_sessions
          where id = $1
         """,
@@ -267,6 +285,7 @@ async def stop_session(
             fps=row["req_fps"],
             codec=row["req_codec"],
             bitrate_kbps=row["req_bitrate_kbps"],
+            latency_mode=row["req_latency_mode"],
         ),
         approved=LimitsSnapshot(
             width=row["lim_width"],
@@ -274,5 +293,6 @@ async def stop_session(
             fps=row["lim_fps"],
             codec=row["lim_codec"],
             bitrate_kbps=row["lim_bitrate_kbps"],
+            latency_mode=row["lim_latency_mode"],
         ),
     )

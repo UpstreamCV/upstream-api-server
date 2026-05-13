@@ -34,3 +34,7 @@ class AgentResponse(BaseModel):
 class AgentRegisterResponse(BaseModel):
     agent: AgentResponse
     server_time: datetime
+
+
+class AgentListResponse(BaseModel):
+    agents: list[AgentResponse]
