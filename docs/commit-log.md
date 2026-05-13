@@ -4,6 +4,26 @@ Reverse chronological. Newest at top. Every meaningful commit gets an entry foll
 
 ---
 
+## 2026-05-13 - Phase 4.5 endpoint smoke tests
+
+### Summary
+Add `tests/test_phase45_endpoints.py` covering all nine new GET endpoints from the previous commit. Same unit-level no-DB pattern as the rest of `tests/` — verifies the auth dep is wired (missing header → 401 `missing_credentials`, non-Bearer scheme → 401 `invalid_auth_scheme`, garbage bearer → 401 `invalid_user_token`/`invalid_token`) plus one regression test that an agent token (`ups_*`) is rejected by `/v1/api-tokens` because it requires a Supabase user JWT specifically. 28 new tests; total suite is now 104, runs in ~2.6 s.
+
+### Files touched
+- `tests/test_phase45_endpoints.py` (new) — parameterized over the nine endpoints; overrides `get_pool` with a no-op stand-in so the lifespan isn't needed (auth dep rejects before any DB access).
+
+### System interaction notes
+- I considered also testing path-param UUID validation (malformed UUID → 422) but FastAPI processes the auth dep before pydantic path validation when an `Authorization` header is present, so the route always 401s before reaching UUID parsing. UUID parsing is FastAPI's framework guarantee, not our code, so the tests would have only verified framework behavior — left out to keep the suite focused.
+- The full end-to-end happy path (real auth → real DB → real response shapes) lives in `scripts/smoke_local.py` and the manual `make dev-account` flow, not in `tests/`.
+
+### How to verify
+```sh
+make test
+# 104 passed in 2.6s
+```
+
+---
+
 ## 2026-05-13 - Phase 4.5 dashboard convenience endpoints + dev-account seeder
 
 ### Summary
