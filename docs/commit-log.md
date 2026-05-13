@@ -4,6 +4,30 @@ Reverse chronological. Newest at top. Every meaningful commit gets an entry foll
 
 ---
 
+## 2026-05-13 - Signup auto-provisioning trigger on auth.users
+
+### Summary
+Close the bootstrap gap where a fresh Supabase Auth signup leaves a user with no `accounts`, `account_members`, or `account_limits` row. New migration adds a `SECURITY DEFINER` `handle_new_user()` function + `on_auth_user_created` trigger on `auth.users` insert that auto-provisions all three. Account name comes from `raw_user_meta_data.workspace_name` (set by the dashboard signup form) and falls back to the email handle. Slug is `slugify(name) + '-' + <6-char uuid suffix>` so collisions don't need a retry loop. Limits match the existing permissive `seed.sql` defaults (5 cameras, 5 concurrent sessions, 60 fps, 1920×1080, 8000 kbps, `{h264,h265}`).
+
+### Files touched
+- `supabase/migrations/20260513140000_signup_trigger.sql` (new) — `handle_new_user()` function and `on_auth_user_created` trigger. `SECURITY DEFINER` with explicit `set search_path = public, pg_temp` per Supabase hardening guidance. Idempotent: short-circuits via `account_members` existence check so re-runs against the same user (test fixtures, manual re-inserts, `supabase db reset`) are safe.
+- `docs/commit-log.md` — this entry.
+
+### System interaction notes
+- The trigger fires for **every** signup path: email/password, magic link, OAuth, and Studio's "Add user" — anything that lands a row in `auth.users`. The dashboard's `signUpAction` passes `workspace_name` via `options.data`, which Supabase Auth stores as `raw_user_meta_data->>'workspace_name'`. The trigger picks it up; without it, the trigger falls back to `initcap(split_part(email, '@', 1))` (`alice@…` → "Alice").
+- `SECURITY DEFINER` bypasses the SELECT-only RLS policies on `accounts`, `account_members`, `account_limits` for the trigger's INSERTs. Function ownership is the Supabase-default `postgres` role.
+- The fixed-suffix slug (`<base>-<6char>`) is collision-resistant without catching unique-violation errors. Probability of collision at any realistic scale is negligible (`16^6 ≈ 16.7M` per slug base).
+- The trigger runs in the same DB transaction as the `auth.users` insert, so by the time `signUpAction` in the dashboard returns, `getActiveAccount()` will find the membership on the very next request. No async lag.
+- Local-dev `seed.sql` is unaffected: it still creates the "Local Dev" account used by `scripts/seed_dev_token.py` for the API-token smoke path. That account has no `auth.users` row, which is fine — it's for the agent-side path, not the dashboard-side.
+- Pre-existing orphan `auth.users` rows (created before this migration, no `account_members` row) are NOT backfilled here. If any exist, a one-time `select handle_new_user() ...` migration can sweep them; not needed for fresh projects.
+
+### How to verify locally
+1. `supabase db reset` — applies the new migration + seed (Local Dev account untouched).
+2. Sign up in the dashboard at `/signup` with `alice@test.local`, workspace `Acme Vision`.
+3. `select a.name, a.slug, m.role, l.max_cameras from accounts a join account_members m on m.account_id = a.id join account_limits l on l.account_id = a.id where m.user_id = (select id from auth.users where email = 'alice@test.local');` returns one row with `max_cameras=5`, slug like `acme-vision-a1b2c3`.
+
+---
+
 ## 2026-05-12 - Phase 2 + Phase 3 + Phase 4 API surface: ingest webhooks, heartbeats, snapshots, dashboard reads
 
 ### Summary
