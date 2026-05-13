@@ -1,8 +1,21 @@
-"""Verify Supabase Auth JWTs presented by dashboard users."""
+"""Verify Supabase Auth JWTs presented by dashboard users.
+
+Supports both signing-key generations:
+  - **HS256** (legacy / "JWT secret" projects): verified with the project's
+    static `UPSTREAM_SUPABASE_JWT_SECRET`.
+  - **ES256 / RS256** (new asymmetric "JWT signing keys" — the default for
+    fresh Supabase projects since late 2024): public key fetched from the
+    project's JWKS endpoint at `<supabase_url>/auth/v1/.well-known/jwks.json`
+    and matched against the token's `kid`.
+
+The algorithm is detected from the unverified JWT header, so both kinds of
+tokens are accepted seamlessly.
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from threading import Lock
 from uuid import UUID
 
 import jwt
@@ -24,15 +37,70 @@ class SupabaseJwtError(Exception):
     pass
 
 
-def verify_supabase_token(token: str, *, secret: str) -> SupabaseUserClaims:
+# JWKS caching. PyJWKClient already caches HTTP responses for `lifespan`
+# seconds, but it doesn't internally key on URL — so we keep one client per
+# Supabase URL. Lock prevents racing the first fetch.
+_JWKS_LIFESPAN_SECONDS = 600
+_jwks_clients: dict[str, jwt.PyJWKClient] = {}
+_jwks_lock = Lock()
+
+
+def _get_jwks_client(supabase_url: str) -> jwt.PyJWKClient:
+    with _jwks_lock:
+        client = _jwks_clients.get(supabase_url)
+        if client is None:
+            jwks_url = f"{supabase_url.rstrip('/')}/auth/v1/.well-known/jwks.json"
+            client = jwt.PyJWKClient(jwks_url, lifespan=_JWKS_LIFESPAN_SECONDS)
+            _jwks_clients[supabase_url] = client
+        return client
+
+
+_HMAC_ALGS = {"HS256", "HS384", "HS512"}
+_ASYMMETRIC_ALGS = {"ES256", "ES384", "ES512", "RS256", "RS384", "RS512"}
+
+
+def verify_supabase_token(
+    token: str,
+    *,
+    secret: str,
+    supabase_url: str | None = None,
+) -> SupabaseUserClaims:
     try:
-        payload = jwt.decode(
-            token,
-            secret,
-            algorithms=["HS256"],
-            audience="authenticated",
-            options={"require": ["exp", "sub"]},
-        )
+        header = jwt.get_unverified_header(token)
+    except jwt.InvalidTokenError as exc:
+        raise SupabaseJwtError(f"Invalid user token: {exc}") from exc
+
+    alg = header.get("alg")
+    if not isinstance(alg, str):
+        raise SupabaseJwtError("Invalid user token: missing alg in header.")
+
+    try:
+        if alg in _HMAC_ALGS:
+            payload = jwt.decode(
+                token,
+                secret,
+                algorithms=sorted(_HMAC_ALGS),
+                audience="authenticated",
+                options={"require": ["exp", "sub"]},
+            )
+        elif alg in _ASYMMETRIC_ALGS:
+            if not supabase_url:
+                raise SupabaseJwtError("Supabase URL is required to verify asymmetric JWTs.")
+            try:
+                signing_key = _get_jwks_client(supabase_url).get_signing_key_from_jwt(token)
+            except jwt.PyJWKClientError as exc:
+                raise SupabaseJwtError(f"Could not fetch JWKS: {exc}") from exc
+            payload = jwt.decode(
+                token,
+                signing_key.key,
+                algorithms=sorted(_ASYMMETRIC_ALGS),
+                audience="authenticated",
+                options={"require": ["exp", "sub"]},
+            )
+        else:
+            raise SupabaseJwtError(f"Unsupported JWT algorithm: {alg}")
+    except SupabaseJwtError:
+        raise
     except jwt.ExpiredSignatureError as exc:
         raise SupabaseJwtError("User token expired.") from exc
     except jwt.InvalidTokenError as exc:

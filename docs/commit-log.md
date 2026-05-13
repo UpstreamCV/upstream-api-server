@@ -4,6 +4,35 @@ Reverse chronological. Newest at top. Every meaningful commit gets an entry foll
 
 ---
 
+## 2026-05-13 - Support Supabase's asymmetric JWT signing keys (ES256)
+
+### Summary
+Dashboard users on Supabase projects using the new asymmetric "JWT signing keys" (default for projects created since late 2024) hit `Invalid user token: The specified alg value is not allowed` on the first authenticated request — `verify_supabase_token` only accepted HS256. Updated to detect the algorithm from the JWT header and verify accordingly: HS256/HS384/HS512 against the static project secret (legacy projects), ES256/ES384/ES512/RS256/RS384/RS512 against the public key fetched from `<supabase_url>/auth/v1/.well-known/jwks.json` and matched by `kid`. Project `xhniroynuandklvgajoc` is on ES256, which is what triggered this.
+
+### Files touched
+- `src/upstream_api/security/supabase_jwt.py` — new dual-algorithm flow; module-level cached `PyJWKClient` per Supabase URL (lifespan 600 s). New optional `supabase_url` kwarg on `verify_supabase_token`, required when the token's alg is asymmetric.
+- `src/upstream_api/security/deps.py` — `current_user` now passes `supabase_url=settings.supabase_url` into the verifier.
+
+### System interaction notes
+- `PyJWKClient` is sync (uses `urllib.request.urlopen` under the hood). With a 10-minute cache lifespan and ~1 request per dashboard view, the blocking fetch happens at most once every 10 min per worker — acceptable; can wrap in `asyncio.to_thread` later if request volume grows.
+- HS256 still works for legacy projects whose `.env` has a valid `UPSTREAM_SUPABASE_JWT_SECRET`. We don't need to keep that env var populated for ES256-only projects, but leaving it in place doesn't break anything.
+- The JWKS URL convention `<supabase_url>/auth/v1/.well-known/jwks.json` is stable Supabase Auth behavior; verified against the hosted project.
+- No new dependencies — `pyjwt[crypto]>=2.9` was already declared in `pyproject.toml` and gives us `PyJWKClient` + EC verification.
+
+### How to verify
+```sh
+make test
+# 104 passed
+
+# Then deploy + sign into the dashboard:
+ssh -i <ssh-key> ec2-user@<api-ip>
+cd ~/upstream-api-server && git pull
+cd deploy && docker compose up -d --build api
+# Sign in at http://localhost:3000 — error frame gone, /dashboard renders.
+```
+
+---
+
 ## 2026-05-13 - Phase 4.5 endpoint smoke tests
 
 ### Summary
