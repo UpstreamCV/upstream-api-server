@@ -8,20 +8,26 @@ go into the `snapshots` table. Quota is enforced against
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Annotated
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, File, Form, UploadFile
+from fastapi import APIRouter, File, Form, Query, UploadFile
 
 from upstream_api.errors import ApiError, ConflictError, LimitExceeded, NotFoundError
 from upstream_api.observability.context import agent_id_var
-from upstream_api.schemas.snapshots import SnapshotUploadResponse
-from upstream_api.security.deps import CurrentAgent, PoolDep, SettingsDep
-from upstream_api.services.storage import upload_bytes
+from upstream_api.schemas.snapshots import LatestFrameResponse, SnapshotUploadResponse
+from upstream_api.security.deps import CurrentAgent, CurrentCaller, PoolDep, SettingsDep
+from upstream_api.services.storage import create_signed_url, upload_bytes
 from upstream_api.services.usage import record_event
 
 router = APIRouter(prefix="/v1/snapshots", tags=["snapshots"])
+
+# Lives at /v1/cameras/{id}/latest-frame to match the design doc; mounted
+# separately so this file owns all snapshot-related handlers.
+camera_router = APIRouter(tags=["snapshots"])
+
+_SIGNED_URL_TTL_SECONDS = 60
 
 _ALLOWED_CONTENT_TYPES = {"image/jpeg", "image/jpg"}
 
@@ -169,4 +175,63 @@ async def upload_snapshot(
         height=row["height"],
         captured_at=row["captured_at"],
         created_at=row["created_at"],
+    )
+
+
+@camera_router.get(
+    "/v1/cameras/{camera_id}/latest-frame",
+    response_model=LatestFrameResponse,
+)
+async def get_latest_frame(
+    camera_id: UUID,
+    caller: CurrentCaller,
+    pool: PoolDep,
+    settings: SettingsDep,
+    account_id: Annotated[UUID | None, Query()] = None,
+) -> LatestFrameResponse:
+    """Most recent snapshot for a camera + a short-lived signed URL.
+
+    Replaces the dashboard's direct Supabase Storage + table query. The
+    signed URL expires after ~60s; clients re-fetch this endpoint to refresh.
+    """
+    scope_account = caller.resolve_account(account_id)
+    async with pool.acquire() as conn:
+        owner_row = await conn.fetchrow(
+            "select account_id from cameras where id = $1",
+            camera_id,
+        )
+        if owner_row is None or owner_row["account_id"] != scope_account:
+            raise NotFoundError("Camera not found.", code="camera_not_found")
+
+        row = await conn.fetchrow(
+            """
+            select storage_key, bytes, width, height, captured_at, created_at
+              from snapshots
+             where camera_id = $1
+             order by captured_at desc
+             limit 1
+            """,
+            camera_id,
+        )
+    if row is None:
+        raise NotFoundError(
+            "No frames captured for this camera yet.",
+            code="snapshot_not_found",
+        )
+
+    signed_url = await create_signed_url(
+        settings=settings,
+        bucket=settings.supabase_storage_bucket,
+        storage_key=row["storage_key"],
+        expires_in=_SIGNED_URL_TTL_SECONDS,
+    )
+    return LatestFrameResponse(
+        storage_key=row["storage_key"],
+        bytes=row["bytes"],
+        width=row["width"],
+        height=row["height"],
+        captured_at=row["captured_at"],
+        created_at=row["created_at"],
+        signed_url=signed_url,
+        expires_at=datetime.now(tz=UTC) + timedelta(seconds=_SIGNED_URL_TTL_SECONDS),
     )

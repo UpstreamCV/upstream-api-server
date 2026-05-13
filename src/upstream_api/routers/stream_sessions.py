@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Annotated
+import json
+from typing import Annotated, Any
 from uuid import UUID
 
 from fastapi import APIRouter, Query
@@ -12,6 +13,10 @@ from upstream_api.schemas.stream_sessions import (
     StreamSessionResponse,
     StreamSessionStartRequest,
     StreamSessionStartResponse,
+)
+from upstream_api.schemas.stream_validations import (
+    StreamValidationListResponse,
+    StreamValidationResponse,
 )
 from upstream_api.security.deps import CurrentAgent, CurrentCaller, PoolDep, SettingsDep
 from upstream_api.services.limits import LimitsSnapshot, RequestedStream
@@ -191,3 +196,61 @@ async def get_session(
         raise NotFoundError("Session not found.", code="session_not_found")
 
     return _row_to_response(_db_row_to_session(row))
+
+
+def _as_dict(value: object) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if value in (None, ""):
+        return {}
+    parsed = json.loads(value)  # type: ignore[arg-type]
+    assert isinstance(parsed, dict)
+    return parsed
+
+
+@router.get(
+    "/{session_id}/validations",
+    response_model=StreamValidationListResponse,
+)
+async def list_session_validations(
+    session_id: UUID,
+    caller: CurrentCaller,
+    pool: PoolDep,
+    account_id: Annotated[UUID | None, Query()] = None,
+    limit: Annotated[int, Query(ge=1, le=100)] = 20,
+) -> StreamValidationListResponse:
+    """Validation history for one session. Newest first."""
+    scope_account = caller.resolve_account(account_id)
+    async with pool.acquire() as conn:
+        owner_row = await conn.fetchrow(
+            "select account_id from stream_sessions where id = $1",
+            session_id,
+        )
+        if owner_row is None or owner_row["account_id"] != scope_account:
+            raise NotFoundError("Session not found.", code="session_not_found")
+
+        rows = await conn.fetch(
+            """
+            select id, session_id, passed, observed, expected, mismatch_fields,
+                   created_at
+              from stream_validations
+             where session_id = $1
+             order by created_at desc
+             limit $2
+            """,
+            session_id,
+            limit,
+        )
+    validations = [
+        StreamValidationResponse(
+            id=r["id"],
+            session_id=r["session_id"],
+            passed=r["passed"],
+            observed=_as_dict(r["observed"]),
+            expected=_as_dict(r["expected"]),
+            mismatch_fields=list(r["mismatch_fields"]),
+            created_at=r["created_at"],
+        )
+        for r in rows
+    ]
+    return StreamValidationListResponse(validations=validations)

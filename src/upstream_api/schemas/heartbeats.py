@@ -47,3 +47,7 @@ class HeartbeatRecord(BaseModel):
     agent_version: str | None
     reported_at: datetime
     created_at: datetime
+
+
+class HeartbeatListResponse(BaseModel):
+    heartbeats: list[HeartbeatRecord]

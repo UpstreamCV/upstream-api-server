@@ -44,3 +44,28 @@ async def upload_bytes(
         data,
         {"content-type": content_type, "upsert": "true"},
     )
+
+
+async def create_signed_url(
+    *,
+    settings: Settings,
+    bucket: str,
+    storage_key: str,
+    expires_in: int = 60,
+) -> str:
+    """Return a time-limited signed URL for `bucket/storage_key`.
+
+    Used by `GET /v1/cameras/{id}/latest-frame` so dashboards can render a
+    JPEG without holding the Supabase service-role key client-side.
+    """
+    client = _client(settings)
+    response = await asyncio.to_thread(
+        client.storage.from_(bucket).create_signed_url,
+        storage_key,
+        expires_in,
+    )
+    # supabase-py returns dict with key 'signedURL' (camelCase from the JS-style API).
+    signed_url = response.get("signedURL") if isinstance(response, dict) else None
+    if not signed_url:
+        raise RuntimeError(f"Supabase did not return a signed URL for {storage_key}")
+    return signed_url

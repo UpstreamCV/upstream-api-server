@@ -1,4 +1,4 @@
-.PHONY: install dev test lint typecheck format db-start db-stop db-reset db-diff db-push
+.PHONY: install dev test lint typecheck format db-start db-stop db-reset db-diff db-push dev-account dev-account-reset
 
 install:
 	uv sync
@@ -37,3 +37,9 @@ db-push:
 
 db-types:
 	supabase gen types typescript --local > /dev/null
+
+dev-account:
+	uv run python scripts/seed_dev_account.py
+
+dev-account-reset:
+	uv run python scripts/seed_dev_account.py --reset

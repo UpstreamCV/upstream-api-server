@@ -29,3 +29,7 @@ class ApiTokenSummary(BaseModel):
 class ApiTokenCreateResponse(BaseModel):
     token: ApiTokenSummary
     plaintext: str  # shown exactly once
+
+
+class ApiTokenListResponse(BaseModel):
+    tokens: list[ApiTokenSummary]

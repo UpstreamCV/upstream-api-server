@@ -478,6 +478,133 @@ Query: `account_id`, `agent_id`, `camera_id`, `state` (`approved|streaming|ended
 
 Response: `{ "sessions": [StreamSessionResponse, ...] }`.
 
+## Endpoints — Phase 4.5: dashboard convenience reads
+
+Added so the dashboard doesn't have to query Supabase tables/Storage directly. All use the same `current_caller` (agent token OR Supabase user JWT) unless noted.
+
+### `GET /v1/me`
+
+Auth: `current_user` only (no agent token — agents don't have a "me" concept).
+
+Response 200:
+```json
+{
+  "user_id": "uuid",
+  "aal": "aal1",
+  "amr": ["password"],
+  "memberships": [
+    { "account_id": "uuid", "account_name": "Acme", "account_slug": "acme-a1b2c3", "role": "owner" }
+  ]
+}
+```
+
+### `GET /v1/account`
+
+Query: `account_id` (UUID, required for multi-account users).
+
+Response 200: full `accounts` row.
+
+Errors: `account_not_found`.
+
+### `GET /v1/account/limits`
+
+Query: `account_id`.
+
+Response 200: full `account_limits` row.
+
+Errors: `account_limits_missing`.
+
+### `GET /v1/api-tokens`
+
+Auth: `current_user` + role gate (owner/admin only — mirrors the existing POST).
+
+Query: `account_id`.
+
+Response 200:
+```json
+{
+  "tokens": [
+    {
+      "id": "uuid",
+      "account_id": "uuid",
+      "name": "production agent",
+      "prefix": "ups_live_AB12CDEF",
+      "last_four": "WXYZ",
+      "scopes": ["agent"],
+      "last_used_at": null,
+      "expires_at": null,
+      "revoked_at": null,
+      "created_at": "..."
+    }
+  ]
+}
+```
+
+Errors: `forbidden.role`, `account_id_required`, `forbidden_account`.
+
+### `GET /v1/agents/{agent_id}/heartbeats`
+
+Query: `account_id`, `limit` (1-500, default 50), `before` (ISO datetime).
+
+Response 200: `{ "heartbeats": [HeartbeatRecord, ...] }` newest first.
+
+Errors: `agent_not_found`.
+
+### `GET /v1/cameras/{camera_id}/heartbeats`
+
+Same shape as above, filtered by `camera_id`.
+
+Errors: `camera_not_found`.
+
+### `GET /v1/cameras/{camera_id}/latest-frame`
+
+Query: `account_id`.
+
+Response 200:
+```json
+{
+  "storage_key": "<account_id>/<camera_id>/20260513/<uuid>.jpg",
+  "bytes": 187432,
+  "width": 1280,
+  "height": 720,
+  "captured_at": "2026-05-13T20:00:30Z",
+  "created_at": "2026-05-13T20:00:31Z",
+  "signed_url": "https://...supabase.co/storage/v1/object/sign/...",
+  "expires_at": "2026-05-13T20:01:31Z"
+}
+```
+
+The signed URL is short-lived (~60s). Clients should re-fetch this endpoint to refresh.
+
+Errors: `camera_not_found`, `snapshot_not_found`.
+
+### `GET /v1/stream-sessions/{session_id}/validations`
+
+Query: `account_id`, `limit` (1-100, default 20).
+
+Response 200: `{ "validations": [StreamValidationResponse, ...] }` newest first.
+
+Errors: `session_not_found`.
+
+### `GET /v1/dashboard/summary`
+
+Query: `account_id`.
+
+Response 200:
+```json
+{
+  "total_cameras": 5,
+  "online_cameras": 4,
+  "offline_cameras": 1,
+  "streaming_cameras": 3,
+  "cameras_with_errors": 0,
+  "active_streams": 3,
+  "validation_errors_24h": 0
+}
+```
+
+Errors: `account_id_required`, `forbidden_account`.
+
 ## Future endpoints (planned)
 
 ### Phase 5 — processor (auth: `current_processor`)
