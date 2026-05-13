@@ -91,9 +91,7 @@ def _webhook_headers() -> dict[str, str]:
     # Read the secret at call time. `conftest.py` uses `setdefault`, so CI envs
     # that set a real secret won't be overridden by the test default; we must
     # mirror whatever ``get_settings()`` resolved to.
-    return {
-        "X-Upstream-Webhook-Secret": get_settings().mediamtx_webhook_secret.get_secret_value()
-    }
+    return {"X-Upstream-Webhook-Secret": get_settings().mediamtx_webhook_secret.get_secret_value()}
 
 
 def test_validate_stream_accepts_a_fresh_approved_session() -> None:
