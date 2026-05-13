@@ -87,7 +87,13 @@ def _client(pool: FakePool) -> TestClient:
     return TestClient(app)
 
 
-_WEBHOOK = {"X-Upstream-Webhook-Secret": "test-mediamtx"}
+def _webhook_headers() -> dict[str, str]:
+    # Read the secret at call time. `conftest.py` uses `setdefault`, so CI envs
+    # that set a real secret won't be overridden by the test default; we must
+    # mirror whatever ``get_settings()`` resolved to.
+    return {
+        "X-Upstream-Webhook-Secret": get_settings().mediamtx_webhook_secret.get_secret_value()
+    }
 
 
 def test_validate_stream_accepts_a_fresh_approved_session() -> None:
@@ -105,7 +111,7 @@ def test_validate_stream_accepts_a_fresh_approved_session() -> None:
     r = client.post(
         "/v1/ingest/validate-stream",
         json={"streamid": streamid},
-        headers=_WEBHOOK,
+        headers=_webhook_headers(),
     )
     assert r.status_code == 200
     body = r.json()
@@ -121,7 +127,7 @@ def test_validate_stream_rejects_malformed_streamid() -> None:
     r = client.post(
         "/v1/ingest/validate-stream",
         json={"streamid": "subscribe:abc123"},
-        headers=_WEBHOOK,
+        headers=_webhook_headers(),
     )
     assert r.status_code == 200
     assert r.json()["accept"] is False
@@ -143,7 +149,7 @@ def test_validate_stream_rejects_jti_mismatch() -> None:
     r = client.post(
         "/v1/ingest/validate-stream",
         json={"streamid": build_streamid(token)},
-        headers=_WEBHOOK,
+        headers=_webhook_headers(),
     )
     body = r.json()
     assert body["accept"] is False
@@ -164,7 +170,7 @@ def test_validate_stream_rejects_wrong_state() -> None:
     r = client.post(
         "/v1/ingest/validate-stream",
         json={"streamid": build_streamid(token)},
-        headers=_WEBHOOK,
+        headers=_webhook_headers(),
     )
     body = r.json()
     assert body["accept"] is False
@@ -185,7 +191,7 @@ def test_validate_stream_rejects_expired_session() -> None:
     r = client.post(
         "/v1/ingest/validate-stream",
         json={"streamid": build_streamid(token)},
-        headers=_WEBHOOK,
+        headers=_webhook_headers(),
     )
     body = r.json()
     assert body["accept"] is False
