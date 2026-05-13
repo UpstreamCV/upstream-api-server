@@ -128,6 +128,7 @@ async def current_user(
         claims = verify_supabase_token(
             token,
             secret=settings.supabase_jwt_secret.get_secret_value(),
+            supabase_url=settings.supabase_url,
         )
     except SupabaseJwtError as exc:
         raise UnauthorizedError(str(exc), code="invalid_user_token") from exc
