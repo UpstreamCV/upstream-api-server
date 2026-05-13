@@ -8,6 +8,7 @@ unique lookup index. Only the ``secret`` portion is argon2id-hashed.
 
 from __future__ import annotations
 
+import asyncio
 import secrets
 from dataclasses import dataclass
 
@@ -81,3 +82,13 @@ def needs_rehash(encoded_hash: str) -> bool:
 
 def rehash(secret: str) -> str:
     return _HASHER.hash(secret)
+
+
+# Argon2 is CPU-bound (~50 ms tuned). Off-load to a worker thread so a single
+# verify/issue doesn't block the event loop for the whole worker process.
+async def verify_secret_async(secret: str, encoded_hash: str) -> bool:
+    return await asyncio.to_thread(verify_secret, secret, encoded_hash)
+
+
+async def issue_token_async(*, environment: str = "live") -> IssuedToken:
+    return await asyncio.to_thread(issue_token, environment=environment)

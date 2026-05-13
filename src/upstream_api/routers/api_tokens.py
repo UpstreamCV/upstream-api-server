@@ -10,7 +10,7 @@ from upstream_api.schemas.api_tokens import (
     ApiTokenCreateResponse,
     ApiTokenSummary,
 )
-from upstream_api.security.api_tokens import ALLOWED_SCOPES, issue_token
+from upstream_api.security.api_tokens import ALLOWED_SCOPES, issue_token_async
 from upstream_api.security.deps import CurrentUser, PoolDep, SettingsDep
 
 router = APIRouter(prefix="/v1/api-tokens", tags=["api-tokens"])
@@ -44,7 +44,7 @@ async def create_token(
         )
 
     env_label = "live" if settings.is_production else "test"
-    issued = issue_token(environment=env_label)
+    issued = await issue_token_async(environment=env_label)
 
     async with pool.acquire() as conn, conn.transaction():
         row = await conn.fetchrow(
@@ -87,14 +87,25 @@ async def revoke_token(
     user: CurrentUser,
     pool: PoolDep,
 ) -> None:
+    # Returning 404 for both "doesn't exist" and "exists but you can't admin
+    # this account" prevents token-id enumeration. The JOIN also obviates the
+    # separate _require_admin call.
     async with pool.acquire() as conn, conn.transaction():
         row = await conn.fetchrow(
-            "select account_id, revoked_at from api_tokens where id = $1",
+            """
+            select t.revoked_at
+              from api_tokens t
+              join account_members m
+                on m.account_id = t.account_id
+               and m.user_id = $2
+               and m.role in ('owner', 'admin')
+             where t.id = $1
+            """,
             token_id,
+            user.user_id,
         )
         if row is None:
             raise NotFoundError("Token not found.", code="token_not_found")
-        _require_admin(user, row["account_id"])
         if row["revoked_at"] is not None:
             return
         await conn.execute(

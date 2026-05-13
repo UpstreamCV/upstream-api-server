@@ -4,6 +4,87 @@ Reverse chronological. Newest at top. Every meaningful commit gets an entry foll
 
 ---
 
+## 2026-05-12 - Auth hardening: argon2 off the event loop, MFA claims, membership cache, no token-id oracle, last_used_at writes
+
+### Summary
+Five related auth fixes. (1) `argon2id` verify and hash now run via `asyncio.to_thread` so each ~50 ms hash doesn't block the worker's event loop — agent-authed throughput on `gunicorn --workers 2` is no longer capped at ~20 req/s/worker. (2) `current_agent` now writes `api_tokens.last_used_at` on each successful verify, throttled to once per 60 s per token to avoid hot-row contention; the column existed in the migration but was never populated. (3) `DELETE /v1/api-tokens/{token_id}` returns 404 in both "doesn't exist" and "exists but caller isn't an admin" cases — the JOIN against `account_members` makes the SELECT either match or not, removing the previous 404-vs-403 enumeration oracle. (4) Supabase JWT verifier now extracts and surfaces `aal` and `amr` claims through `SupabaseUserClaims` and `UserAuth` so handlers can gate sensitive ops on MFA when an account-level MFA policy lands. (5) `current_user` now reads memberships via a 60 s `cachetools.TTLCache` keyed on `user_id`, eliminating the per-request DB round-trip on dashboard endpoints.
+
+### Files touched
+- `src/upstream_api/security/api_tokens.py` — added `verify_secret_async` and `issue_token_async` wrappers around the CPU-bound argon2 calls.
+- `src/upstream_api/security/deps.py` — `current_agent` now uses the async verify, includes `last_used_at` in the SELECT, and writes a throttled update inside the same connection acquire. `current_user` uses a module-level `TTLCache` and propagates `aal`/`amr`. `UserAuth` gained `aal: str` and `amr: tuple[str, ...]`. Added `clear_membership_cache()` for tests.
+- `src/upstream_api/security/supabase_jwt.py` — `SupabaseUserClaims` gained `aal` (default `"aal1"`) and `amr` (default `()`); decoder handles both Supabase's list-of-strings and list-of-objects `amr` shapes.
+- `src/upstream_api/routers/api_tokens.py` — `revoke_token` JOINs `api_tokens` with `account_members` filtered to `role in ('owner','admin')`; returns 404 on miss. `create_token` now `await`s `issue_token_async`.
+- `pyproject.toml` — added `cachetools>=5.5` (runtime) and `types-cachetools>=5.5` (dev).
+- `tests/test_api_tokens.py` — added async wrapper round-trip; two `_FakePool`/`_FakeConn` tests for the `last_used_at` throttle (writes when null, skips when recent); two TestClient tests for the revoke 404 oracle (unknown id and non-admin caller produce identical bodies).
+- `tests/test_supabase_jwt.py` (new) — five tests covering `aal2` extraction, both `amr` shapes, the `aal1` default, expiry, and bad audience.
+
+### System interaction notes
+The argon2 wrapping is the highest-leverage piece: previously a single bursty agent could starve every other request handled by the same worker. The membership cache means a role change takes up to 60 s to propagate to the API — acceptable for the dashboard use cases today but worth revisiting if/when an admin yanks a user's access and expects it to take effect instantly. The 404-collapse on revoke removes a small token-id enumeration oracle; combined with the existing per-IP rate limit at Caddy this closes the obvious abuse path.
+
+### Testing/checks
+- `ruff check`, `ruff format --check`, `mypy --strict`, `pytest -q` clean (43 tests, was 23).
+- After deploy:
+  - `select last_used_at from api_tokens where prefix = ...` populates within a second of the first authed call.
+  - `DELETE /v1/api-tokens/<random uuid>` and `DELETE /v1/api-tokens/<existing token id from another account>` return identical JSON 404s.
+  - Dashboard auth latency drops by one round-trip per call after the first within a 60 s window per user.
+
+### Follow-up TODOs
+- Once an account-level MFA policy table exists, gate `POST /v1/api-tokens` and `DELETE /v1/api-tokens/{id}` on `aal == "aal2"` for accounts that require it.
+- Consider extending the membership cache key to `(user_id, jti)` if/when Supabase JWT rotation gets aggressive — currently a stale role survives for at most 60 s.
+
+---
+
+## 2026-05-12 - Close TOCTOU race on stream_sessions start
+
+### Summary
+Two concurrent `POST /v1/stream-sessions/start` calls on the same camera previously both passed the "is the camera streaming?" pre-check and both inserted, briefly minting two SRT URLs for one camera; the same race could let a single account exceed `max_concurrent_sessions`. Two changes belt-and-brace the fix. (1) New partial unique index `stream_sessions_one_active_per_camera_idx on stream_sessions(camera_id) where state in ('approved','streaming')` — Postgres rejects the second insert with a unique-violation, which `start_session` catches and re-raises as `ConflictError(code="camera_already_streaming")` (same shape as the pre-check error). (2) `check_session_start` now takes a transaction-scoped `pg_advisory_xact_lock(hashtextextended(account_id::text, 0))` before counting active sessions, serializing per-account decisions without contending across accounts.
+
+### Files touched
+- `supabase/migrations/20260512131000_session_unique_active_per_camera.sql` (new) — the partial unique index.
+- `src/upstream_api/services/session_lifecycle.py` — wraps the `INSERT ... RETURNING` in `try/except asyncpg.UniqueViolationError` and re-raises as `ConflictError`.
+- `src/upstream_api/services/limits.py` — adds the advisory lock at the top of `check_session_start` (after `load_account_limits`, before `count(*)`).
+- `docs/architecture.md` — new "Concurrency safeguards on session start" section documenting both mechanisms.
+- `tests/test_session_lifecycle.py` (new) — fake-conn tests for (a) `UniqueViolationError` -> `ConflictError(code="camera_already_streaming")` translation and (b) the advisory-lock SQL is issued.
+
+### System interaction notes
+The advisory lock is keyed on a 64-bit hash of `account_id::text` rather than the raw UUID — Postgres advisory locks are 64-bit integers, and `hashtextextended` is a stable in-DB hash that's transaction-safe. Collisions (two different accounts hashing to the same 64-bit key) would silently serialize them too, but the cost is one extra await per concurrent start, which is fine. A real concurrency test for this needs a live Postgres harness (testcontainers or `pytest-postgresql`) — same gap that's been outstanding for the integration test layer; deferred.
+
+### Testing/checks
+- `ruff check`, `ruff format --check`, `mypy --strict`, `pytest -q` clean (43 tests).
+- After deploy / `supabase db push`:
+  - `\d stream_sessions` shows `stream_sessions_one_active_per_camera_idx` as a partial unique index with the `WHERE` clause.
+  - `xargs -P 2 -I _ curl -X POST -H 'Authorization: Bearer …' …/v1/stream-sessions/start` (twice for the same camera) yields exactly one 200 and one 409 `camera_already_streaming`.
+
+### Follow-up TODOs
+- Add an integration test layer (testcontainers + asyncpg) that exercises the true concurrent path for both the per-camera unique index and the per-account advisory lock — would have caught this class of bug originally.
+
+---
+
+## 2026-05-12 - Scope usage.py error handling + tighten CORS allowlists
+
+### Summary
+Two unrelated hardening tweaks bundled because both shrink the surface of "wrong by default" config. (1) `services/usage.record_event` previously wrapped its INSERT in a blanket `except asyncpg.UndefinedTableError` to tolerate the Phase 1-4 absence of `usage_events`. That swallowed any future SQL typo that referenced a missing table too. Replaced with a one-shot `to_regclass('public.usage_events') is not null` probe cached in module state under an `asyncio.Lock`; the INSERT now runs without try/except, so unrelated errors propagate. (2) `CORSMiddleware` previously combined `allow_credentials=True` with `allow_methods=["*"]` and `allow_headers=["*"]`, which browsers silently downgrade. Replaced with explicit lists (`GET, POST, DELETE` and `Authorization, Content-Type, X-Request-ID`) so credentialed cross-origin actually works and any new method gets a deliberate review.
+
+### Files touched
+- `src/upstream_api/services/usage.py` — module-level `_table_exists` cache + `_probe_lock`; new `_probe_table_exists` and `reset_usage_table_cache` helpers; insert no longer guarded by `except`.
+- `src/upstream_api/app.py` — CORS middleware switched to explicit method/header lists; comment notes why.
+- `tests/test_usage.py` (new) — fake-conn tests for skip-when-missing, insert-when-present, and probe-result-caching.
+- `tests/test_app_routes.py` — added `test_cors_middleware_uses_explicit_methods_and_headers` which inspects `app.user_middleware` directly.
+
+### System interaction notes
+The `to_regclass` probe runs once per process and the cache is process-local, so a deploy after the Phase 5 migration ships will pick up the new state without a config flip — the next process boot's first `record_event` call will discover the table. The CORS change adds `OPTIONS` implicitly via Starlette's CORSMiddleware preflight handling, so no explicit OPTIONS in the methods list is needed.
+
+### Testing/checks
+- `ruff check`, `ruff format --check`, `mypy --strict`, `pytest -q` clean (43 tests).
+- After deploy:
+  - From the dashboard origin: a credentialed `fetch(..., {credentials: 'include'})` against `POST /v1/api-tokens` succeeds (previously failed silently in browsers).
+  - `select count(*) from usage_events;` (once Phase 5 ships) shows new rows; before then, `_logger.debug("usage_events_table_missing", ...)` fires once per process.
+
+### Follow-up TODOs
+- Add `PATCH`/`PUT` to the CORS methods list when (and only when) the API grows them — matches the explicit-allow philosophy of this change.
+
+---
+
 ## 2026-05-12 - Disable interactive docs in production + cap request body at 1 MB
 
 ### Summary

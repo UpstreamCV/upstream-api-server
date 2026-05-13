@@ -119,40 +119,48 @@ async def start_session(
     streamid = build_streamid(session_token)
     srt_url = _build_srt_url(streamid)
 
-    row = await conn.fetchrow(
-        """
-        insert into stream_sessions (
-          id, account_id, agent_id, camera_id, state,
-          req_width, req_height, req_fps, req_codec, req_bitrate_kbps,
-          lim_width, lim_height, lim_fps, lim_codec, lim_bitrate_kbps,
-          streamid, srt_url, session_token_jti, expires_at
-        ) values (
-          $1, $2, $3, $4, 'approved',
-          $5, $6, $7, $8, $9,
-          $10, $11, $12, $13, $14,
-          $15, $16, $17, $18
+    try:
+        row = await conn.fetchrow(
+            """
+            insert into stream_sessions (
+              id, account_id, agent_id, camera_id, state,
+              req_width, req_height, req_fps, req_codec, req_bitrate_kbps,
+              lim_width, lim_height, lim_fps, lim_codec, lim_bitrate_kbps,
+              streamid, srt_url, session_token_jti, expires_at
+            ) values (
+              $1, $2, $3, $4, 'approved',
+              $5, $6, $7, $8, $9,
+              $10, $11, $12, $13, $14,
+              $15, $16, $17, $18
+            )
+            returning id, state, expires_at, started_at, ended_at
+            """,
+            session_id,
+            account_id,
+            agent_id,
+            camera_id,
+            requested.width,
+            requested.height,
+            requested.fps,
+            requested.codec,
+            requested.bitrate_kbps,
+            approved.width,
+            approved.height,
+            approved.fps,
+            approved.codec,
+            approved.bitrate_kbps,
+            streamid,
+            srt_url,
+            jti,
+            expires_at,
         )
-        returning id, state, expires_at, started_at, ended_at
-        """,
-        session_id,
-        account_id,
-        agent_id,
-        camera_id,
-        requested.width,
-        requested.height,
-        requested.fps,
-        requested.codec,
-        requested.bitrate_kbps,
-        approved.width,
-        approved.height,
-        approved.fps,
-        approved.codec,
-        approved.bitrate_kbps,
-        streamid,
-        srt_url,
-        jti,
-        expires_at,
-    )
+    except asyncpg.UniqueViolationError as exc:
+        # Hit by the partial unique index `stream_sessions_one_active_per_camera_idx`
+        # when a concurrent /start raced past the pre-check above.
+        raise ConflictError(
+            "Camera already has an active stream session.",
+            code="camera_already_streaming",
+        ) from exc
     assert row is not None  # insert ... returning always returns a row
 
     await record_event(
