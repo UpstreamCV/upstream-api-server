@@ -4,6 +4,38 @@ Reverse chronological. Newest at top. Every meaningful commit gets an entry foll
 
 ---
 
+## 2026-05-13 - Grant authenticated SELECT on dashboard tables + snapshots storage policy
+
+### Summary
+Fix `permission denied for table <x>` (Postgres code 42501) when the dashboard queries `public.*` tables against hosted Supabase. Tables created via migration in hosted Supabase don't receive automatic `GRANT SELECT TO authenticated` the way the local Supabase CLI grants them, so the RLS `member_select` policies on `accounts`, `account_members`, `account_limits`, `api_tokens`, `agents`, `cameras`, `stream_sessions`, `stream_validations`, `heartbeats`, `snapshots`, and `usage_events` were unreachable — Postgres rejected the query before even consulting RLS. This migration adds explicit grants for all eleven, plus a `storage.objects` policy mirroring `snapshots_member_select` so `createSignedUrl()` calls from the dashboard succeed when the bucket eventually has objects.
+
+### Files touched
+- `supabase/migrations/20260513150000_dashboard_grants.sql` (new) — eleven `grant select … to authenticated` statements (idempotent), `grant usage on schema public to authenticated`, and a `snapshots_storage_member_select` policy on `storage.objects` keyed off the leading `<account_id>/` path segment.
+- `docs/commit-log.md` — this entry.
+
+### System interaction notes
+- The pattern going forward: any new public table intended for dashboard SELECT must include `grant select on public.<table> to authenticated;` in the same migration that creates it. Local Supabase CLI applies a similar grant by default, which is why this gap survived to hosted. Documented as a followup in the dashboard plan; should land in `AGENTS.md` of this repo too.
+- No writes are granted to `authenticated` — dashboard writes go through the api-server (service role). Read-only matches the policy intent.
+- The storage policy uses `(storage.foldername(name))[1]::uuid` to read the first path segment as the account id, matching the `storage_key` shape produced by `src/upstream_api/routers/snapshots.py:29` (`{account_id}/{camera_id}/{yyyymmdd}/{uuid}.jpg`). It applies the same membership check as the `snapshots` table's RLS so signed-URL access is consistent with table-row access.
+- The storage policy is a no-op if the `snapshots` bucket doesn't exist yet — bucket creation is out-of-band (Studio or first service-role upload), not in SQL migrations.
+
+### How to verify on hosted
+```sql
+-- 11 rows expected
+select grantee, table_name, privilege_type
+  from information_schema.table_privileges
+ where table_schema = 'public' and grantee = 'authenticated'
+ order by table_name;
+
+-- 1 row expected
+select polname from pg_policies
+ where schemaname = 'storage' and tablename = 'objects'
+   and polname = 'snapshots_storage_member_select';
+```
+Then refresh the dashboard at `http://localhost:3000` — the `permission denied for table account_members` error should be gone.
+
+---
+
 ## 2026-05-13 - Signup auto-provisioning trigger on auth.users
 
 ### Summary
