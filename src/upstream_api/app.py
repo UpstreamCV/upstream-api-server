@@ -53,12 +53,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     app.state.settings = settings
 
+    # `allow_credentials=True` combined with `*` in methods/headers is silently
+    # downgraded by browsers; enumerate the actual surface so credentialed
+    # cross-origin requests work and any new method gets a deliberate review.
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.allowed_origins,
         allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
+        allow_methods=["GET", "POST", "DELETE"],
+        allow_headers=["Authorization", "Content-Type", "X-Request-ID"],
         expose_headers=["X-Request-ID"],
     )
     app.add_middleware(AccessLogMiddleware)

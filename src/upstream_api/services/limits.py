@@ -126,6 +126,15 @@ async def check_session_start(
 
     check_camera_defaults(limits, requested)
 
+    # Serialize concurrent start_session calls for the same account so the
+    # count(*) below and the eventual insert observe a consistent view of
+    # active sessions. Released automatically at transaction commit/rollback;
+    # caller must hold a transaction (start_session does).
+    await conn.execute(
+        "select pg_advisory_xact_lock(hashtextextended($1::text, 0))",
+        str(account_id),
+    )
+
     active_count = await conn.fetchval(
         """
         select count(*)::int

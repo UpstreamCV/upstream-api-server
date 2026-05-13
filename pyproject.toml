@@ -22,6 +22,7 @@ dependencies = [
     "slowapi>=0.1.9",
     "gunicorn>=23",
     "uvicorn[standard]>=0.30",
+    "cachetools>=5.5",
 ]
 
 [dependency-groups]
@@ -32,6 +33,7 @@ dev = [
     "pytest-asyncio>=0.24",
     "respx>=0.21",
     "faker>=30",
+    "types-cachetools>=5.5",
 ]
 
 [build-system]

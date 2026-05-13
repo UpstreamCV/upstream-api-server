@@ -7,11 +7,12 @@ Importable as ``Annotated`` aliases so handlers can write
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Annotated
 from uuid import UUID
 
 import asyncpg
+from cachetools import TTLCache
 from fastapi import Depends, Header
 from fastapi.security.utils import get_authorization_scheme_param
 
@@ -19,9 +20,22 @@ from upstream_api.config import Settings, get_settings
 from upstream_api.db.pool import get_pool
 from upstream_api.errors import UnauthorizedError
 from upstream_api.observability.context import account_id_var, agent_id_var
-from upstream_api.security.api_tokens import split_token, verify_secret
+from upstream_api.security.api_tokens import split_token, verify_secret_async
 from upstream_api.security.shared_secret import verify_shared_secret
 from upstream_api.security.supabase_jwt import SupabaseJwtError, verify_supabase_token
+
+# Skip writing api_tokens.last_used_at if it was bumped within this window.
+# Avoids hot-row contention from a chatty agent fleet without losing freshness.
+_LAST_USED_REFRESH = timedelta(seconds=60)
+
+# Per-user membership cache. 60 s TTL means a role change propagates within a
+# minute — acceptable for the dashboard, and saves one DB round-trip per call.
+_membership_cache: TTLCache[UUID, dict[UUID, str]] = TTLCache(maxsize=2048, ttl=60)
+
+
+def clear_membership_cache() -> None:
+    """Reset the per-user membership cache. Tests only."""
+    _membership_cache.clear()
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,6 +50,10 @@ class UserAuth:
     user_id: UUID
     # account_id -> role
     memberships: dict[UUID, str]
+    # MFA assurance level + auth-methods. Handlers can gate sensitive ops on
+    # ``aal == "aal2"`` once an account-level MFA policy table lands.
+    aal: str
+    amr: tuple[str, ...]
 
 
 SettingsDep = Annotated[Settings, Depends(get_settings)]
@@ -64,22 +82,29 @@ async def current_agent(
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
-            select id, account_id, hash, scopes, expires_at, revoked_at
+            select id, account_id, hash, scopes, expires_at, revoked_at, last_used_at
               from api_tokens
              where prefix = $1
             """,
             prefix,
         )
 
-    if row is None:
-        raise UnauthorizedError("Token not recognized.", code="invalid_token")
-    if row["revoked_at"] is not None:
-        raise UnauthorizedError("Token has been revoked.", code="token_revoked")
-    if row["expires_at"] is not None and row["expires_at"] < datetime.now(tz=UTC):
-        # asyncpg returns timezone-aware datetimes for timestamptz columns.
-        raise UnauthorizedError("Token has expired.", code="token_expired")
-    if not verify_secret(secret, row["hash"]):
-        raise UnauthorizedError("Token not recognized.", code="invalid_token")
+        if row is None:
+            raise UnauthorizedError("Token not recognized.", code="invalid_token")
+        if row["revoked_at"] is not None:
+            raise UnauthorizedError("Token has been revoked.", code="token_revoked")
+        if row["expires_at"] is not None and row["expires_at"] < datetime.now(tz=UTC):
+            # asyncpg returns timezone-aware datetimes for timestamptz columns.
+            raise UnauthorizedError("Token has expired.", code="token_expired")
+        if not await verify_secret_async(secret, row["hash"]):
+            raise UnauthorizedError("Token not recognized.", code="invalid_token")
+
+        last_used_at: datetime | None = row["last_used_at"]
+        if last_used_at is None or (datetime.now(tz=UTC) - last_used_at) > _LAST_USED_REFRESH:
+            await conn.execute(
+                "update api_tokens set last_used_at = now() where id = $1",
+                row["id"],
+            )
 
     auth = AgentAuth(
         account_id=row["account_id"],
@@ -107,14 +132,22 @@ async def current_user(
     except SupabaseJwtError as exc:
         raise UnauthorizedError(str(exc), code="invalid_user_token") from exc
 
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            "select account_id, role from account_members where user_id = $1",
-            claims.user_id,
-        )
+    cached = _membership_cache.get(claims.user_id)
+    if cached is None:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                "select account_id, role from account_members where user_id = $1",
+                claims.user_id,
+            )
+        cached = {r["account_id"]: r["role"] for r in rows}
+        _membership_cache[claims.user_id] = cached
 
-    memberships = {r["account_id"]: r["role"] for r in rows}
-    return UserAuth(user_id=claims.user_id, memberships=memberships)
+    return UserAuth(
+        user_id=claims.user_id,
+        memberships=cached,
+        aal=claims.aal,
+        amr=claims.amr,
+    )
 
 
 CurrentUser = Annotated[UserAuth, Depends(current_user)]

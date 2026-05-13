@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 from upstream_api.app import create_app
 
 
@@ -20,3 +22,16 @@ def test_expected_routes_are_mounted() -> None:
     }
     missing = expected - paths
     assert not missing, f"Missing routes: {sorted(missing)}"
+
+
+def test_cors_middleware_uses_explicit_methods_and_headers() -> None:
+    app = create_app()
+    cors: Any = next(
+        m for m in app.user_middleware if getattr(m.cls, "__name__", "") == "CORSMiddleware"
+    )
+    methods = cors.kwargs["allow_methods"]
+    headers = cors.kwargs["allow_headers"]
+    assert "*" not in methods
+    assert "*" not in headers
+    assert set(methods) == {"GET", "POST", "DELETE"}
+    assert "Authorization" in headers

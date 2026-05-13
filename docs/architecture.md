@@ -105,6 +105,13 @@ The agent then opens an SRT connection to `upstream-streaming-server` with `stre
 
 When a session is approved, the relevant `account_limits` values are copied to `lim_*` columns on the session row. The streaming server uses the JWT's `lim` claim — which mirrors `lim_*` — as the contract for that session. If an operator raises or lowers `account_limits` mid-stream, the in-flight session is unaffected; the new limit only applies to future-session decisions.
 
+## Concurrency safeguards on session start
+
+Two concurrent `POST /v1/stream-sessions/start` calls could otherwise race past the application-level pre-checks. We belt-and-brace this in two places:
+
+- **Per-camera**: a partial unique index `stream_sessions_one_active_per_camera_idx on stream_sessions(camera_id) where state in ('approved','streaming')` makes the second insert fail with a unique-violation, which `services.session_lifecycle.start_session` translates back into the same `ConflictError(code="camera_already_streaming")` the pre-check raises.
+- **Per-account**: `services.limits.check_session_start` takes a transaction-scoped `pg_advisory_xact_lock(hashtextextended(account_id::text, 0))` before counting active sessions. Different accounts don't contend; concurrent starts within one account serialize and observe the same active-count snapshot. The lock releases automatically at commit/rollback because `start_session` runs inside `async with conn.transaction()`.
+
 ## Token model
 
 There are three kinds of token in the system:
