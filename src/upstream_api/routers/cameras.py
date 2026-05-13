@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 import json
+from typing import Annotated
+from uuid import UUID
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Query
 
 from upstream_api.errors import ConflictError, NotFoundError
-from upstream_api.schemas.cameras import CameraRegisterRequest, CameraResponse
-from upstream_api.security.deps import CurrentAgent, PoolDep
+from upstream_api.schemas.cameras import (
+    CameraListResponse,
+    CameraRegisterRequest,
+    CameraResponse,
+)
+from upstream_api.security.deps import CurrentAgent, CurrentCaller, PoolDep
 from upstream_api.services.limits import (
     RequestedStream,
     check_camera_defaults,
@@ -30,6 +36,7 @@ def _camera_to_response(row: dict) -> CameraResponse:  # type: ignore[type-arg]
         default_fps=row["default_fps"],
         default_codec=row["default_codec"],
         default_bitrate_kbps=row["default_bitrate_kbps"],
+        default_latency_mode=row["default_latency_mode"],
         metadata=row["metadata"]
         if isinstance(row["metadata"], dict)
         else json.loads(row["metadata"]),
@@ -37,6 +44,14 @@ def _camera_to_response(row: dict) -> CameraResponse:  # type: ignore[type-arg]
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )
+
+
+_CAMERA_COLUMNS = (
+    "id, account_id, agent_id, name, external_id, device_path, "
+    "default_width, default_height, default_fps, default_codec, "
+    "default_bitrate_kbps, default_latency_mode, metadata, status, "
+    "created_at, updated_at"
+)
 
 
 @router.post("/register", response_model=CameraResponse)
@@ -89,16 +104,14 @@ async def register_camera(
 
         if existing is None:
             row = await conn.fetchrow(
-                """
+                f"""
                 insert into cameras (
                   account_id, agent_id, name, external_id, device_path,
                   default_width, default_height, default_fps, default_codec, default_bitrate_kbps,
-                  metadata
+                  default_latency_mode, metadata
                 )
-                values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb)
-                returning id, account_id, agent_id, name, external_id, device_path,
-                          default_width, default_height, default_fps, default_codec,
-                          default_bitrate_kbps, metadata, status, created_at, updated_at
+                values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb)
+                returning {_CAMERA_COLUMNS}
                 """,
                 auth.account_id,
                 body.agent_id,
@@ -110,11 +123,12 @@ async def register_camera(
                 body.default_fps,
                 body.default_codec,
                 body.default_bitrate_kbps,
+                body.default_latency_mode,
                 json.dumps(body.metadata),
             )
         else:
             row = await conn.fetchrow(
-                """
+                f"""
                 update cameras
                    set name = $3,
                        device_path = $4,
@@ -123,11 +137,10 @@ async def register_camera(
                        default_fps = $7,
                        default_codec = $8,
                        default_bitrate_kbps = $9,
-                       metadata = $10::jsonb
+                       default_latency_mode = $10,
+                       metadata = $11::jsonb
                  where id = $1 and account_id = $2
-                returning id, account_id, agent_id, name, external_id, device_path,
-                          default_width, default_height, default_fps, default_codec,
-                          default_bitrate_kbps, metadata, status, created_at, updated_at
+                returning {_CAMERA_COLUMNS}
                 """,
                 existing["id"],
                 auth.account_id,
@@ -138,8 +151,56 @@ async def register_camera(
                 body.default_fps,
                 body.default_codec,
                 body.default_bitrate_kbps,
+                body.default_latency_mode,
                 json.dumps(body.metadata),
             )
 
     assert row is not None
+    return _camera_to_response(row)
+
+
+@router.get("", response_model=CameraListResponse)
+async def list_cameras(
+    caller: CurrentCaller,
+    pool: PoolDep,
+    account_id: Annotated[UUID | None, Query()] = None,
+    agent_id: Annotated[UUID | None, Query()] = None,
+    status: Annotated[str | None, Query(max_length=32)] = None,
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+) -> CameraListResponse:
+    scope_account = caller.resolve_account(account_id)
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            f"""
+            select {_CAMERA_COLUMNS}
+              from cameras
+             where account_id = $1
+               and ($2::uuid is null or agent_id = $2)
+               and ($3::text is null or status = $3)
+             order by created_at desc
+             limit $4
+            """,
+            scope_account,
+            agent_id,
+            status,
+            limit,
+        )
+    return CameraListResponse(cameras=[_camera_to_response(r) for r in rows])
+
+
+@router.get("/{camera_id}", response_model=CameraResponse)
+async def get_camera(
+    camera_id: UUID,
+    caller: CurrentCaller,
+    pool: PoolDep,
+    account_id: Annotated[UUID | None, Query()] = None,
+) -> CameraResponse:
+    scope_account = caller.resolve_account(account_id)
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            f"select {_CAMERA_COLUMNS} from cameras where id = $1",
+            camera_id,
+        )
+    if row is None or row["account_id"] != scope_account:
+        raise NotFoundError("Camera not found.", code="camera_not_found")
     return _camera_to_response(row)

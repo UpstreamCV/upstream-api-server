@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, Field
+
+LatencyMode = Literal["low", "balanced", "stable"]
 
 
 class CameraRegisterRequest(BaseModel):
@@ -17,6 +19,7 @@ class CameraRegisterRequest(BaseModel):
     default_fps: int = Field(ge=1, le=240)
     default_codec: str = Field(min_length=1, max_length=32)
     default_bitrate_kbps: int = Field(ge=1, le=200_000)
+    default_latency_mode: LatencyMode = "balanced"
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -32,7 +35,12 @@ class CameraResponse(BaseModel):
     default_fps: int | None
     default_codec: str | None
     default_bitrate_kbps: int | None
+    default_latency_mode: LatencyMode
     metadata: dict[str, Any]
     status: str
     created_at: datetime
     updated_at: datetime
+
+
+class CameraListResponse(BaseModel):
+    cameras: list[CameraResponse]

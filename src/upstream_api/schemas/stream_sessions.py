@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, Field
+
+LatencyMode = Literal["low", "balanced", "stable"]
 
 
 class RequestedStreamParams(BaseModel):
@@ -13,6 +15,7 @@ class RequestedStreamParams(BaseModel):
     fps: int = Field(ge=1, le=240)
     codec: str = Field(min_length=1, max_length=32)
     bitrate_kbps: int = Field(ge=1, le=200_000)
+    latency_mode: LatencyMode = "balanced"
 
 
 class StreamSessionStartRequest(BaseModel):
@@ -40,3 +43,7 @@ class StreamSessionStartResponse(BaseModel):
     srt_url: str
     session_token: str
     expires_at: datetime
+
+
+class StreamSessionListResponse(BaseModel):
+    sessions: list[StreamSessionResponse]
