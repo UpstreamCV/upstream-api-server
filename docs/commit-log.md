@@ -4,6 +4,46 @@ Reverse chronological. Newest at top. Every meaningful commit gets an entry foll
 
 ---
 
+## 2026-05-14 - WHEP proxy: MediaMTX 1.9.3 uses /whep/<id>, not /whepsession/<id>
+
+### Summary
+The WHEP proxy was issuing `POST` to MediaMTX, getting a `201` back with
+`Location: /<path>/whep/<uuid>`, and then failing to parse the resource id
+because `_LOCATION_RE` required the literal substring `whepsession`.
+Result: dashboard saw a `502 upstream_unavailable` on every WHEP attempt
+even though MediaMTX was happy. The DELETE path had the same bug — it
+built `/<path>/whepsession/<id>` URLs that would 404 against a real
+MediaMTX 1.9.3.
+
+### Fix
+- `_LOCATION_RE` now matches `/whep(?:session)?/<id>` — both the
+  MediaMTX 1.9.3+ form and the legacy `<= 1.8` form.
+- `proxy_whep_delete` issues `DELETE /<path>/whep/<id>` to match the
+  POST Location header MediaMTX returns.
+
+Verified against a real `upstream-streaming-server` running
+`bluenviron/mediamtx:1.9.3`:
+```
+Location: /sess_1d937c92aa231041/whep/3c4b69c1-ec6a-4f6e-b358-e89e86a16fc1
+```
+
+### Files touched
+- `src/upstream_api/services/whep_proxy.py` — regex + DELETE URL.
+- `tests/test_whep_proxy.py` — flipped 9 occurrences of `whepsession` to
+  `whep` to match the new contract; added one new test asserting the
+  legacy `/whepsession/` form is still accepted by the parser.
+
+### Verification
+`uv run pytest -q` → 145 passing (+1 for the legacy-form parser test).
+
+### Deploy
+```sh
+cd ~/upstream-api-server && git pull --ff-only
+cd deploy && docker compose up -d --build api
+```
+
+---
+
 ## 2026-05-14 - stop_session: mirror cameras.status to 'idle' (gap in prior commit)
 
 ### Summary

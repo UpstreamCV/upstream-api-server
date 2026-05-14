@@ -111,16 +111,23 @@ def _session_row(
 
 
 def test_parse_location_well_formed() -> None:
+    # MediaMTX 1.9.3 uses `/whep/<id>`.
+    assert parse_mediamtx_location("/sess_abc/whep/xyz-123") == "xyz-123"
+
+
+def test_parse_location_legacy_whepsession_form() -> None:
+    # Older MediaMTX (<= 1.8) used `/whepsession/<id>`; we still accept it
+    # so older deployments don't break.
     assert parse_mediamtx_location("/sess_abc/whepsession/xyz-123") == "xyz-123"
 
 
 def test_parse_location_trailing_slash() -> None:
-    assert parse_mediamtx_location("/sess_abc/whepsession/xyz-123/") == "xyz-123"
+    assert parse_mediamtx_location("/sess_abc/whep/xyz-123/") == "xyz-123"
 
 
 def test_parse_location_absolute_url() -> None:
     assert (
-        parse_mediamtx_location("http://localhost:8889/sess_abc/whepsession/xyz-123") == "xyz-123"
+        parse_mediamtx_location("http://localhost:8889/sess_abc/whep/xyz-123") == "xyz-123"
     )
 
 
@@ -133,7 +140,7 @@ def test_parse_location_empty() -> None:
 
 
 def test_parse_location_no_resource() -> None:
-    assert parse_mediamtx_location("/sess_abc/whepsession/") is None
+    assert parse_mediamtx_location("/sess_abc/whep/") is None
 
 
 def test_parse_location_unexpected_shape() -> None:
@@ -146,7 +153,7 @@ def test_parse_location_rejects_dot_in_resource_id() -> None:
     # succeeds with Location: "abc.def" while the DELETE router regex
     # (_RESOURCE_ID_RE) rejects dots. Aligning both sides at "no dots"
     # collapses the mismatch into a single 502 outcome at parse time.
-    assert parse_mediamtx_location("/sess_abc/whepsession/abc.def") is None
+    assert parse_mediamtx_location("/sess_abc/whep/abc.def") is None
 
 
 # -----------------------------------------------------------------------------
@@ -166,7 +173,7 @@ def test_whep_offer_happy_path() -> None:
             content=CANNED_SDP_ANSWER,
             headers={
                 "Content-Type": "application/sdp",
-                "Location": f"/{SESSION_PATH}/whepsession/abc-123",
+                "Location": f"/{SESSION_PATH}/whep/abc-123",
             },
         )
     )
@@ -203,7 +210,7 @@ def test_whep_offer_agent_caller_works() -> None:
             content=CANNED_SDP_ANSWER,
             headers={
                 "Content-Type": "application/sdp",
-                "Location": f"/{SESSION_PATH}/whepsession/abc-123",
+                "Location": f"/{SESSION_PATH}/whep/abc-123",
             },
         )
     )
@@ -388,7 +395,7 @@ def test_whep_delete_happy_path() -> None:
     row = _session_row(account_id=account_id)
     client = _build_client({row["id"]: row}, _user_caller(account_id))
 
-    route = respx.delete(f"{MEDIAMTX_BASE}/{SESSION_PATH}/whepsession/abc-123").mock(
+    route = respx.delete(f"{MEDIAMTX_BASE}/{SESSION_PATH}/whep/abc-123").mock(
         return_value=httpx.Response(200)
     )
 
@@ -428,7 +435,7 @@ def test_whep_delete_cross_account_returns_404() -> None:
     row = _session_row(account_id=session_owner)
     client = _build_client({row["id"]: row}, _user_caller(other_user_account))
 
-    route = respx.delete(f"{MEDIAMTX_BASE}/{SESSION_PATH}/whepsession/abc-123").mock(
+    route = respx.delete(f"{MEDIAMTX_BASE}/{SESSION_PATH}/whep/abc-123").mock(
         return_value=httpx.Response(200)
     )
 
@@ -448,7 +455,7 @@ def test_whep_delete_mediamtx_404_still_returns_204() -> None:
     account_id = uuid4()
     row = _session_row(account_id=account_id)
     client = _build_client({row["id"]: row}, _user_caller(account_id))
-    respx.delete(f"{MEDIAMTX_BASE}/{SESSION_PATH}/whepsession/abc-123").mock(
+    respx.delete(f"{MEDIAMTX_BASE}/{SESSION_PATH}/whep/abc-123").mock(
         return_value=httpx.Response(404)
     )
 
@@ -464,7 +471,7 @@ def test_whep_delete_mediamtx_timeout_still_returns_204() -> None:
     account_id = uuid4()
     row = _session_row(account_id=account_id)
     client = _build_client({row["id"]: row}, _user_caller(account_id))
-    respx.delete(f"{MEDIAMTX_BASE}/{SESSION_PATH}/whepsession/abc-123").mock(
+    respx.delete(f"{MEDIAMTX_BASE}/{SESSION_PATH}/whep/abc-123").mock(
         side_effect=httpx.ConnectTimeout("timeout")
     )
 

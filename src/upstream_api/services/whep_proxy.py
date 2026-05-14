@@ -22,11 +22,14 @@ from dataclasses import dataclass
 
 import httpx
 
-# MediaMTX 1.9 returns `Location: /<path>/whepsession/<uuid>` (path-absolute).
-# We extract the trailing resource id. The allowed character set must match
+# MediaMTX 1.9.3 returns `Location: /<path>/whep/<uuid>` on a successful
+# POST (verified against a running upstream-streaming-server on 2026-05-14;
+# the older `/whepsession/<uuid>` format from earlier MediaMTX versions is
+# kept here as a fallback so we don't break older deployments). We extract
+# the trailing resource id. The allowed character set must match
 # `_RESOURCE_ID_RE` in routers/stream_sessions.py — anything we accept here
 # must also pass DELETE validation, otherwise POST succeeds and DELETE 400s.
-_LOCATION_RE = re.compile(r"/whepsession/([A-Za-z0-9_~-]{1,128})/?$")
+_LOCATION_RE = re.compile(r"/whep(?:session)?/([A-Za-z0-9_~-]{1,128})/?$")
 
 
 class UpstreamMediaMTXUnavailable(Exception):
@@ -103,7 +106,13 @@ async def proxy_whep_delete(
     from the dashboard's perspective (session already gone). Transport
     failures bubble as :class:`UpstreamMediaMTXUnavailable`.
     """
-    url = f"{mediamtx_base_url.rstrip('/')}/{path}/whepsession/{resource_id}"
+    # MediaMTX 1.9.3 exposes the session endpoint at `/<path>/whep/<id>`;
+    # earlier MediaMTX versions used `/whepsession/<id>`. The Location header
+    # MediaMTX returns from POST is the canonical URL, but we reconstruct
+    # statelessly here from the resource_id. If we ever support a deploy
+    # against pre-1.9 MediaMTX, gate this on a settings flag — for now we
+    # only target 1.9.x.
+    url = f"{mediamtx_base_url.rstrip('/')}/{path}/whep/{resource_id}"
     try:
         response = await client.delete(url)
     except httpx.HTTPError as exc:
