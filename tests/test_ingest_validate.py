@@ -44,9 +44,7 @@ class FakePool:
         return AcquireCtx(self.conn)
 
 
-def _session_row(
-    *, session_id: UUID, state: str, expires_at: datetime
-) -> dict[str, Any]:
+def _session_row(*, session_id: UUID, state: str, expires_at: datetime) -> dict[str, Any]:
     return {
         "id": session_id,
         "account_id": uuid4(),
