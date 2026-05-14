@@ -7,6 +7,7 @@ import pytest
 from upstream_api.security.streamid import (
     build_streamid,
     extract_stream_key,
+    is_valid_stream_key,
     mint_stream_key,
 )
 
@@ -36,3 +37,26 @@ def test_built_streamid_fits_libsrt_limit() -> None:
 def test_extract_rejects_unknown_prefix(bad: str) -> None:
     with pytest.raises(ValueError):
         extract_stream_key(bad)
+
+
+def test_is_valid_stream_key_accepts_minted_keys() -> None:
+    for _ in range(5):
+        assert is_valid_stream_key(mint_stream_key())
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "",
+        "sess_",
+        "sess_short",
+        "sess_TOOLONG0123456789",
+        "sess_NOTHEXVALUE12345",
+        "publish:sess_0123456789abcdef",  # leading prefix
+        "sess_0123456789abcdef ",  # trailing whitespace
+        "SESS_0123456789abcdef",  # uppercase prefix
+        "session_0123456789abcdef",
+    ],
+)
+def test_is_valid_stream_key_rejects_malformed(bad: str) -> None:
+    assert is_valid_stream_key(bad) is False

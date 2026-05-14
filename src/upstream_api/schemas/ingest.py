@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Any
 from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class ValidateStreamRequest(BaseModel):
@@ -67,3 +67,26 @@ class LookupSessionResponse(BaseModel):
     agent_id: UUID
     camera_id: UUID
     state: str
+
+
+class MediaMTXAuthRequest(BaseModel):
+    """MediaMTX 1.9.3 authHTTP request body.
+
+    Shape is dictated by MediaMTX (see ``mediamtx.yml.default`` lines 87-96);
+    every field is defaulted because MediaMTX may omit values, and a 422 on
+    missing keys would falsely accept the publish (MediaMTX treats non-2xx
+    as deny but we still want our logs to record the action+protocol it sent).
+    Extra fields are ignored so a MediaMTX bump that adds keys does not break
+    the contract.
+    """
+
+    user: str = ""
+    password: str = ""
+    ip: str = ""
+    action: str = ""
+    path: str = ""
+    protocol: str = ""
+    id: str = ""
+    query: str = ""
+
+    model_config = ConfigDict(extra="ignore")
