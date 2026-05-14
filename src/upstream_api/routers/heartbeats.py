@@ -64,6 +64,15 @@ async def submit_heartbeats(
     in the batch must belong to that agent.
     """
     async with pool.acquire() as conn, conn.transaction():
+        # Validate agent_id ownership before any insert. Cross-account agents
+        # return the same 404 as unknown agents to avoid leaking existence.
+        owner_row = await conn.fetchrow(
+            "select account_id from agents where id = $1",
+            agent_id,
+        )
+        if owner_row is None or owner_row["account_id"] != auth.account_id:
+            raise NotFoundError("Agent not found.", code="agent_not_found")
+
         result = await record_batch(
             conn,
             account_id=auth.account_id,

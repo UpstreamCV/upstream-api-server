@@ -32,6 +32,7 @@ class StreamSessionResponse(BaseModel):
     srt_url: str
     streamid: str
     expires_at: datetime
+    created_at: datetime
     started_at: datetime | None
     ended_at: datetime | None
     requested: dict[str, Any]

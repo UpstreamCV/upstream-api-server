@@ -35,6 +35,7 @@ class StreamSessionRow:
     srt_url: str
     streamid: str
     expires_at: datetime
+    created_at: datetime
     started_at: datetime | None
     ended_at: datetime | None
     requested: RequestedStream
@@ -159,7 +160,7 @@ async def start_session(
               $11, $12, $13, $14, $15, $16,
               $17, $18, $19, $20
             )
-            returning id, state, expires_at, started_at, ended_at
+            returning id, state, expires_at, created_at, started_at, ended_at
             """,
             session_id,
             account_id,
@@ -209,6 +210,7 @@ async def start_session(
         srt_url=srt_url,
         streamid=streamid,
         expires_at=row["expires_at"],
+        created_at=row["created_at"],
         started_at=row["started_at"],
         ended_at=row["ended_at"],
         requested=requested,
@@ -233,7 +235,7 @@ async def stop_session(
     row = await conn.fetchrow(
         """
         select id, account_id, agent_id, camera_id, state, srt_url, streamid,
-               expires_at, started_at, ended_at,
+               expires_at, created_at, started_at, ended_at,
                req_width, req_height, req_fps, req_codec, req_bitrate_kbps, req_latency_mode,
                lim_width, lim_height, lim_fps, lim_codec, lim_bitrate_kbps, lim_latency_mode
           from stream_sessions
@@ -287,6 +289,7 @@ async def stop_session(
         srt_url=row["srt_url"],
         streamid=row["streamid"],
         expires_at=row["expires_at"],
+        created_at=row["created_at"],
         started_at=row["started_at"],
         ended_at=ended_at,
         requested=RequestedStream(

@@ -70,5 +70,5 @@ async def record_event(
         session_id,
         int(quantity),
         unit,
-        None if metadata is None else json.dumps(metadata),
+        "{}" if metadata is None else json.dumps(metadata),
     )

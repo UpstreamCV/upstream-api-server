@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import patch
 from uuid import UUID, uuid4
@@ -65,6 +66,7 @@ class FakeConn:
                 "id": args[0],
                 "state": "approved",
                 "expires_at": None,
+                "created_at": datetime.now(tz=UTC),
                 "started_at": None,
                 "ended_at": None,
             }
