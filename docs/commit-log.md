@@ -4,6 +4,39 @@ Reverse chronological. Newest at top. Every meaningful commit gets an entry foll
 
 ---
 
+## 2026-05-14 - Make SRT ingest host/port configurable via Settings
+
+### Summary
+After the streamid fix shipped, `upstream run` was still failing because the API kept advertising `srt://ingest.upstream.tv:8890?...` while the actual streaming server lives at `<ingest-ip>:18890`. Root cause: `_build_srt_url` had the host/port hardcoded as default argument values and the caller never overrode them — there was no settings hook at all. Operator-set `UPSTREAM_SRT_INGEST_HOST` / `UPSTREAM_SRT_INGEST_PORT` env vars on the EC2 host were being silently ignored (Settings used `extra="ignore"` and had no field for them).
+
+Added `srt_ingest_host` / `srt_ingest_port` to `Settings` (defaults preserve the previous hardcoded values for back-compat). `_build_srt_url` now takes them as required args; `start_session` passes them through from `settings`. The .env on the production box plus `.env.production.example` get the new keys.
+
+### Files touched
+- `src/upstream_api/config.py` — added `srt_ingest_host: str = "ingest.upstream.tv"` and `srt_ingest_port: int = 8890`.
+- `src/upstream_api/services/session_lifecycle.py` — `_build_srt_url` now takes `ingest_host` / `port` as required kwargs; `start_session` plumbs them from `settings`.
+- `tests/test_session_lifecycle.py` — new regression test `test_start_session_srt_url_uses_settings_host_and_port` that overrides both via `model_copy` and asserts the resulting `srt_url` starts with `srt://<ingest-ip>:18890?streamid=publish:sess_` and contains no `ingest.upstream.tv`.
+- `deploy/.env.production.example` — added the two new keys in a clearly-labelled SRT section.
+- `docs/api-contracts.md` — added rows for `UPSTREAM_SRT_INGEST_HOST` / `_PORT` to the env-var table.
+
+### Operator step (one-time, on each deployed environment)
+The new env vars must be set on each deployed box for the URL to point anywhere other than the back-compat default. On `<api-ip>`:
+```sh
+cd ~/upstream-api-server/deploy
+printf '\n# --- SRT ingest endpoint ---\nUPSTREAM_SRT_INGEST_HOST=<ingest-ip>\nUPSTREAM_SRT_INGEST_PORT=18890\n' >> .env
+git pull --ff-only
+docker compose up -d --build api
+docker exec upstream-api-api-1 printenv | grep SRT   # confirm the container sees both
+```
+
+### How to verify
+```sh
+uv run pytest tests/test_session_lifecycle.py -q     # new regression test
+# After deploy, call /v1/stream-sessions/start and confirm:
+#   srt_url starts with `srt://<ingest-ip>:18890?streamid=publish:sess_`
+```
+
+---
+
 ## 2026-05-13 - Apply ruff format to test_ingest_validate.py
 
 ### Summary

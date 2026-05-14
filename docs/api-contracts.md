@@ -285,6 +285,8 @@ Why opaque, not the JWT: libsrt's `streamid` query parameter is capped at ~512 b
 | `UPSTREAM_MEDIAMTX_WEBHOOK_SECRET` | yes | Verifies `/v1/ingest/*` callers |
 | `UPSTREAM_PROCESSOR_WEBHOOK_SECRET` | yes | Verifies `/v1/processor/*` callers |
 | `UPSTREAM_PROMETHEUS_AUTH_TOKEN` | yes | Will gate `/admin/metrics` (Phase 6) |
+| `UPSTREAM_SRT_INGEST_HOST` | no | SRT ingest host advertised in `srt_url` (default `ingest.upstream.tv`) |
+| `UPSTREAM_SRT_INGEST_PORT` | no | SRT ingest port (default `8890`) |
 | `UPSTREAM_PORT` | no | HTTP port (default 4000) |
 | `UPSTREAM_ENVIRONMENT` | no | `development` \| `staging` \| `production` (default `development`) |
 | `UPSTREAM_LOG_LEVEL` | no | `DEBUG`/`INFO`/`WARNING`/`ERROR` (default `INFO`) |
