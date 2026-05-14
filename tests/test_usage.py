@@ -53,6 +53,35 @@ async def test_record_event_inserts_when_table_present() -> None:
     assert "insert into usage_events" in conn.executes[0][0]
 
 
+async def test_record_event_omitted_metadata_inserts_empty_object_not_null() -> None:
+    # The `usage_events.metadata` column is jsonb NOT NULL default '{}'. Since
+    # the INSERT explicitly binds the column, the default does not fire — so
+    # `record_event(metadata=None)` must bind '{}' rather than SQL NULL, or the
+    # write fails with NotNullViolationError and bubbles up as a 500.
+    conn = FakeConn(table_exists=True)
+    await record_event(
+        conn,
+        account_id=UUID("00000000-0000-0000-0000-000000000001"),
+        event_type="heartbeat_batch",
+    )
+    assert len(conn.executes) == 1
+    bound_metadata = conn.executes[0][1][-1]
+    assert bound_metadata == "{}"
+    assert bound_metadata is not None
+
+
+async def test_record_event_explicit_metadata_is_json_encoded() -> None:
+    conn = FakeConn(table_exists=True)
+    await record_event(
+        conn,
+        account_id=UUID("00000000-0000-0000-0000-000000000001"),
+        event_type="heartbeat_batch",
+        metadata={"reason": "test"},
+    )
+    bound_metadata = conn.executes[0][1][-1]
+    assert bound_metadata == '{"reason": "test"}'
+
+
 async def test_probe_caches_after_first_call() -> None:
     conn = FakeConn(table_exists=True)
     await record_event(

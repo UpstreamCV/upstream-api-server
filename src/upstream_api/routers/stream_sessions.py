@@ -59,6 +59,7 @@ def _row_to_response(row: StreamSessionRow) -> StreamSessionResponse:
         srt_url=row.srt_url,
         streamid=row.streamid,
         expires_at=row.expires_at,
+        created_at=row.created_at,
         started_at=row.started_at,
         ended_at=row.ended_at,
         requested={
@@ -82,7 +83,7 @@ def _row_to_response(row: StreamSessionRow) -> StreamSessionResponse:
 
 _SESSION_COLUMNS = (
     "id, account_id, agent_id, camera_id, state, srt_url, streamid, "
-    "expires_at, started_at, ended_at, "
+    "expires_at, created_at, started_at, ended_at, "
     "req_width, req_height, req_fps, req_codec, req_bitrate_kbps, req_latency_mode, "
     "lim_width, lim_height, lim_fps, lim_codec, lim_bitrate_kbps, lim_latency_mode"
 )
@@ -98,6 +99,7 @@ def _db_row_to_session(row: dict) -> StreamSessionRow:  # type: ignore[type-arg]
         srt_url=row["srt_url"],
         streamid=row["streamid"],
         expires_at=row["expires_at"],
+        created_at=row["created_at"],
         started_at=row["started_at"],
         ended_at=row["ended_at"],
         requested=RequestedStream(
