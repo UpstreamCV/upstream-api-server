@@ -254,9 +254,7 @@ async def mark_failed(
     return str(row["state"])
 
 
-async def _sync_camera_status(
-    conn: asyncpg.Connection, session_id: UUID, status: str
-) -> None:
+async def _sync_camera_status(conn: asyncpg.Connection, session_id: UUID, status: str) -> None:
     """Mirror a session-state transition onto ``cameras.status``.
 
     The dashboard's cameras list reads ``cameras.status`` directly (not

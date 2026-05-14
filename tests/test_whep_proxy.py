@@ -126,9 +126,7 @@ def test_parse_location_trailing_slash() -> None:
 
 
 def test_parse_location_absolute_url() -> None:
-    assert (
-        parse_mediamtx_location("http://localhost:8889/sess_abc/whep/xyz-123") == "xyz-123"
-    )
+    assert parse_mediamtx_location("http://localhost:8889/sess_abc/whep/xyz-123") == "xyz-123"
 
 
 def test_parse_location_none() -> None:
