@@ -339,9 +339,9 @@ Authenticated via `CurrentCaller`. The `resource_id` is the value the client rec
 | `UPSTREAM_SNAPSHOT_MAX_BYTES` | no | Per-request snapshot size limit (default 5 MB) |
 | `UPSTREAM_SENTRY_DSN` | no | Sentry exception reporting |
 
-## Endpoints — Phase 2: ingest webhooks (auth: `current_ingest`)
+## Endpoints — Phase 2: ingest webhooks (auth: `current_ingest`, except mediamtx-auth)
 
-Streaming server -> API. All require `X-Upstream-Webhook-Secret`.
+Streaming server -> API. Most require `X-Upstream-Webhook-Secret`. The one exception is `/v1/ingest/mediamtx-auth/{secret}` — MediaMTX 1.9.3 cannot send custom headers, so that endpoint takes the secret as a URL path segment (see its section below).
 
 ### `POST /v1/ingest/validate-stream`
 
@@ -455,6 +455,44 @@ Response 200:
 ```
 
 Errors: 404 `session_not_found` if no session row matches the streamid.
+
+### `POST /v1/ingest/mediamtx-auth/{secret}` (M4.1 — MediaMTX authHTTP deny gate)
+
+Called by MediaMTX 1.9.3's `authMethod: http` for every SRT publish attempt. Returns **200 with empty body** to accept the publish and **401 with empty body** to deny — MediaMTX inspects only the status code, so no JSON envelope is sent.
+
+**Path-segment auth.** The shared webhook secret is in the URL path because MediaMTX 1.9.3 has no `authHTTPHeaders` support (the field was added upstream in 1.11+). The handler does NOT require `X-Upstream-Webhook-Secret` and the `current_ingest` dependency is intentionally not used. Constant-time compared via `verify_shared_secret`.
+
+**Deploy note (important):** The URL contains the secret. Any reverse-proxy / load-balancer in front of the api-server MUST be configured so its access logs strip the trailing path segment. The api-server's own `AccessLogMiddleware` already redacts the path to `/v1/ingest/mediamtx-auth/<redacted>` before logging (see `tests/test_access_log_redaction.py`). When MediaMTX is bumped to 1.11+, migrate the secret out of the URL path into a header and remove this endpoint's path segment auth.
+
+Request body (verbatim from MediaMTX 1.9.3 — see `mediamtx.yml.default` lines 87-96):
+```json
+{
+  "user": "",
+  "password": "",
+  "ip": "203.0.113.42",
+  "action": "publish",
+  "path": "sess_2a88f3405d513c05",
+  "protocol": "srt",
+  "id": "<connection-uuid>",
+  "query": ""
+}
+```
+
+Decision pipeline (fail-closed — any failure returns 401):
+
+1. Path segment ≠ `Settings.mediamtx_webhook_secret` → 401.
+2. `action != "publish"` → 401 (M4.1 gates publish only; read/playback are excluded by the streaming-server's `authHTTPExclude` but the handler is defensive).
+3. `protocol != "srt"` → 401.
+4. Stream key extraction: primary `body.path` (MediaMTX strips the `publish:` prefix before the auth call so `path` is already `sess_<hex>`); fallback `body.query` parsed for either `streamid=publish:<key>` or bare `publish:<key>`. Shape-validated via `is_valid_stream_key()` (`^sess_[0-9a-f]{16}\Z`).
+5. `check_session_admit()` (shared with `validate-stream`): `session_not_found` / `stream_state_invalid` / `session_expired` → 401.
+6. Any uncaught exception (DB error, etc.) → 401, logged as `reason_code=internal_error`.
+
+Logging (structured via structlog at `ingest.mediamtx_auth`):
+
+- **Logged:** `action`, `protocol`, redacted `stream_key` (first 12 chars + `…`), `reason_code`, `session_id` / `agent_id` / `camera_id` / `account_id` when resolved.
+- **Never logged:** the presented secret value, the full URL, the full stream key, the `password` body field, the `query` body value.
+
+Scope: publish only. Reader / playback / api / metrics / pprof actions are excluded in the streaming-server's `authHTTPExclude` config and should not reach this endpoint; if they do, they 401 defensively.
 
 ### Side-effect: `cameras.status` mirroring
 

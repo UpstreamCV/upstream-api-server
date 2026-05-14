@@ -13,10 +13,12 @@ rejects the URL with "Query string option 'streamid' value is too long".
 
 from __future__ import annotations
 
+import re
 import secrets
 
 _PUBLISH_PREFIX = "publish:"
 _STREAM_KEY_PREFIX = "sess_"
+_STREAM_KEY_PATTERN = re.compile(r"^sess_[0-9a-f]{16}\Z")
 
 
 def mint_stream_key() -> str:
@@ -36,3 +38,12 @@ def extract_stream_key(streamid: str) -> str:
     if not streamid.startswith(_PUBLISH_PREFIX):
         raise ValueError("streamid must start with 'publish:'")
     return streamid[len(_PUBLISH_PREFIX) :]
+
+
+def is_valid_stream_key(key: str) -> bool:
+    """Return True if ``key`` matches the minted shape ``sess_<16 hex>``.
+
+    Untrusted callers (e.g. the MediaMTX authHTTP deny gate) use this as a
+    pre-DB filter so we never look up obviously bogus keys.
+    """
+    return _STREAM_KEY_PATTERN.match(key) is not None

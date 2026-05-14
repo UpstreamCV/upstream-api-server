@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
@@ -78,6 +78,41 @@ async def load_session_by_streamid(
     if row is None:
         return None
     return _session_state_row(row)
+
+
+async def check_session_admit(
+    conn: asyncpg.Connection,
+    streamid: str,
+    *,
+    now: datetime | None = None,
+) -> tuple[SessionStateRow | None, str | None]:
+    """Admit decision for a new SRT publisher.
+
+    Single DB lookup, then evaluates state/expiry. Return shape:
+
+    - accept: ``(row, None)``
+    - missing session: ``(None, "session_not_found")``
+    - wrong state:    ``(row, "stream_state_invalid")``
+    - expired:        ``(row, "session_expired")``
+
+    The row is returned alongside the reject reason so the caller can still
+    reference ``session.id`` in its response/log line without a second
+    lookup. Only ``session_not_found`` returns no row (because there isn't
+    one).
+
+    Shared between ``/v1/ingest/validate-stream`` (JSON response envelope)
+    and ``/v1/ingest/mediamtx-auth/{secret}`` (MediaMTX authHTTP gate, which
+    only inspects the HTTP status code). Keeping the state-machine rule in
+    one place so the two callers cannot drift.
+    """
+    session = await load_session_by_streamid(conn, streamid)
+    if session is None:
+        return None, "session_not_found"
+    if session.state != "approved":
+        return session, "stream_state_invalid"
+    if session.expires_at < (now or datetime.now(tz=UTC)):
+        return session, "session_expired"
+    return session, None
 
 
 async def mark_streaming(
