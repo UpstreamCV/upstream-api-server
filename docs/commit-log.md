@@ -4,6 +4,24 @@ Reverse chronological. Newest at top. Every meaningful commit gets an entry foll
 
 ---
 
+## 2026-05-13 - Apply ruff format to test_ingest_validate.py
+
+### Summary
+Follow-up to the streamid commit — CI's `ruff format --check` flagged `tests/test_ingest_validate.py` because the `_session_row` signature fit on one line after I rewrote the helper. Ran `uv run ruff format src tests` and committed the (single-line) diff. No behavioural change; only `ruff format --check` was failing in CI — `ruff check`, `mypy`, and `pytest` were all green locally and remain so.
+
+### Files touched
+- `tests/test_ingest_validate.py` — `_session_row(*, session_id, state, expires_at)` rejoined onto one line.
+
+### How to verify
+```sh
+uv run ruff check src tests && \
+  uv run ruff format --check src tests && \
+  uv run mypy src tests && \
+  uv run pytest -q
+```
+
+---
+
 ## 2026-05-13 - Use a short opaque key in SRT streamid instead of the session JWT
 
 ### Summary
