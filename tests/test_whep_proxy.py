@@ -91,7 +91,12 @@ def _build_client(rows: dict[UUID, dict[str, Any]], caller: CallerAuth) -> TestC
     return TestClient(app)
 
 
-def _session_row(*, account_id: UUID, state: str = "streaming", streamid: str = STREAMID) -> dict[str, Any]:
+def _session_row(
+    *,
+    account_id: UUID,
+    state: str = "streaming",
+    streamid: str = STREAMID,
+) -> dict[str, Any]:
     return {
         "id": uuid4(),
         "account_id": account_id,
@@ -115,8 +120,7 @@ def test_parse_location_trailing_slash() -> None:
 
 def test_parse_location_absolute_url() -> None:
     assert (
-        parse_mediamtx_location("http://localhost:8889/sess_abc/whepsession/xyz-123")
-        == "xyz-123"
+        parse_mediamtx_location("http://localhost:8889/sess_abc/whepsession/xyz-123") == "xyz-123"
     )
 
 
@@ -290,9 +294,7 @@ def test_whep_offer_mediamtx_404_returns_stream_not_ready() -> None:
     account_id = uuid4()
     row = _session_row(account_id=account_id)
     client = _build_client({row["id"]: row}, _user_caller(account_id))
-    respx.post(f"{MEDIAMTX_BASE}/{SESSION_PATH}/whep").mock(
-        return_value=httpx.Response(404)
-    )
+    respx.post(f"{MEDIAMTX_BASE}/{SESSION_PATH}/whep").mock(return_value=httpx.Response(404))
     r = client.post(
         f"/v1/stream-sessions/{row['id']}/whep",
         content=CANNED_SDP_OFFER,
@@ -386,9 +388,9 @@ def test_whep_delete_happy_path() -> None:
     row = _session_row(account_id=account_id)
     client = _build_client({row["id"]: row}, _user_caller(account_id))
 
-    route = respx.delete(
-        f"{MEDIAMTX_BASE}/{SESSION_PATH}/whepsession/abc-123"
-    ).mock(return_value=httpx.Response(200))
+    route = respx.delete(f"{MEDIAMTX_BASE}/{SESSION_PATH}/whepsession/abc-123").mock(
+        return_value=httpx.Response(200)
+    )
 
     r = client.delete(
         f"/v1/stream-sessions/{row['id']}/whep/abc-123",
@@ -426,9 +428,9 @@ def test_whep_delete_cross_account_returns_404() -> None:
     row = _session_row(account_id=session_owner)
     client = _build_client({row["id"]: row}, _user_caller(other_user_account))
 
-    route = respx.delete(
-        f"{MEDIAMTX_BASE}/{SESSION_PATH}/whepsession/abc-123"
-    ).mock(return_value=httpx.Response(200))
+    route = respx.delete(f"{MEDIAMTX_BASE}/{SESSION_PATH}/whepsession/abc-123").mock(
+        return_value=httpx.Response(200)
+    )
 
     r = client.delete(
         f"/v1/stream-sessions/{row['id']}/whep/abc-123",
@@ -446,9 +448,9 @@ def test_whep_delete_mediamtx_404_still_returns_204() -> None:
     account_id = uuid4()
     row = _session_row(account_id=account_id)
     client = _build_client({row["id"]: row}, _user_caller(account_id))
-    respx.delete(
-        f"{MEDIAMTX_BASE}/{SESSION_PATH}/whepsession/abc-123"
-    ).mock(return_value=httpx.Response(404))
+    respx.delete(f"{MEDIAMTX_BASE}/{SESSION_PATH}/whepsession/abc-123").mock(
+        return_value=httpx.Response(404)
+    )
 
     r = client.delete(
         f"/v1/stream-sessions/{row['id']}/whep/abc-123",
@@ -462,9 +464,9 @@ def test_whep_delete_mediamtx_timeout_still_returns_204() -> None:
     account_id = uuid4()
     row = _session_row(account_id=account_id)
     client = _build_client({row["id"]: row}, _user_caller(account_id))
-    respx.delete(
-        f"{MEDIAMTX_BASE}/{SESSION_PATH}/whepsession/abc-123"
-    ).mock(side_effect=httpx.ConnectTimeout("timeout"))
+    respx.delete(f"{MEDIAMTX_BASE}/{SESSION_PATH}/whepsession/abc-123").mock(
+        side_effect=httpx.ConnectTimeout("timeout")
+    )
 
     r = client.delete(
         f"/v1/stream-sessions/{row['id']}/whep/abc-123",
