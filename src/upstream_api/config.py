@@ -48,11 +48,11 @@ class Settings(BaseSettings):
     supabase_storage_bucket: str = "snapshots"
     snapshot_max_bytes: int = 5 * 1024 * 1024  # 5 MB; Caddy must allow >= this on /v1/snapshots
 
-    # SRT ingest endpoint advertised back to the agent in `srt_url`. Override
-    # per environment (the dev/staging streaming server lives on a different
-    # host:port from prod ingest).
-    srt_ingest_host: str = "ingest.upstream.tv"
-    srt_ingest_port: int = 8890
+    # SRT ingest endpoint advertised back to the agent in `srt_url`. Defaults
+    # point at the current operator-run streaming server; override per env
+    # once we have a stable ingest hostname or move boxes.
+    srt_ingest_host: str = "<ingest-ip>"
+    srt_ingest_port: int = 18890
 
     @property
     def is_production(self) -> bool:
