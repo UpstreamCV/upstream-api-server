@@ -32,6 +32,7 @@ from upstream_api.routers import (
     stream_sessions,
     users,
 )
+from upstream_api.services.http_client import build_http_client
 
 _logger = get_logger("app")
 
@@ -41,11 +42,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings: Settings = app.state.settings
     pool = await create_pool(settings)
     app.state.db_pool = pool
+    app.state.http_client = build_http_client()
     _logger.info("startup", environment=settings.environment, port=settings.port)
     try:
         yield
     finally:
         _logger.info("shutdown")
+        await app.state.http_client.aclose()
         await pool.close()
 
 
