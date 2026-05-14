@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import re
 from typing import Annotated, Any
@@ -290,7 +291,7 @@ def _mediamtx_path_from_streamid(streamid: str) -> str | None:
     """Return the MediaMTX path for a session, or None on a malformed streamid."""
     if not streamid.startswith(_STREAMID_PUBLISH_PREFIX):
         return None
-    tail = streamid[len(_STREAMID_PUBLISH_PREFIX):]
+    tail = streamid[len(_STREAMID_PUBLISH_PREFIX) :]
     # Defensive: reject any character that could escape the URL path segment.
     if not tail or "/" in tail or ".." in tail:
         return None
@@ -425,15 +426,14 @@ async def whep_delete(
         # Nothing to clean up server-side.
         return Response(status_code=204)
 
-    try:
+    # Best-effort teardown. MediaMTX's ICE timeout reaps orphans on transport
+    # failure, so a 502 here would be noise on the dashboard side.
+    with contextlib.suppress(UpstreamMediaMTXUnavailable):
         await proxy_whep_delete(
             http,
             mediamtx_base_url=settings.mediamtx_base_url,
             path=path,
             resource_id=resource_id,
         )
-    except UpstreamMediaMTXUnavailable:
-        # Best-effort teardown. MediaMTX's ICE timeout reaps orphans.
-        pass
 
     return Response(status_code=204)
