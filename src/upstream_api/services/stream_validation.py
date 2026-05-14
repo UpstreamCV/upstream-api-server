@@ -34,18 +34,13 @@ class SessionStateRow:
     lim_latency_mode: str
 
 
-async def load_session_state(conn: asyncpg.Connection, session_id: UUID) -> SessionStateRow | None:
-    row = await conn.fetchrow(
-        """
-        select id, account_id, agent_id, camera_id, state, expires_at, session_token_jti,
-               lim_width, lim_height, lim_fps, lim_codec, lim_bitrate_kbps, lim_latency_mode
-          from stream_sessions
-         where id = $1
-        """,
-        session_id,
-    )
-    if row is None:
-        return None
+_SESSION_STATE_COLUMNS = (
+    "id, account_id, agent_id, camera_id, state, expires_at, session_token_jti, "
+    "lim_width, lim_height, lim_fps, lim_codec, lim_bitrate_kbps, lim_latency_mode"
+)
+
+
+def _session_state_row(row: dict[str, Any]) -> SessionStateRow:
     return SessionStateRow(
         id=row["id"],
         account_id=row["account_id"],
@@ -61,6 +56,28 @@ async def load_session_state(conn: asyncpg.Connection, session_id: UUID) -> Sess
         lim_bitrate_kbps=row["lim_bitrate_kbps"],
         lim_latency_mode=row["lim_latency_mode"],
     )
+
+
+async def load_session_state(conn: asyncpg.Connection, session_id: UUID) -> SessionStateRow | None:
+    row = await conn.fetchrow(
+        f"select {_SESSION_STATE_COLUMNS} from stream_sessions where id = $1",
+        session_id,
+    )
+    if row is None:
+        return None
+    return _session_state_row(row)
+
+
+async def load_session_by_streamid(
+    conn: asyncpg.Connection, streamid: str
+) -> SessionStateRow | None:
+    row = await conn.fetchrow(
+        f"select {_SESSION_STATE_COLUMNS} from stream_sessions where streamid = $1",
+        streamid,
+    )
+    if row is None:
+        return None
+    return _session_state_row(row)
 
 
 async def mark_streaming(
