@@ -44,6 +44,11 @@ from upstream_api.security.streamid import (
     extract_stream_key,
     is_valid_stream_key,
 )
+from upstream_api.services.http_client import HttpClientDep
+from upstream_api.services.mediamtx_provisioning import (
+    MediaMTXProvisioningFailure,
+    deprovision_path,
+)
 from upstream_api.services.stream_validation import (
     check_session_admit,
     load_session_by_streamid,
@@ -148,6 +153,8 @@ async def stream_ended(
     body: StreamEndedRequest,
     _ingest: CurrentIngest,
     pool: PoolDep,
+    settings: SettingsDep,
+    http: HttpClientDep,
 ) -> IngestActionResponse:
     """SRT connection closed; record duration and bytes for usage billing.
 
@@ -155,6 +162,11 @@ async def stream_ended(
     any value the caller supplies, since the DB is the source of truth and
     streaming-server hooks generally cannot track started_at across script
     invocations.
+
+    Phase 2: after the txn commits, best-effort delete the per-session
+    MediaMTX path so its passphrase / config doesn't linger past the
+    session. A 404 from MediaMTX is success (it restarted); other
+    failures are logged but never propagated.
     """
     async with pool.acquire() as conn, conn.transaction():
         state, server_duration = await mark_ended(
@@ -188,6 +200,20 @@ async def stream_ended(
                 "reason": body.reason,
             },
         )
+
+    # Best-effort MediaMTX path teardown — outside the DB txn so a
+    # streaming-server outage can't roll back the lifecycle write.
+    try:
+        await deprovision_path(
+            http,
+            base_url=settings.mediamtx_api_base_url,
+            path=extract_stream_key(session.streamid),
+        )
+    except (MediaMTXProvisioningFailure, ValueError):
+        # ValueError: streamid didn't carry a `publish:` prefix; logged
+        # but not actionable here.
+        pass
+
     session_id_var.set(body.session_id)
     return IngestActionResponse(session_id=body.session_id, state=state)
 
@@ -226,8 +252,14 @@ async def validation_failed(
     body: ValidationFailedRequest,
     _ingest: CurrentIngest,
     pool: PoolDep,
+    settings: SettingsDep,
+    http: HttpClientDep,
 ) -> IngestActionResponse:
-    """ffprobe (or post-validation) rejected the stream; mark `failed`."""
+    """ffprobe (or post-validation) rejected the stream; mark `failed`.
+
+    Phase 2: after the txn commits, best-effort delete the per-session
+    MediaMTX path. Same semantics as `/stream-ended`.
+    """
     observed = body.observed.model_dump() if body.observed is not None else None
     async with pool.acquire() as conn, conn.transaction():
         state = await mark_failed(
@@ -238,6 +270,19 @@ async def validation_failed(
             failure_code=body.failure_code,
             failure_message=body.failure_message,
         )
+        # Read streamid for the deprovision call while we still hold conn.
+        session = await load_session_state(conn, body.session_id)
+
+    if session is not None:
+        try:
+            await deprovision_path(
+                http,
+                base_url=settings.mediamtx_api_base_url,
+                path=extract_stream_key(session.streamid),
+            )
+        except (MediaMTXProvisioningFailure, ValueError):
+            pass
+
     session_id_var.set(body.session_id)
     return IngestActionResponse(session_id=body.session_id, state=state)
 

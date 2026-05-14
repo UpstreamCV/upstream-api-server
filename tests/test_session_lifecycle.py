@@ -145,6 +145,13 @@ async def test_start_session_srt_url_uses_settings_host_and_port() -> None:
     assert result.srt_url.startswith(expected_prefix), result.srt_url
     assert "ingest.upstreamcv.com" not in result.srt_url
     assert "ingest.upstream.tv" not in result.srt_url
+    # Phase 2 / FU-6: per-session AES passphrase must be present in the URL
+    # and surfaced on the StartSessionResult so the router can PATCH MediaMTX
+    # with the same value. URL-encoded; pbkeylen=32 selects AES-256.
+    assert result.srt_publish_passphrase, "passphrase must be populated"
+    assert 10 <= len(result.srt_publish_passphrase) <= 79  # libsrt range
+    assert "passphrase=" in result.srt_url
+    assert "pbkeylen=32" in result.srt_url
 
 
 async def test_start_session_takes_advisory_lock_per_account() -> None:

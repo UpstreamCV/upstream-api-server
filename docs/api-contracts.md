@@ -165,7 +165,7 @@ Response 200:
     "agent_id": "uuid",
     "camera_id": "uuid",
     "state": "approved",
-    "srt_url": "srt://ingest.upstreamcv.com:18890?streamid=publish:sess_<hex>&latency=200",
+    "srt_url": "srt://ingest.upstreamcv.com:18890?streamid=publish:sess_<hex>&latency=200&passphrase=<urlencoded>&pbkeylen=32",
     "streamid": "publish:sess_<hex>",
     "expires_at": "2026-05-13T00:00:00Z",
     "started_at": null,
@@ -173,13 +173,21 @@ Response 200:
     "requested": { "width": 1280, "height": 720, "fps": 30, "codec": "h264", "bitrate_kbps": 3000 },
     "approved":  { "width": 1280, "height": 720, "fps": 30, "codec": "h264", "bitrate_kbps": 3000 }
   },
-  "srt_url": "srt://ingest.upstreamcv.com:18890?streamid=publish:sess_<hex>&latency=200",
+  "srt_url": "srt://ingest.upstreamcv.com:18890?streamid=publish:sess_<hex>&latency=200&passphrase=<urlencoded>&pbkeylen=32",
   "session_token": "<jwt>",
   "expires_at": "2026-05-13T00:00:00Z"
 }
 ```
 
-Errors: `camera_not_found`, `camera_already_streaming`, `limit_exceeded.*`.
+Errors: `camera_not_found`, `camera_already_streaming`, `limit_exceeded.*`, `upstream_unavailable` (when MediaMTX path provisioning fails — the session row is left in `failed` state with `failure_code='mediamtx_provision_failed'`; agent should retry).
+
+Phase 2 / FU-6: every issued `srt_url` includes a unique
+`&passphrase=<X>&pbkeylen=32` (~32 url-safe chars, AES-256). The api-server
+PATCHes the corresponding MediaMTX path with the same passphrase before
+returning. SRT publishes that drop the passphrase parameter will fail at
+the SRT handshake. The api-server DELETEs the MediaMTX path at session
+end (`/stop`, `/stream-ended`, `/validation-failed` — best-effort, with
+404 tolerance for MediaMTX restarts in between).
 
 ### `POST /v1/stream-sessions/{session_id}/stop`
 

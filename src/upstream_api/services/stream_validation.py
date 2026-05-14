@@ -26,6 +26,11 @@ class SessionStateRow:
     state: str
     expires_at: datetime
     session_token_jti: UUID
+    # The full SRT streamid (``publish:sess_<hex>``). Carried here so
+    # callers that already have a `SessionStateRow` in hand for
+    # state-machine reasoning can also drive Phase-2 MediaMTX
+    # deprovisioning without an extra DB round-trip.
+    streamid: str
     lim_width: int
     lim_height: int
     lim_fps: int
@@ -35,7 +40,7 @@ class SessionStateRow:
 
 
 _SESSION_STATE_COLUMNS = (
-    "id, account_id, agent_id, camera_id, state, expires_at, session_token_jti, "
+    "id, account_id, agent_id, camera_id, state, expires_at, session_token_jti, streamid, "
     "lim_width, lim_height, lim_fps, lim_codec, lim_bitrate_kbps, lim_latency_mode"
 )
 
@@ -49,6 +54,7 @@ def _session_state_row(row: dict[str, Any]) -> SessionStateRow:
         state=row["state"],
         expires_at=row["expires_at"],
         session_token_jti=row["session_token_jti"],
+        streamid=row["streamid"],
         lim_width=row["lim_width"],
         lim_height=row["lim_height"],
         lim_fps=row["lim_fps"],

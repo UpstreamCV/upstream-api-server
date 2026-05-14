@@ -61,6 +61,15 @@ class Settings(BaseSettings):
     # the host-mapped port in upstream-streaming-server/docker-compose.yml.
     mediamtx_base_url: str = "http://localhost:8889"
 
+    # MediaMTX HTTP API base URL for per-session path provisioning (Phase 2).
+    # Used by `services/mediamtx_provisioning.py` to PATCH a per-path
+    # `srtPublishPassphrase` at session start and DELETE the path at session
+    # end. Reaches MediaMTX's `:9997` admin port — must be unreachable from
+    # the public internet (firewall + `authHTTPExclude` carve-out cover this
+    # in production; the streaming-server only accepts `api` actions from the
+    # AWS api-server's Elastic IP).
+    mediamtx_api_base_url: str = "http://localhost:9997"
+
     @property
     def is_production(self) -> bool:
         return self.environment == "production"

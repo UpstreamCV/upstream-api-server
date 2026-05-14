@@ -26,19 +26,29 @@ from upstream_api.schemas.stream_validations import (
     StreamValidationListResponse,
     StreamValidationResponse,
 )
+from upstream_api.observability.logging import get_logger
 from upstream_api.security.deps import CurrentAgent, CurrentCaller, PoolDep, SettingsDep
+from upstream_api.security.streamid import extract_stream_key
 from upstream_api.services.http_client import HttpClientDep
 from upstream_api.services.limits import LimitsSnapshot, RequestedStream
+from upstream_api.services.mediamtx_provisioning import (
+    MediaMTXProvisioningFailure,
+    deprovision_path,
+    provision_path,
+)
 from upstream_api.services.session_lifecycle import (
     StreamSessionRow,
     start_session,
     stop_session,
 )
+from upstream_api.services.stream_validation import mark_failed
 from upstream_api.services.whep_proxy import (
     UpstreamMediaMTXUnavailable,
     proxy_whep_delete,
     proxy_whep_offer,
 )
+
+_provisionlog = get_logger("stream_sessions.mediamtx_provisioning")
 
 # Resource id format on DELETE — comes from MediaMTX, so we deliberately accept
 # any printable URL-safe id. The regex's job is to refuse path-traversal
@@ -127,6 +137,7 @@ async def start(
     auth: CurrentAgent,
     pool: PoolDep,
     settings: SettingsDep,
+    http: HttpClientDep,
 ) -> StreamSessionStartResponse:
     async with pool.acquire() as conn, conn.transaction():
         result = await start_session(
@@ -145,6 +156,42 @@ async def start(
         )
 
     session_id_var.set(result.session.id)
+
+    # Phase 2 / FU-6 — provision a dynamic MediaMTX path with the session's
+    # SRT passphrase. Must happen AFTER the DB transaction commits so a
+    # MediaMTX failure can't roll back the session row (we keep failed
+    # rows around for the audit trail). On failure we mark the session
+    # `failed` in a separate transaction and return 502; the agent will
+    # retry `/start` and get a fresh attempt.
+    stream_key = extract_stream_key(result.session.streamid)
+    try:
+        await provision_path(
+            http,
+            base_url=settings.mediamtx_api_base_url,
+            path=stream_key,
+            passphrase=result.srt_publish_passphrase,
+        )
+    except MediaMTXProvisioningFailure as exc:
+        _provisionlog.error(
+            "mediamtx_provision_failed",
+            session_id=str(result.session.id),
+            reason=exc.reason,
+            status=exc.status,
+        )
+        async with pool.acquire() as conn2, conn2.transaction():
+            await mark_failed(
+                conn2,
+                session_id=result.session.id,
+                observed=None,
+                mismatch_fields=[],
+                failure_code="mediamtx_provision_failed",
+                failure_message=f"reason={exc.reason} status={exc.status}"[:512],
+            )
+        raise BadGatewayError(
+            "Streaming server is unreachable; session marked failed.",
+            code="upstream_unavailable",
+        ) from exc
+
     return StreamSessionStartResponse(
         session=_row_to_response(result.session),
         srt_url=result.srt_url,
@@ -158,6 +205,8 @@ async def stop(
     session_id: UUID,
     auth: CurrentAgent,
     pool: PoolDep,
+    settings: SettingsDep,
+    http: HttpClientDep,
 ) -> StreamSessionResponse:
     async with pool.acquire() as conn, conn.transaction():
         row = await stop_session(
@@ -165,6 +214,26 @@ async def stop(
             account_id=auth.account_id,
             session_id=session_id,
         )
+
+    # Best-effort deprovision of the per-session MediaMTX path (Phase 2).
+    # MediaMTX may be down or have already dropped the path on its own
+    # restart — neither failure should cascade into the agent-facing
+    # response. We log and continue.
+    stream_key = extract_stream_key(row.streamid)
+    try:
+        await deprovision_path(
+            http,
+            base_url=settings.mediamtx_api_base_url,
+            path=stream_key,
+        )
+    except MediaMTXProvisioningFailure as exc:
+        _provisionlog.warning(
+            "mediamtx_deprovision_failed",
+            session_id=str(row.id),
+            reason=exc.reason,
+            status=exc.status,
+        )
+
     return _row_to_response(row)
 
 
