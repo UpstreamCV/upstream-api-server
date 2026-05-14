@@ -171,3 +171,56 @@ def test_validate_stream_requires_webhook_secret() -> None:
     r = client.post("/v1/ingest/validate-stream", json={"streamid": "publish:x"})
     assert r.status_code == 401
     assert r.json()["error"]["code"] == "invalid_webhook_secret"
+
+
+# ----------------------------------------------------------------------------
+# /v1/ingest/lookup-session — used by streaming-server lifecycle hooks to
+# resolve a streamid to its session_id without coupling to validate-stream's
+# state-gate semantics.
+# ----------------------------------------------------------------------------
+
+
+def test_lookup_session_returns_session_for_known_streamid() -> None:
+    streamid = build_streamid(mint_stream_key())
+    session_id = uuid4()
+    row = _session_row(
+        session_id=session_id,
+        # lookup must work regardless of state — including during streaming,
+        # which is what runOnNotReady will see.
+        state="streaming",
+        expires_at=datetime.now(tz=UTC) + timedelta(hours=1),
+    )
+    pool = FakePool(FakeConn({streamid: row}))
+    client = _client(pool)
+    r = client.post(
+        "/v1/ingest/lookup-session",
+        json={"streamid": streamid},
+        headers=_webhook_headers(),
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["session_id"] == str(session_id)
+    assert body["account_id"] == str(row["account_id"])
+    assert body["agent_id"] == str(row["agent_id"])
+    assert body["camera_id"] == str(row["camera_id"])
+    assert body["state"] == "streaming"
+
+
+def test_lookup_session_404_on_unknown_streamid() -> None:
+    pool = FakePool(FakeConn())
+    client = _client(pool)
+    r = client.post(
+        "/v1/ingest/lookup-session",
+        json={"streamid": build_streamid(mint_stream_key())},
+        headers=_webhook_headers(),
+    )
+    assert r.status_code == 404
+    assert r.json()["error"]["code"] == "session_not_found"
+
+
+def test_lookup_session_requires_webhook_secret() -> None:
+    pool = FakePool(FakeConn())
+    client = _client(pool)
+    r = client.post("/v1/ingest/lookup-session", json={"streamid": "publish:x"})
+    assert r.status_code == 401
+    assert r.json()["error"]["code"] == "invalid_webhook_secret"
