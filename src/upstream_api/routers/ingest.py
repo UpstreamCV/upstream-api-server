@@ -20,10 +20,12 @@ from datetime import UTC, datetime
 
 from fastapi import APIRouter
 
-from upstream_api.errors import ConflictError
+from upstream_api.errors import ConflictError, NotFoundError
 from upstream_api.observability.context import session_id_var
 from upstream_api.schemas.ingest import (
     IngestActionResponse,
+    LookupSessionRequest,
+    LookupSessionResponse,
     StreamEndedRequest,
     StreamStartedRequest,
     ValidateStreamRequest,
@@ -125,9 +127,15 @@ async def stream_ended(
     _ingest: CurrentIngest,
     pool: PoolDep,
 ) -> IngestActionResponse:
-    """SRT connection closed; record duration and bytes for usage billing."""
+    """SRT connection closed; record duration and bytes for usage billing.
+
+    Server-derived duration (from the session row's ``started_at``) wins over
+    any value the caller supplies, since the DB is the source of truth and
+    streaming-server hooks generally cannot track started_at across script
+    invocations.
+    """
     async with pool.acquire() as conn, conn.transaction():
-        state, _duration = await mark_ended(
+        state, server_duration = await mark_ended(
             conn,
             session_id=body.session_id,
             ended_at=body.ended_at,
@@ -140,12 +148,18 @@ async def stream_ended(
                 code="stream_state_invalid",
                 details={"session_id": str(body.session_id)},
             )
+        if server_duration is not None:
+            quantity = int(server_duration)
+        elif body.duration_seconds is not None:
+            quantity = int(body.duration_seconds)
+        else:
+            quantity = 0
         await record_event(
             conn,
             account_id=session.account_id,
             event_type="stream_seconds",
             session_id=body.session_id,
-            quantity=int(body.duration_seconds),
+            quantity=quantity,
             unit="seconds",
             metadata={
                 "bytes_sent": body.bytes_sent,
@@ -154,6 +168,35 @@ async def stream_ended(
         )
     session_id_var.set(body.session_id)
     return IngestActionResponse(session_id=body.session_id, state=state)
+
+
+@router.post("/lookup-session", response_model=LookupSessionResponse)
+async def lookup_session(
+    body: LookupSessionRequest,
+    _ingest: CurrentIngest,
+    pool: PoolDep,
+) -> LookupSessionResponse:
+    """Resolve a streamid to its session identifiers.
+
+    Used by streaming-server lifecycle hooks (``runOnReady`` /
+    ``runOnNotReady``) to translate the SRT streamid they receive
+    (``publish:sess_<hex>``) into the ``session_id`` they need to call
+    ``stream-started`` / ``stream-ended``. Read-only and idempotent —
+    independent from ``validate-stream``, which gates connection acceptance
+    and only succeeds while the session is still ``approved``.
+    """
+    async with pool.acquire() as conn:
+        session = await load_session_by_streamid(conn, body.streamid)
+    if session is None:
+        raise NotFoundError("Session not found.", code="session_not_found")
+    session_id_var.set(session.id)
+    return LookupSessionResponse(
+        session_id=session.id,
+        account_id=session.account_id,
+        agent_id=session.agent_id,
+        camera_id=session.camera_id,
+        state=session.state,
+    )
 
 
 @router.post("/validation-failed", response_model=IngestActionResponse)

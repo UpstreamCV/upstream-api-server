@@ -4,6 +4,40 @@ Reverse chronological. Newest at top. Every meaningful commit gets an entry foll
 
 ---
 
+## 2026-05-13 - Sync cameras.status with stream lifecycle + add ingest lookup-session endpoint
+
+### Summary
+Two changes that together fix "camera shows Idle and stream cannot be viewed" when an agent is publishing:
+1. `mark_streaming` / `mark_ended` / `mark_failed` now mirror their session-state transitions onto `cameras.status` (`'streaming'` / `'idle'` / `'error'`) inside the same transaction, so the dashboard's cameras list view (which reads `cameras.status` directly) tracks live streams instead of staying `'idle'` forever.
+2. New `POST /v1/ingest/lookup-session` endpoint resolves a streamid (`publish:sess_<hex>`) to its session identifiers (`session_id`, `account_id`, `agent_id`, `camera_id`, `state`). Used by the streaming-server's `runOnReady` / `runOnNotReady` MediaMTX hooks to translate the streamid they receive into the `session_id` they need to call `stream-started` / `stream-ended`. Independent of `validate-stream` (which gates connection acceptance and only succeeds while the session is `'approved'`).
+
+`mark_streaming` is now idempotent for the streaming→streaming reconnect case (SRT publisher reconnects re-fire `runOnReady`) — the `cameras.status` mirror still runs but no duplicate `stream_validations` row is written. `mark_ended` continues to compute duration server-side from the session row's `started_at`; the `stream-ended` router endpoint now uses that server-derived duration for usage billing instead of the streaming-server's request body, since hooks generally cannot track started_at across script invocations. `StreamEndedRequest.duration_seconds` is therefore now optional.
+
+### Why
+The streaming-server's M4 webhook integration is shipping in the sibling repo at the same time. Once those hooks land, sessions transition `approved` → `streaming` → `ended` correctly, but two pieces were still missing here:
+- Nothing was syncing `cameras.status` with `stream_sessions.state`. The cameras list view at `/dashboard/cameras` reads `cameras.status` directly via `<StatusBadge>` (`cameras-table.tsx:49`), so even after sessions transitioned correctly, the list showed every camera as "Idle".
+- The streaming-server hooks need to translate the streamid they see (`MTX_PATH = sess_<hex>`) into a `session_id` to call `/v1/ingest/stream-started`. `validate-stream` cannot serve this purpose — it returns `accept: false / stream_state_invalid` once the session leaves `'approved'`, so it would reject the lookup at `runOnNotReady` time.
+
+### Files touched
+- `src/upstream_api/services/stream_validation.py` — added private `_sync_camera_status` helper. `mark_streaming` rewritten to disambiguate "row missing" vs "already streaming reconnect" vs "wrong state" without the generic `_explain_unexpected_state` helper, so the streaming reconnect case becomes a no-op (cameras still nudged, no duplicate validation row). `mark_ended` and `mark_failed` call the helper after their UPDATE.
+- `src/upstream_api/schemas/ingest.py` — added `LookupSessionRequest` / `LookupSessionResponse`. Made `StreamEndedRequest.duration_seconds` optional.
+- `src/upstream_api/routers/ingest.py` — added `POST /v1/ingest/lookup-session`. `stream_ended` handler now prefers server-derived duration from `mark_ended` over the request body field for the `record_event` quantity.
+- `tests/test_stream_validation.py` — `FakeConn.execute` now captures `update cameras` calls in a separate list. New `test_mark_streaming_idempotent_on_streaming_reconnect`. Existing transition tests assert the `cameras.status` mirror happens; rejection tests assert it does NOT.
+- `tests/test_ingest_validate.py` — three new tests for `lookup-session` (happy path returns all four IDs + state, 404 on unknown, 401 without webhook secret).
+- `tests/test_app_routes.py` — added `/v1/ingest/lookup-session:POST` to the expected mounted-routes set.
+
+### Verification
+`uv run pytest -q` → 144 passing (was 134; +3 lookup-session, +1 reconnect idempotency, +6 camera-status-mirror assertions on existing tests).
+
+### Deploy
+Code-only; no env changes. AWS deploy currently behind on `e8d08ba` ("fixing streaming session start time and heartbeat") — pulling this commit also brings that one. Confirm `UPSTREAM_MEDIAMTX_WEBHOOK_SECRET` is set on the server (the streaming-server hooks will start using it):
+```sh
+cd ~/upstream-api-server && git pull --ff-only
+cd deploy && docker compose up -d --build api
+```
+
+---
+
 ## 2026-05-13 - WHEP proxy endpoints for read-path auth
 
 ### Summary

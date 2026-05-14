@@ -396,7 +396,7 @@ Errors: `session_not_found`, `stream_state_invalid`.
 
 ### `POST /v1/ingest/stream-ended`
 
-SRT connection closed. Transition `approved|streaming → ended`. Idempotent — returns the current state if already terminal.
+SRT connection closed. Transition `approved|streaming → ended`. Idempotent — returns the current state if already terminal. Mirrors `cameras.status` to `'idle'` in the same transaction.
 
 Request:
 ```json
@@ -409,13 +409,15 @@ Request:
 }
 ```
 
+`duration_seconds` is optional — the API derives the authoritative value from the session row's `started_at` and the supplied `ended_at`. The streaming-server hooks omit it; only legacy callers that already track started_at should send it.
+
 Response 200: `{ "session_id": "...", "state": "ended" }`.
 
-A `usage_events` row of type `stream_seconds` is written with `quantity=int(duration_seconds)`.
+A `usage_events` row of type `stream_seconds` is written using the server-derived duration (falls back to the request body field, then `0`, in that order).
 
 ### `POST /v1/ingest/validation-failed`
 
-ffprobe (or a later validator) rejected the stream. Transition `approved|streaming → failed` and write a failing `stream_validations` row.
+ffprobe (or a later validator) rejected the stream. Transition `approved|streaming → failed` and write a failing `stream_validations` row. Mirrors `cameras.status` to `'error'` in the same transaction.
 
 Request:
 ```json
@@ -429,6 +431,42 @@ Request:
 ```
 
 Response 200: `{ "session_id": "...", "state": "failed" }`.
+
+### `POST /v1/ingest/lookup-session`
+
+Resolve a streamid to its session identifiers without coupling to `validate-stream`'s state-gate semantics. Used by the streaming-server's `runOnReady` / `runOnNotReady` MediaMTX hooks to translate `MTX_PATH=sess_<hex>` into the `session_id` they pass to `stream-started` / `stream-ended`.
+
+Read-only. Idempotent. Works regardless of session state — including during `streaming` (which is what `runOnNotReady` will see).
+
+Request:
+```json
+{ "streamid": "publish:sess_<hex>" }
+```
+
+Response 200:
+```json
+{
+  "session_id": "uuid",
+  "account_id": "uuid",
+  "agent_id": "uuid",
+  "camera_id": "uuid",
+  "state": "streaming"
+}
+```
+
+Errors: 404 `session_not_found` if no session row matches the streamid.
+
+### Side-effect: `cameras.status` mirroring
+
+Every successful state transition through these webhooks (and through the agent-driven `/v1/stream-sessions/start` and `/stop` paths via `mark_streaming` / `mark_ended` / `mark_failed`) also updates the parent camera row:
+
+| Session transition | `cameras.status` after |
+|---|---|
+| → `streaming` | `'streaming'` |
+| → `ended` | `'idle'` |
+| → `failed` | `'error'` |
+
+The cameras list view at `/dashboard/cameras` reads `cameras.status` directly via `<StatusBadge>`. The mirror runs inside the same transaction as the session UPDATE so the two columns can never diverge.
 
 ## Endpoints — Phase 3: telemetry (auth: `current_agent`)
 

@@ -37,7 +37,9 @@ class StreamStartedRequest(BaseModel):
 class StreamEndedRequest(BaseModel):
     session_id: UUID
     ended_at: datetime
-    duration_seconds: float = Field(ge=0)
+    # Optional: streaming-server hooks omit this and let the API derive
+    # duration from the session's started_at/ended_at in the same transaction.
+    duration_seconds: float | None = Field(default=None, ge=0)
     bytes_sent: int | None = Field(default=None, ge=0)
     reason: str = Field(min_length=1, max_length=64)
 
@@ -52,4 +54,16 @@ class ValidationFailedRequest(BaseModel):
 
 class IngestActionResponse(BaseModel):
     session_id: UUID
+    state: str
+
+
+class LookupSessionRequest(BaseModel):
+    streamid: str = Field(min_length=10, max_length=4096)
+
+
+class LookupSessionResponse(BaseModel):
+    session_id: UUID
+    account_id: UUID
+    agent_id: UUID
+    camera_id: UUID
     state: str

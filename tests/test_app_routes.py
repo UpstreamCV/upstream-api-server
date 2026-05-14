@@ -39,6 +39,7 @@ def test_expected_routes_are_mounted() -> None:
         "/v1/ingest/stream-started:POST",
         "/v1/ingest/stream-ended:POST",
         "/v1/ingest/validation-failed:POST",
+        "/v1/ingest/lookup-session:POST",
     }
     missing = expected - paths
     assert not missing, f"Missing routes: {sorted(missing)}"

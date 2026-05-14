@@ -89,8 +89,14 @@ async def mark_streaming(
 ) -> str:
     """Transition ``approved`` -> ``streaming`` and write the ffprobe snapshot.
 
-    Inserts a passing ``stream_validations`` row at the same time so the
-    history of "we accepted this stream" is auditable.
+    Inserts a passing ``stream_validations`` row alongside the transition so
+    the history of "we accepted this stream" is auditable. SRT publisher
+    reconnects can fire the streaming server's ``runOnReady`` hook on a
+    session already in ``streaming``; that case is idempotent — no duplicate
+    validation row is written, but ``cameras.status`` is still nudged to
+    ``streaming`` in case it drifted. Both the session row and the parent
+    ``cameras.status`` are kept in lockstep so the dashboard cameras list
+    reflects live state.
     """
     row = await conn.fetchrow(
         """
@@ -116,7 +122,20 @@ async def mark_streaming(
         observed["bitrate_kbps"],
     )
     if row is None:
-        await _explain_unexpected_state(conn, session_id, expected="approved")
+        # Disambiguate: missing row vs. already-streaming reconnect vs. wrong state.
+        existing = await load_session_state(conn, session_id)
+        if existing is None:
+            raise NotFoundError("Session not found.", code="session_not_found")
+        if existing.state == "streaming":
+            await _sync_camera_status(conn, session_id, "streaming")
+            return existing.state
+        raise ConflictError(
+            f"Session is in state '{existing.state}', expected 'approved'.",
+            code="stream_state_invalid",
+            details={"current_state": existing.state, "expected": "approved"},
+        )
+
+    await _sync_camera_status(conn, session_id, "streaming")
 
     expected = {
         "codec": row["lim_codec"],
@@ -145,7 +164,11 @@ async def mark_ended(
     ended_at: datetime,
     reason: str,
 ) -> tuple[str, float | None]:
-    """Transition any non-terminal state -> ``ended``. Idempotent."""
+    """Transition any non-terminal state -> ``ended``. Idempotent.
+
+    Mirrors the transition onto ``cameras.status = 'idle'`` so the dashboard
+    cameras list returns to "Idle" once the stream stops.
+    """
     row = await conn.fetchrow(
         """
         update stream_sessions
@@ -167,6 +190,8 @@ async def mark_ended(
             raise NotFoundError("Session not found.", code="session_not_found")
         return existing.state, None
 
+    await _sync_camera_status(conn, session_id, "idle")
+
     duration: float | None = None
     if row["started_at"] is not None and row["ended_at"] is not None:
         duration = (row["ended_at"] - row["started_at"]).total_seconds()
@@ -182,7 +207,11 @@ async def mark_failed(
     failure_code: str,
     failure_message: str,
 ) -> str:
-    """Transition any non-terminal state -> ``failed``. Writes a failing validation."""
+    """Transition any non-terminal state -> ``failed``. Writes a failing validation.
+
+    Mirrors the transition onto ``cameras.status = 'error'`` so the dashboard
+    cameras list surfaces the failure.
+    """
     row = await conn.fetchrow(
         """
         update stream_sessions
@@ -201,6 +230,8 @@ async def mark_failed(
     )
     if row is None:
         await _explain_unexpected_state(conn, session_id, expected="approved|streaming")
+
+    await _sync_camera_status(conn, session_id, "error")
 
     expected = {
         "codec": row["lim_codec"],
@@ -221,6 +252,27 @@ async def mark_failed(
         mismatch_fields,
     )
     return str(row["state"])
+
+
+async def _sync_camera_status(
+    conn: asyncpg.Connection, session_id: UUID, status: str
+) -> None:
+    """Mirror a session-state transition onto ``cameras.status``.
+
+    The dashboard's cameras list reads ``cameras.status`` directly (not
+    ``stream_sessions.state``), so this keeps the list view in lockstep
+    with stream lifecycle. Uses a subquery so the camera_id is resolved
+    in the same transaction snapshot as the caller's stream_sessions write.
+    """
+    await conn.execute(
+        """
+        update cameras
+           set status = $2
+         where id = (select camera_id from stream_sessions where id = $1)
+        """,
+        session_id,
+        status,
+    )
 
 
 async def _explain_unexpected_state(
