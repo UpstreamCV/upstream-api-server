@@ -116,6 +116,32 @@ async def test_start_session_translates_unique_violation_to_conflict() -> None:
     assert exc_info.value.code == "camera_already_streaming"
 
 
+async def test_start_session_srt_url_uses_settings_host_and_port() -> None:
+    """srt_url must read host/port from Settings — no hardcoded ingest.upstream.tv."""
+    account_id = uuid4()
+    camera_id = uuid4()
+    conn = FakeConn(camera_account_id=account_id, camera_agent_id=uuid4())
+    requested = RequestedStream(width=1280, height=720, fps=30, codec="h264", bitrate_kbps=2500)
+
+    settings = get_settings().model_copy(
+        update={"srt_ingest_host": "73.203.70.44", "srt_ingest_port": 18890}
+    )
+    with patch(
+        "upstream_api.services.session_lifecycle.mint_session_token",
+        return_value=("dummy-token", _DummyClaims()),
+    ):
+        result = await start_session(
+            conn,
+            settings=settings,
+            account_id=account_id,
+            camera_id=camera_id,
+            requested=requested,
+        )
+    expected_prefix = "srt://73.203.70.44:18890?streamid=publish:sess_"
+    assert result.srt_url.startswith(expected_prefix), result.srt_url
+    assert "ingest.upstream.tv" not in result.srt_url
+
+
 async def test_start_session_takes_advisory_lock_per_account() -> None:
     """The advisory lock is taken in check_session_start before the count(*)."""
     account_id = uuid4()

@@ -61,11 +61,13 @@ _LATENCY_MS_BY_MODE = {
 def _build_srt_url(
     streamid: str,
     *,
+    ingest_host: str,
+    port: int,
     latency_mode: str = "balanced",
-    ingest_host: str = "ingest.upstream.tv",
-    port: int = 8890,
 ) -> str:
-    # URL-safe streamid; SRT carries the streamid as a UTF-8 string.
+    # URL-safe streamid; SRT carries the streamid as a UTF-8 string. Host/port
+    # come from `Settings.srt_ingest_host` / `.srt_ingest_port` so dev and prod
+    # can point at different streaming servers.
     latency_ms = _LATENCY_MS_BY_MODE.get(latency_mode, _LATENCY_MS_BY_MODE["balanced"])
     return f"srt://{ingest_host}:{port}?streamid={streamid}&latency={latency_ms}"
 
@@ -136,7 +138,12 @@ async def start_session(
     # to the agent as `session_token` for any non-ingest use, but libsrt's
     # streamid is capped at ~512 bytes so we never put the JWT in the URL.
     streamid = build_streamid(mint_stream_key())
-    srt_url = _build_srt_url(streamid, latency_mode=approved.latency_mode)
+    srt_url = _build_srt_url(
+        streamid,
+        ingest_host=settings.srt_ingest_host,
+        port=settings.srt_ingest_port,
+        latency_mode=approved.latency_mode,
+    )
 
     try:
         row = await conn.fetchrow(
