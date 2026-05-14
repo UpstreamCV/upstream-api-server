@@ -271,6 +271,47 @@ Ingest connections set `streamid=publish:sess_<16 hex>` — the literal prefix `
 
 Why opaque, not the JWT: libsrt's `streamid` query parameter is capped at ~512 bytes, and a signed JWT carrying the `lim` claim object exceeds that — FFmpeg surfaces this as "Query string option 'streamid' value is too long". A short DB-backed key sidesteps the limit and removes a round of JWT verification from the ingest hot path; the API row is the source of truth either way.
 
+### Consumed by the api-server WHEP proxy (internal)
+
+The api-server itself derives the MediaMTX path from `streamid` for its read-path proxy endpoints (see "WHEP proxy" below). The convention: a session with `streamid=publish:sess_abc123` plays back as MediaMTX path `sess_abc123`. The dashboard no longer derives this client-side — it just calls the proxy endpoint by session id.
+
+## WHEP proxy (read-path playback for the dashboard)
+
+The api-server forwards WebRTC signaling between authenticated dashboard users and MediaMTX. Only the HTTP signaling is proxied; the actual UDP/ICE media flows browser ↔ MediaMTX directly via ICE candidates carried in the SDP answer.
+
+This exists because MediaMTX's read path has no native auth — proxying through the api-server lets us reuse the existing `CurrentCaller` (Supabase JWT or agent token) + `account_id` scoping that already gates every other read endpoint. Production deploys MUST firewall MediaMTX's `8889/tcp` / `8554/tcp` / `9997/tcp` to the api-server's egress IP only — those ports are not behind any auth.
+
+### `POST /v1/stream-sessions/{session_id}/whep`
+
+Authenticated via `CurrentCaller`. Multi-account users may need `?account_id=...` like other read endpoints.
+
+Request:
+- Header: `Content-Type: application/sdp` (other types → 415)
+- Body: SDP offer bytes (browser-generated). Empty bodies → 400.
+
+Response:
+- 201 + `Content-Type: application/sdp` + `Location: <resource_id>` + body=MediaMTX's SDP answer. The Location header is a **bare resource id**, not a URL — the dashboard appends it to the POST URL to form the DELETE target.
+- 404 `session_not_found` — session doesn't exist or belongs to a different account (does not leak existence)
+- 404 `stream_not_ready` — MediaMTX hasn't registered the path yet (race; client should retry)
+- 409 `session_not_streaming` — session is in `approved` / `ended` / `expired` / `failed` state
+- 415 `invalid_content_type` — wrong Content-Type
+- 400 `invalid_sdp` — empty body
+- 502 `upstream_unavailable` — MediaMTX timeout, 5xx, or unparseable response
+
+### `DELETE /v1/stream-sessions/{session_id}/whep/{resource_id}`
+
+Authenticated via `CurrentCaller`. The `resource_id` is the value the client received from the POST's Location header.
+
+- 204 No Content on success or any MediaMTX outcome (DELETE is best-effort — MediaMTX cleans up orphans via ICE timeout anyway)
+- 400 `invalid_resource_id` — `resource_id` contains characters outside `[A-Za-z0-9_~-]` (path-traversal defense)
+- 404 `session_not_found` — same as POST
+
+### Configuration
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `UPSTREAM_MEDIAMTX_BASE_URL` | `http://localhost:8889` | Base URL for MediaMTX's WHEP endpoint. Reachable only from the api-server in production. |
+
 ## Environment variables (consumed by this service)
 
 | Variable | Required | Purpose |

@@ -4,6 +4,37 @@ Reverse chronological. Newest at top. Every meaningful commit gets an entry foll
 
 ---
 
+## 2026-05-13 - WHEP proxy endpoints for read-path auth
+
+### Summary
+Adds two endpoints (`POST /v1/stream-sessions/{id}/whep` + `DELETE /v1/stream-sessions/{id}/whep/{resource_id}`) that proxy WebRTC signaling between authenticated dashboard users and MediaMTX. The api-server enforces account-scoped auth via the existing `CurrentCaller` dependency; UDP/ICE media still flows browser ↔ MediaMTX directly. Closes FU-3 from `../upstream-streaming-server/docs/follow-ups.md`.
+
+### Why
+The dashboard's previous-commit WHEP player hit MediaMTX directly, which has no native read auth (`authInternalUsers` is permissive by design). Routing signaling through the api-server gives us auth for free — same pattern as every other read endpoint — without coordinating a new shared secret across three repos.
+
+### Files touched
+- `src/upstream_api/routers/stream_sessions.py` — added `whep_offer` and `whep_delete` handlers. Both look up the session row by id, verify `account_id` matches the caller's scope (returns 404 `session_not_found` on mismatch — never leaks existence), and on POST also verify state is `streaming` (409 `session_not_streaming` otherwise). Defensive regex `^[A-Za-z0-9_~-]{1,128}$` on `resource_id` to prevent path-traversal into other MediaMTX endpoints.
+- `src/upstream_api/services/whep_proxy.py` (NEW) — pure I/O wrapper around `httpx.AsyncClient`: `proxy_whep_offer`, `proxy_whep_delete`, `parse_mediamtx_location`. Raises `UpstreamMediaMTXUnavailable` on transport failure for the router to translate to 502.
+- `src/upstream_api/services/http_client.py` (NEW) — `build_http_client()` for lifespan, `get_http_client()` + `HttpClientDep` for the router. `httpx.AsyncClient(connect=2.0, read=10.0, ...)`.
+- `src/upstream_api/app.py` — lifespan now creates and closes `app.state.http_client` alongside the DB pool.
+- `src/upstream_api/config.py` — new setting `mediamtx_base_url: str = "http://localhost:8889"` (env `UPSTREAM_MEDIAMTX_BASE_URL`).
+- `src/upstream_api/errors.py` — new subclasses `BadRequestError`, `UnsupportedMediaTypeError`, `BadGatewayError` (filled in the 400/415/502 gaps in the hierarchy).
+- `tests/test_whep_proxy.py` (NEW) — 27 cases via `respx`: happy path, agent caller dual-auth, cross-account 404 (no info leak), unknown session, all four non-streaming states, wrong content type, empty body, MediaMTX 404/5xx/timeout/no-Location, plus DELETE happy path, invalid resource id, cross-account, MediaMTX 404 still returns 204. Also unit tests for `parse_mediamtx_location`.
+- `scripts/smoke_whep_proxy.py` (NEW) — end-to-end smoke script that hits a running api-server with a real agent token; bootstraps a session, exercises POST/DELETE, and verifies the 400 invalid-resource-id negative path. Falls back to verifying the 409 not-streaming path when no publisher is running.
+- `docs/api-contracts.md` — new "WHEP proxy" section under stream-sessions documenting both endpoints, all error codes, and the `UPSTREAM_MEDIAMTX_BASE_URL` config var. Replaced the older "follow-up: add a `playback` object" note since the proxy supersedes that approach.
+
+### Verification
+`pytest` → 134 passing (27 new in `test_whep_proxy.py`, 107 existing untouched).
+
+### Deploy
+Requires the new env var to be set on the deploy target:
+```
+UPSTREAM_MEDIAMTX_BASE_URL=http://upstream-streaming-server:8889  # private network DNS
+```
+**Production firewall posture:** MediaMTX's `8889/tcp`, `8554/tcp`, and `9997/tcp` MUST be reachable only from the api-server's egress IP. The UDP ICE port `8189/udp` stays public so browsers can negotiate ICE. See `../upstream-streaming-server/docs/stream-auth.md` (Read-path auth section).
+
+---
+
 ## 2026-05-14 - Default SRT ingest host to ingest.upstreamcv.com
 
 ### Summary

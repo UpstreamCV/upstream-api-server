@@ -54,6 +54,13 @@ class Settings(BaseSettings):
     srt_ingest_host: str = "ingest.upstreamcv.com"
     srt_ingest_port: int = 18890
 
+    # MediaMTX base URL for the WHEP read-path proxy. The api-server forwards
+    # SDP offers from authenticated dashboard users to this server's WHEP
+    # endpoint. MUST be reachable only from the api-server in production —
+    # MediaMTX's read path is otherwise unauthenticated. Local dev points at
+    # the host-mapped port in upstream-streaming-server/docker-compose.yml.
+    mediamtx_base_url: str = "http://localhost:8889"
+
     @property
     def is_production(self) -> bool:
         return self.environment == "production"

@@ -1,12 +1,19 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Annotated, Any
 from uuid import UUID
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Query, Request, Response
 
-from upstream_api.errors import NotFoundError
+from upstream_api.errors import (
+    BadGatewayError,
+    BadRequestError,
+    ConflictError,
+    NotFoundError,
+    UnsupportedMediaTypeError,
+)
 from upstream_api.observability.context import session_id_var
 from upstream_api.schemas.stream_sessions import (
     StreamSessionListResponse,
@@ -19,12 +26,24 @@ from upstream_api.schemas.stream_validations import (
     StreamValidationResponse,
 )
 from upstream_api.security.deps import CurrentAgent, CurrentCaller, PoolDep, SettingsDep
+from upstream_api.services.http_client import HttpClientDep
 from upstream_api.services.limits import LimitsSnapshot, RequestedStream
 from upstream_api.services.session_lifecycle import (
     StreamSessionRow,
     start_session,
     stop_session,
 )
+from upstream_api.services.whep_proxy import (
+    UpstreamMediaMTXUnavailable,
+    proxy_whep_delete,
+    proxy_whep_offer,
+)
+
+# Resource id format on DELETE — comes from MediaMTX, so we deliberately accept
+# any printable URL-safe id. The regex's job is to refuse path-traversal
+# (slashes, dots, encoded characters) before we interpolate it into a URL.
+_RESOURCE_ID_RE = re.compile(r"^[A-Za-z0-9_~-]{1,128}$")
+_STREAMID_PUBLISH_PREFIX = "publish:"
 
 router = APIRouter(prefix="/v1/stream-sessions", tags=["stream-sessions"])
 
@@ -254,3 +273,167 @@ async def list_session_validations(
         for r in rows
     ]
     return StreamValidationListResponse(validations=validations)
+
+
+# ---------------------------------------------------------------------------
+# WHEP proxy — read-path auth for browser WebRTC playback.
+#
+# The dashboard's <LiveStreamPlayer> POSTs SDP offers here instead of hitting
+# MediaMTX directly. We authenticate the caller (existing CurrentCaller dep),
+# verify they're a member of the session's account, then forward the offer to
+# MediaMTX over a private connection. MediaMTX itself must be firewalled in
+# production — it has no auth on the read path.
+# ---------------------------------------------------------------------------
+
+
+def _mediamtx_path_from_streamid(streamid: str) -> str | None:
+    """Return the MediaMTX path for a session, or None on a malformed streamid."""
+    if not streamid.startswith(_STREAMID_PUBLISH_PREFIX):
+        return None
+    tail = streamid[len(_STREAMID_PUBLISH_PREFIX):]
+    # Defensive: reject any character that could escape the URL path segment.
+    if not tail or "/" in tail or ".." in tail:
+        return None
+    return tail
+
+
+@router.post(
+    "/{session_id}/whep",
+    status_code=201,
+    responses={
+        201: {"content": {"application/sdp": {}}, "description": "SDP answer"},
+        404: {"description": "Session not found or stream not yet available"},
+        409: {"description": "Session is not currently streaming"},
+        415: {"description": "Content-Type must be application/sdp"},
+        502: {"description": "Streaming server unreachable"},
+    },
+)
+async def whep_offer(
+    session_id: UUID,
+    request: Request,
+    caller: CurrentCaller,
+    pool: PoolDep,
+    settings: SettingsDep,
+    http: HttpClientDep,
+    account_id: Annotated[UUID | None, Query()] = None,
+) -> Response:
+    """Forward an SDP offer to MediaMTX after auth + ownership checks."""
+    content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    if content_type != "application/sdp":
+        raise UnsupportedMediaTypeError(
+            "Content-Type must be application/sdp.",
+            code="invalid_content_type",
+        )
+
+    sdp_offer = await request.body()
+    if not sdp_offer:
+        raise BadRequestError("Empty SDP offer.", code="invalid_sdp")
+
+    scope_account = caller.resolve_account(account_id)
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "select account_id, state, streamid from stream_sessions where id = $1",
+            session_id,
+        )
+    if row is None or row["account_id"] != scope_account:
+        raise NotFoundError("Session not found.", code="session_not_found")
+    if row["state"] != "streaming":
+        raise ConflictError(
+            "Session is not currently streaming.",
+            code="session_not_streaming",
+        )
+
+    path = _mediamtx_path_from_streamid(row["streamid"])
+    if path is None:
+        # The session row's streamid format is owned by this server; an
+        # unexpected shape means data corruption, not a client error.
+        raise BadGatewayError(
+            "Streaming server is misconfigured for this session.",
+            code="upstream_unavailable",
+        )
+
+    try:
+        result = await proxy_whep_offer(
+            http,
+            mediamtx_base_url=settings.mediamtx_base_url,
+            path=path,
+            sdp_offer=sdp_offer,
+        )
+    except UpstreamMediaMTXUnavailable as exc:
+        raise BadGatewayError(
+            "Streaming server is unreachable.",
+            code="upstream_unavailable",
+        ) from exc
+
+    if result.status == 404:
+        # Common race: api-server has marked the session streaming a beat
+        # before MediaMTX registers the publisher's path. Dashboard retries.
+        raise NotFoundError(
+            "Stream not yet available; retry shortly.",
+            code="stream_not_ready",
+        )
+    if not 200 <= result.status < 300:
+        raise BadGatewayError(
+            f"Streaming server rejected the offer (HTTP {result.status}).",
+            code="upstream_unavailable",
+        )
+    if result.resource_id is None:
+        raise BadGatewayError(
+            "Streaming server returned an unparseable response.",
+            code="upstream_unavailable",
+        )
+
+    response = Response(
+        content=result.body,
+        media_type="application/sdp",
+        status_code=201,
+    )
+    # Bare resource id — the dashboard's whep-client appends it to the POST
+    # URL to build the DELETE target. Avoids encoding the proxy prefix here.
+    response.headers["Location"] = result.resource_id
+    return response
+
+
+@router.delete(
+    "/{session_id}/whep/{resource_id}",
+    status_code=204,
+)
+async def whep_delete(
+    session_id: UUID,
+    resource_id: str,
+    caller: CurrentCaller,
+    pool: PoolDep,
+    settings: SettingsDep,
+    http: HttpClientDep,
+    account_id: Annotated[UUID | None, Query()] = None,
+) -> Response:
+    """Tear down a WHEP session at MediaMTX. Best-effort."""
+    if not _RESOURCE_ID_RE.match(resource_id):
+        raise BadRequestError("Invalid resource id.", code="invalid_resource_id")
+
+    scope_account = caller.resolve_account(account_id)
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "select account_id, streamid from stream_sessions where id = $1",
+            session_id,
+        )
+    if row is None or row["account_id"] != scope_account:
+        raise NotFoundError("Session not found.", code="session_not_found")
+
+    path = _mediamtx_path_from_streamid(row["streamid"])
+    if path is None:
+        # Nothing to clean up server-side.
+        return Response(status_code=204)
+
+    try:
+        await proxy_whep_delete(
+            http,
+            mediamtx_base_url=settings.mediamtx_base_url,
+            path=path,
+            resource_id=resource_id,
+        )
+    except UpstreamMediaMTXUnavailable:
+        # Best-effort teardown. MediaMTX's ICE timeout reaps orphans.
+        pass
+
+    return Response(status_code=204)

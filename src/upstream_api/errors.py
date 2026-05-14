@@ -56,6 +56,21 @@ class LimitExceeded(ApiError):
     code = "limit_exceeded"
 
 
+class UnsupportedMediaTypeError(ApiError):
+    status_code = 415
+    code = "unsupported_media_type"
+
+
+class BadGatewayError(ApiError):
+    status_code = 502
+    code = "upstream_unavailable"
+
+
+class BadRequestError(ApiError):
+    status_code = 400
+    code = "bad_request"
+
+
 def _envelope(
     *,
     code: str,
