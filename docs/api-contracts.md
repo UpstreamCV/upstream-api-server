@@ -165,7 +165,7 @@ Response 200:
     "agent_id": "uuid",
     "camera_id": "uuid",
     "state": "approved",
-    "srt_url": "srt://<ingest-ip>:18890?streamid=publish:sess_<hex>&latency=200",
+    "srt_url": "srt://ingest.upstreamcv.com:18890?streamid=publish:sess_<hex>&latency=200",
     "streamid": "publish:sess_<hex>",
     "expires_at": "2026-05-13T00:00:00Z",
     "started_at": null,
@@ -173,7 +173,7 @@ Response 200:
     "requested": { "width": 1280, "height": 720, "fps": 30, "codec": "h264", "bitrate_kbps": 3000 },
     "approved":  { "width": 1280, "height": 720, "fps": 30, "codec": "h264", "bitrate_kbps": 3000 }
   },
-  "srt_url": "srt://<ingest-ip>:18890?streamid=publish:sess_<hex>&latency=200",
+  "srt_url": "srt://ingest.upstreamcv.com:18890?streamid=publish:sess_<hex>&latency=200",
   "session_token": "<jwt>",
   "expires_at": "2026-05-13T00:00:00Z"
 }
@@ -285,7 +285,7 @@ Why opaque, not the JWT: libsrt's `streamid` query parameter is capped at ~512 b
 | `UPSTREAM_MEDIAMTX_WEBHOOK_SECRET` | yes | Verifies `/v1/ingest/*` callers |
 | `UPSTREAM_PROCESSOR_WEBHOOK_SECRET` | yes | Verifies `/v1/processor/*` callers |
 | `UPSTREAM_PROMETHEUS_AUTH_TOKEN` | yes | Will gate `/admin/metrics` (Phase 6) |
-| `UPSTREAM_SRT_INGEST_HOST` | no | SRT ingest host advertised in `srt_url` (default `<ingest-ip>`) |
+| `UPSTREAM_SRT_INGEST_HOST` | no | SRT ingest host advertised in `srt_url` (default `ingest.upstreamcv.com`) |
 | `UPSTREAM_SRT_INGEST_PORT` | no | SRT ingest port (default `18890`) |
 | `UPSTREAM_PORT` | no | HTTP port (default 4000) |
 | `UPSTREAM_ENVIRONMENT` | no | `development` \| `staging` \| `production` (default `development`) |

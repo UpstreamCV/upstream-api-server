@@ -117,14 +117,16 @@ async def test_start_session_translates_unique_violation_to_conflict() -> None:
 
 
 async def test_start_session_srt_url_uses_settings_host_and_port() -> None:
-    """srt_url must read host/port from Settings — no hardcoded ingest.upstream.tv."""
+    """srt_url reads host/port from Settings — no hardcoded value in _build_srt_url."""
     account_id = uuid4()
     camera_id = uuid4()
     conn = FakeConn(camera_account_id=account_id, camera_agent_id=uuid4())
     requested = RequestedStream(width=1280, height=720, fps=30, codec="h264", bitrate_kbps=2500)
 
+    # Override both with values that are clearly not the default so a regression
+    # to a hardcoded host or port can't be masked by happening to match.
     settings = get_settings().model_copy(
-        update={"srt_ingest_host": "<ingest-ip>", "srt_ingest_port": 18890}
+        update={"srt_ingest_host": "127.0.0.1", "srt_ingest_port": 9999}
     )
     with patch(
         "upstream_api.services.session_lifecycle.mint_session_token",
@@ -137,8 +139,9 @@ async def test_start_session_srt_url_uses_settings_host_and_port() -> None:
             camera_id=camera_id,
             requested=requested,
         )
-    expected_prefix = "srt://<ingest-ip>:18890?streamid=publish:sess_"
+    expected_prefix = "srt://127.0.0.1:9999?streamid=publish:sess_"
     assert result.srt_url.startswith(expected_prefix), result.srt_url
+    assert "ingest.upstreamcv.com" not in result.srt_url
     assert "ingest.upstream.tv" not in result.srt_url
 
 

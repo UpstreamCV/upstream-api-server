@@ -4,6 +4,38 @@ Reverse chronological. Newest at top. Every meaningful commit gets an entry foll
 
 ---
 
+## 2026-05-14 - Default SRT ingest host to ingest.upstreamcv.com
+
+### Summary
+DNS now points `ingest.upstreamcv.com` at `<ingest-ip>` (the same Comcast box running MediaMTX). Switching the API's default `srt_ingest_host` from the raw IP to the hostname removes the IP from agent-visible URLs and means the next time the streaming server moves boxes we just update DNS — no code commit, no API redeploy. Env-var override (`UPSTREAM_SRT_INGEST_HOST`) still works for dev/staging that point at a local IP.
+
+### Files touched
+- `src/upstream_api/config.py` — default `srt_ingest_host` flipped to `"ingest.upstreamcv.com"`.
+- `tests/test_session_lifecycle.py` — regression test now overrides to `127.0.0.1:9999` (visibly non-default) and asserts neither the new nor old hostname leaks into the URL.
+- `deploy/.env.production.example` — commented-out SRT block updated to reference the new default.
+- `docs/api-contracts.md`, `docs/agent-quickstart.md` — example `srt_url` strings and env-var table default now reference `ingest.upstreamcv.com:18890`.
+
+### Deploy
+Code-only change; no .env edit needed (server has no `UPSTREAM_SRT_INGEST_HOST` set, so the new default applies):
+```sh
+cd ~/upstream-api-server && git pull --ff-only
+cd deploy && docker compose up -d --build api
+docker exec upstream-api-api-1 python -c "from upstream_api.config import get_settings; print(get_settings().srt_ingest_host)"
+# expect: ingest.upstreamcv.com
+```
+
+### How to verify
+```sh
+uv run pytest tests/test_session_lifecycle.py::test_start_session_srt_url_uses_settings_host_and_port -q
+# After deploy, /v1/stream-sessions/start should return:
+#   srt://ingest.upstreamcv.com:18890?streamid=publish:sess_<hex>&latency=...
+```
+
+### Note on the streaming server's IP
+`<ingest-ip>` is a residential Comcast range. If it isn't actually static, DNS will go stale at the next lease rotation — set up a DDNS updater on the streaming-server box or pin a static IP through Comcast Business. UDP `18890` on that IP must continue to be forwarded to whichever host runs MediaMTX.
+
+---
+
 ## 2026-05-14 - Point SRT ingest at the real streaming server (<ingest-ip>:18890)
 
 ### Summary
