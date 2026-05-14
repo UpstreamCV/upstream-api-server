@@ -4,6 +4,59 @@ Reverse chronological. Newest at top. Every meaningful commit gets an entry foll
 
 ---
 
+## 2026-05-14 - Enable Supabase Realtime on stream_sessions and cameras
+
+### Summary
+New migration `20260514120000_realtime_publication.sql` adds the
+`stream_sessions` and `cameras` tables to Supabase's built-in
+`supabase_realtime` publication. With this in place, the dashboard can
+subscribe to row changes via the browser's Supabase client instead of
+polling `/v1/stream-sessions` every 5 s — cutting "agent connect → live
+indicator" latency from up to 5 s down to ~50–200 ms (broadcast hop).
+
+### Why
+The api-server is the only writer to these tables (service-role pool;
+RLS is `select`-only for end users), and RLS already restricts which
+rows a member can read. Adding the tables to the publication means
+Supabase Realtime tails the WAL and forwards inserts/updates to
+subscribed clients, automatically filtering per-client against the
+same RLS policies the api-server honors. No new auth surface, no
+client-visible service-role key.
+
+The companion dashboard commit (`upstream-dashboard`
+`docs/commit-log.md` 2026-05-14) replaces `camera-detail-polling.tsx`
+with `camera-detail-realtime.tsx`.
+
+### Files touched
+- `supabase/migrations/20260514120000_realtime_publication.sql` (NEW) —
+  idempotent `alter publication supabase_realtime add table ...` for
+  both tables, guarded by a `pg_publication_tables` existence check so
+  rerunning the migration (or applying it to a project where the
+  tables were already enabled by hand in the Supabase dashboard) is a
+  no-op.
+
+### Verification
+`uv run pytest -q` → 145 passing (no new tests; the migration is
+schema-only and doesn't touch any code path under test).
+
+After the migration applies in production, sanity-check with:
+```sh
+psql "$UPSTREAM_DATABASE_URL" -c "
+  select schemaname, tablename
+    from pg_publication_tables
+   where pubname = 'supabase_realtime'
+     and tablename in ('stream_sessions', 'cameras')
+   order by tablename;
+"
+# expect: two rows.
+```
+
+### Deploy
+Auto-applies on push to `main` via Supabase's GitHub integration. No
+api-server redeploy needed (no Python changes).
+
+---
+
 ## 2026-05-14 - WHEP proxy: MediaMTX 1.9.3 uses /whep/<id>, not /whepsession/<id>
 
 ### Summary
