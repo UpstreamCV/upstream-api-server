@@ -47,6 +47,7 @@ class FakeConn:
                 "state": self.current_state,
                 "expires_at": datetime.now(tz=UTC),
                 "session_token_jti": uuid4(),
+                "streamid": "publish:sess_0123456789abcdef",
                 "lim_width": 1280,
                 "lim_height": 720,
                 "lim_fps": 30,

@@ -7,8 +7,10 @@ the DB is always the source of truth.
 
 from __future__ import annotations
 
+import secrets
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from urllib.parse import quote
 from uuid import UUID, uuid4
 
 import asyncpg
@@ -48,6 +50,14 @@ class StartSessionResult:
     session_token: str
     claims: SessionTokenClaims
     srt_url: str
+    # Per-session SRT passphrase (Phase 2 / FU-6). The api-server's
+    # router calls `provision_path` with this value immediately after
+    # `start_session` returns so MediaMTX has the matching key before
+    # the agent attempts to publish. Not sent to the agent in any
+    # response field — the agent sees it only as a query parameter
+    # baked into `srt_url`. Caller is responsible for NEVER logging
+    # this value.
+    srt_publish_passphrase: str
 
 
 # SRT latency in milliseconds per mode. Lower = lower glass-to-glass delay,
@@ -65,12 +75,26 @@ def _build_srt_url(
     ingest_host: str,
     port: int,
     latency_mode: str = "balanced",
+    passphrase: str | None = None,
 ) -> str:
     # URL-safe streamid; SRT carries the streamid as a UTF-8 string. Host/port
     # come from `Settings.srt_ingest_host` / `.srt_ingest_port` so dev and prod
     # can point at different streaming servers.
+    #
+    # `passphrase` (Phase 2 / FU-6) enables AES-256 encryption on the wire.
+    # When set, the agent's ffmpeg/libsrt negotiates the key during the SRT
+    # handshake against MediaMTX's per-path `srtPublishPassphrase` (also
+    # configured by the api-server via the path-provisioning HTTP API).
+    # `pbkeylen=32` selects AES-256; the value is part of the SRT URL
+    # contract — both ends must agree. URL-encoding the passphrase is
+    # important because `secrets.token_urlsafe` includes `-` and `_` which
+    # are URL-safe but a future stronger PRNG might emit `=` padding.
     latency_ms = _LATENCY_MS_BY_MODE.get(latency_mode, _LATENCY_MS_BY_MODE["balanced"])
-    return f"srt://{ingest_host}:{port}?streamid={streamid}&latency={latency_ms}"
+    base = f"srt://{ingest_host}:{port}?streamid={streamid}&latency={latency_ms}"
+    if passphrase is not None:
+        encoded = quote(passphrase, safe="")
+        base = f"{base}&passphrase={encoded}&pbkeylen=32"
+    return base
 
 
 async def start_session(
@@ -139,11 +163,18 @@ async def start_session(
     # to the agent as `session_token` for any non-ingest use, but libsrt's
     # streamid is capped at ~512 bytes so we never put the JWT in the URL.
     streamid = build_streamid(mint_stream_key())
+    # Per-session SRT passphrase (Phase 2 / FU-6). `token_urlsafe(24)` returns
+    # ~32 chars, comfortably inside libsrt's [10, 79] character window. The
+    # value is stored on the row + baked into `srt_url`; the router then
+    # PATCHes MediaMTX with the same value as the path's `srtPublishPassphrase`
+    # so the SRT handshake's AES key negotiation succeeds.
+    srt_publish_passphrase = secrets.token_urlsafe(24)
     srt_url = _build_srt_url(
         streamid,
         ingest_host=settings.srt_ingest_host,
         port=settings.srt_ingest_port,
         latency_mode=approved.latency_mode,
+        passphrase=srt_publish_passphrase,
     )
 
     try:
@@ -153,12 +184,12 @@ async def start_session(
               id, account_id, agent_id, camera_id, state,
               req_width, req_height, req_fps, req_codec, req_bitrate_kbps, req_latency_mode,
               lim_width, lim_height, lim_fps, lim_codec, lim_bitrate_kbps, lim_latency_mode,
-              streamid, srt_url, session_token_jti, expires_at
+              streamid, srt_url, session_token_jti, expires_at, srt_publish_passphrase
             ) values (
               $1, $2, $3, $4, 'approved',
               $5, $6, $7, $8, $9, $10,
               $11, $12, $13, $14, $15, $16,
-              $17, $18, $19, $20
+              $17, $18, $19, $20, $21
             )
             returning id, state, expires_at, created_at, started_at, ended_at
             """,
@@ -182,6 +213,7 @@ async def start_session(
             srt_url,
             jti,
             expires_at,
+            srt_publish_passphrase,
         )
     except asyncpg.UniqueViolationError as exc:
         # Hit by the partial unique index `stream_sessions_one_active_per_camera_idx`
@@ -221,6 +253,7 @@ async def start_session(
         session_token=session_token,
         claims=claims,
         srt_url=srt_url,
+        srt_publish_passphrase=srt_publish_passphrase,
     )
 
 

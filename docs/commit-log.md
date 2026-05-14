@@ -97,6 +97,86 @@ cd deploy && docker compose up -d --build api
 
 ---
 
+## 2026-05-14 - Phase 2 / FU-6: per-session SRT passphrase via MediaMTX path provisioning
+
+### Summary
+Each `stream_sessions` row now mints its own AES-256 passphrase at
+`/v1/stream-sessions/start`, embeds it in the returned SRT URL
+(`&passphrase=<X>&pbkeylen=32`), and PATCHes a matching MediaMTX path
+via the streaming-server's HTTP API so the SRT handshake actually
+negotiates encryption. On stop/end/failed the api-server DELETEs the
+path. Closes FU-6.
+
+### Why
+The agent → MediaMTX hop was previously plaintext UDP. WebRTC playback
+(MediaMTX → browser) is already DTLS-SRTP encrypted, so this work is
+strictly about the publish hop. With per-session keys, a leaked
+passphrase only exposes that one session.
+
+### Files touched
+- `supabase/migrations/20260514130000_session_passphrase.sql` (NEW) —
+  adds nullable `srt_publish_passphrase text` column. Pre-existing rows
+  stay NULL; new rows always populate. Cheap migration.
+- `src/upstream_api/config.py` — new `mediamtx_api_base_url` setting
+  (env `UPSTREAM_MEDIAMTX_API_BASE_URL`). Default `http://localhost:9997`
+  for tests; production is `http://ingest.upstreamcv.com:19997` (the
+  host-mapped MediaMTX admin port, firewall-allowed for the api-server's
+  Elastic IP and `authHTTPExclude`'d for `action: api`).
+- `src/upstream_api/services/mediamtx_provisioning.py` (NEW) — thin
+  `httpx.AsyncClient` wrapper around `PATCH /v3/config/paths/patch/{name}`
+  and `DELETE /v3/config/paths/delete/{name}`. PATCH is idempotent;
+  DELETE treats 404 as success (MediaMTX restarted, path gone). Typed
+  `MediaMTXProvisioningFailure` on transport/non-2xx so callers can
+  distinguish failure modes.
+- `src/upstream_api/services/session_lifecycle.py` — `_build_srt_url`
+  signature gains `passphrase: str | None`; when set, appends
+  `&passphrase=<url-encoded>&pbkeylen=32`. `start_session` mints via
+  `secrets.token_urlsafe(24)` (~32 chars, inside libsrt's [10, 79]
+  range), stores in DB, returns it on `StartSessionResult.srt_publish_passphrase`.
+- `src/upstream_api/services/stream_validation.py` — `SessionStateRow`
+  gains a `streamid` field so `mark_ended`/`mark_failed` callers can
+  drive the per-session path teardown without a second DB query.
+- `src/upstream_api/routers/stream_sessions.py` — `start` calls
+  `provision_path` after the DB txn commits; on `MediaMTXProvisioningFailure`
+  marks the session `failed` with `failure_code='mediamtx_provision_failed'`
+  in a fresh txn and returns 502 (`upstream_unavailable`). `stop` calls
+  `deprovision_path` after the txn (best-effort, log on failure).
+- `src/upstream_api/routers/ingest.py` — `stream-ended` and
+  `validation-failed` call `deprovision_path` after the txn (best-effort).
+- `tests/test_mediamtx_provisioning.py` (NEW) — 9 `respx` cases:
+  happy PATCH, trailing-slash base-url normalization, PATCH 4xx/5xx/transport
+  → typed failure, happy DELETE, DELETE 404 (success), DELETE other-4xx
+  → failure, DELETE transport-error → failure.
+- `tests/test_session_lifecycle.py` — added passphrase + pbkeylen
+  assertions to `test_start_session_srt_url_uses_settings_host_and_port`.
+- `tests/test_ingest_mediamtx_auth.py`, `tests/test_ingest_validate.py`,
+  `tests/test_stream_validation.py` — `_session_row` fixtures gain
+  `streamid` to match the widened `SessionStateRow`.
+- `tests/test_app_routes.py` — adds `/v1/ingest/mediamtx-auth/{secret}:POST`
+  to the expected mounted routes.
+
+### Verification
+`uv run pytest -q` → 181 passing (was 172; +9 provisioning tests).
+
+### Deploy
+1. Push migration first (auto-applies via Supabase). Column is nullable
+   so the api-server keeps working on existing rows during the gap
+   between migration apply and api-server rebuild.
+2. Push api-server. New sessions get passphrases + paths.
+3. On crowdcounts2: bump mediamtx.yml to remove the catch-all
+   `paths.all_others` block (every legitimate path is now explicitly
+   provisioned by the api-server; unknown streamids fail authHTTP +
+   no longer fall back to the permissive catch-all). `docker compose
+   restart mediamtx`.
+
+### Known limitation
+MediaMTX's path config is in-memory. A streaming-server restart loses
+all dynamic paths; in-flight sessions break until the agent calls
+`/start` again (which re-provisions). Tracked as FU-7. Mitigation: a
+periodic reconciler on the api-server. Deferred.
+
+---
+
 ## 2026-05-14 - stop_session: mirror cameras.status to 'idle' (gap in prior commit)
 
 ### Summary
