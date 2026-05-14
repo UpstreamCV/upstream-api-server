@@ -4,35 +4,35 @@ Reverse chronological. Newest at top. Every meaningful commit gets an entry foll
 
 ---
 
-## 2026-05-14 - Make SRT ingest host/port configurable via Settings
+## 2026-05-14 - Point SRT ingest at the real streaming server (73.203.70.44:18890)
 
 ### Summary
-After the streamid fix shipped, `upstream run` was still failing because the API kept advertising `srt://ingest.upstream.tv:8890?...` while the actual streaming server lives at `73.203.70.44:18890`. Root cause: `_build_srt_url` had the host/port hardcoded as default argument values and the caller never overrode them — there was no settings hook at all. Operator-set `UPSTREAM_SRT_INGEST_HOST` / `UPSTREAM_SRT_INGEST_PORT` env vars on the EC2 host were being silently ignored (Settings used `extra="ignore"` and had no field for them).
+After the streamid fix shipped, `upstream run` was still failing because the API kept advertising `srt://ingest.upstream.tv:8890?...` — a hostname we don't own; it was a placeholder that survived from early scaffolding. The actual streaming server is at `73.203.70.44:18890`. Root cause: `_build_srt_url` had host/port hardcoded as default kwargs, the caller never overrode them, and there was no settings hook at all.
 
-Added `srt_ingest_host` / `srt_ingest_port` to `Settings` (defaults preserve the previous hardcoded values for back-compat). `_build_srt_url` now takes them as required args; `start_session` passes them through from `settings`. The .env on the production box plus `.env.production.example` get the new keys.
+Fix is two parts: (1) add `srt_ingest_host` / `srt_ingest_port` to `Settings` so dev/staging/prod can each point at a different streaming server without code changes, and (2) set the *defaults* to the real server (`73.203.70.44:18890`) so the running box works out of the box — no operator env step needed on this deploy.
 
 ### Files touched
-- `src/upstream_api/config.py` — added `srt_ingest_host: str = "ingest.upstream.tv"` and `srt_ingest_port: int = 8890`.
+- `src/upstream_api/config.py` — added `srt_ingest_host: str = "73.203.70.44"` and `srt_ingest_port: int = 18890`.
 - `src/upstream_api/services/session_lifecycle.py` — `_build_srt_url` now takes `ingest_host` / `port` as required kwargs; `start_session` plumbs them from `settings`.
-- `tests/test_session_lifecycle.py` — new regression test `test_start_session_srt_url_uses_settings_host_and_port` that overrides both via `model_copy` and asserts the resulting `srt_url` starts with `srt://73.203.70.44:18890?streamid=publish:sess_` and contains no `ingest.upstream.tv`.
-- `deploy/.env.production.example` — added the two new keys in a clearly-labelled SRT section.
-- `docs/api-contracts.md` — added rows for `UPSTREAM_SRT_INGEST_HOST` / `_PORT` to the env-var table.
+- `tests/test_session_lifecycle.py` — new regression test `test_start_session_srt_url_uses_settings_host_and_port`: overrides both via `model_copy` and asserts the resulting `srt_url` starts with `srt://73.203.70.44:18890?streamid=publish:sess_` and contains no `ingest.upstream.tv`.
+- `deploy/.env.production.example` — added a commented-out SRT section; defaults are correct so the keys stay optional.
+- `docs/api-contracts.md` — env-var table now lists `UPSTREAM_SRT_INGEST_HOST` / `_PORT` with their real defaults, and the example `srt_url` strings reference `73.203.70.44:18890`.
+- `docs/agent-quickstart.md` — example response and smoke-test output updated to show the real host:port plus the new `publish:sess_<hex>` streamid shape (the old examples still showed the JWT-bearing form from before the streamid fix).
 
-### Operator step (one-time, on each deployed environment)
-The new env vars must be set on each deployed box for the URL to point anywhere other than the back-compat default. On `18.225.104.21`:
+### Deploy
+No operator env step required — defaults match the live streaming server. On `18.225.104.21`:
 ```sh
-cd ~/upstream-api-server/deploy
-printf '\n# --- SRT ingest endpoint ---\nUPSTREAM_SRT_INGEST_HOST=73.203.70.44\nUPSTREAM_SRT_INGEST_PORT=18890\n' >> .env
+cd ~/upstream-api-server
 git pull --ff-only
-docker compose up -d --build api
-docker exec upstream-api-api-1 printenv | grep SRT   # confirm the container sees both
+cd deploy && docker compose up -d --build api
 ```
 
 ### How to verify
 ```sh
-uv run pytest tests/test_session_lifecycle.py -q     # new regression test
+uv run pytest tests/test_session_lifecycle.py -q
 # After deploy, call /v1/stream-sessions/start and confirm:
 #   srt_url starts with `srt://73.203.70.44:18890?streamid=publish:sess_`
+# Then re-run `upstream run`; ffmpeg should connect to the real ingest.
 ```
 
 ---
