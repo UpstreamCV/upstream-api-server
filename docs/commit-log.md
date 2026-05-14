@@ -4,6 +4,35 @@ Reverse chronological. Newest at top. Every meaningful commit gets an entry foll
 
 ---
 
+## 2026-05-14 - stop_session: mirror cameras.status to 'idle' (gap in prior commit)
+
+### Summary
+`stop_session` (used by `POST /v1/stream-sessions/{id}/stop`) does its own
+inline UPDATE rather than calling `mark_ended`, so it skipped the
+`cameras.status` mirror added in the previous commit. An agent-driven /stop
+(or stale-session cleanup) would correctly transition the session row to
+`ended` but leave `cameras.status` stuck on its prior value. Fixed by
+adding the same `update cameras` statement inline in `stop_session` so the
+agent path matches the streaming-server-hook path.
+
+### Files touched
+- `src/upstream_api/services/session_lifecycle.py` — added inline
+  `update cameras set status='idle'` inside the existing `if state in
+  ('approved','streaming'):` block.
+
+### Verification
+`uv run pytest -q` → 144 passing (no new tests; existing
+`session_lifecycle` coverage doesn't include stop_session and adding a
+FakeConn just for this would be larger than the fix).
+
+### Deploy
+```sh
+cd ~/upstream-api-server && git pull --ff-only
+cd deploy && docker compose up -d --build api
+```
+
+---
+
 ## 2026-05-13 - Sync cameras.status with stream lifecycle + add ingest lookup-session endpoint
 
 ### Summary
