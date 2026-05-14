@@ -1,7 +1,9 @@
 """End-to-end smoke test for the API server.
 
 Walks the happy path: register an agent, register a camera, start a stream
-session, decode the issued JWT, and assert the claims match what we asked for.
+session, decode the JWT returned at the top level, and assert the claims
+match what we asked for. The SRT streamid itself carries an opaque
+``sess_<hex>`` key, not the JWT.
 
 Usage:
     UPSTREAM_API_URL=http://localhost:4000 \\
@@ -21,7 +23,7 @@ import httpx
 
 from upstream_api.config import get_settings
 from upstream_api.security.session_jwt import verify_session_token
-from upstream_api.security.streamid import extract_session_token
+from upstream_api.security.streamid import extract_stream_key
 
 API_URL = os.environ.get("UPSTREAM_API_URL", "http://localhost:4000")
 TOKEN = os.environ.get("UPSTREAM_DEV_TOKEN")
@@ -88,14 +90,19 @@ def main() -> None:
 
         assert body["session"]["state"] == "approved", body
         assert body["srt_url"].startswith("srt://"), body
-        assert "streamid=publish:" in body["srt_url"], body
+        assert "streamid=publish:sess_" in body["srt_url"], body
         print(f"  ok  srt_url={body['srt_url'][:80]}…")
 
-        # 4. Decode the JWT and assert claims
+        # 4. The streamid is now an opaque short key — sanity-check its shape.
+        stream_key = extract_stream_key(body["session"]["streamid"])
+        assert stream_key.startswith("sess_"), stream_key
+        assert len(body["session"]["streamid"]) < 64, body["session"]["streamid"]
+        print(f"  ok  stream_key={stream_key}")
+
+        # 5. The signed JWT still rides at the top level for non-ingest callers.
         settings = get_settings()
-        embedded = extract_session_token(body["session"]["streamid"])
         claims = verify_session_token(
-            embedded, secret=settings.session_jwt_secret.get_secret_value()
+            body["session_token"], secret=settings.session_jwt_secret.get_secret_value()
         )
         assert str(claims.camera_id) == str(camera_id), claims
         assert str(claims.agent_id) == str(agent_id), claims

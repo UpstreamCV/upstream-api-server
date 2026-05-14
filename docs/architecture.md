@@ -30,7 +30,7 @@ Its job is to authenticate agents, gate session creation against account limits,
 upstream-agent                  upstream-streaming-server
 (Python, public pip lib)        (MediaMTX, SRT in / WebRTC out)
    │
-   └── SRT publish, streamid=publish:<jwt>
+   └── SRT publish, streamid=publish:<stream_key>
          │
          ▼
    upstream-streaming-server
@@ -69,7 +69,7 @@ agent ──Bearer API token──► POST /v1/stream-sessions/start
                               │  - services.limits.check_session_start
                               │      (load account_limits, concurrent session count)
                               │  - mint_session_token(secret, claims with lim)
-                              │  - build streamid = "publish:<jwt>"
+                              │  - build streamid = "publish:<stream_key>" (short opaque)
                               │  - INSERT stream_sessions (state='approved', lim_* snapshot)
                               │  - record_event(session_started)
                               │
@@ -77,7 +77,7 @@ agent ──Bearer API token──► POST /v1/stream-sessions/start
 agent ◄── { srt_url, session_token, session: {...} }
 ```
 
-The agent then opens an SRT connection to `upstream-streaming-server` with `streamid=publish:<jwt>`. In Phase 2 the streaming server will POST to `/v1/ingest/validate-stream` to verify the JWT before accepting the stream.
+The agent then opens an SRT connection to `upstream-streaming-server` with `streamid=publish:<stream_key>`. The streaming server POSTs to `/v1/ingest/validate-stream` with the full streamid; the API looks up the matching session row and returns the approved `lim_*` parameters as `expected`. The session JWT (`session_token` in the response) is **not** embedded in the streamid — libsrt caps the streamid query value at ~512 bytes, and a signed JWT with `lim` claims comfortably exceeds that. The JWT is still returned at the top level for non-ingest callers.
 
 ## Session state machine
 
@@ -117,7 +117,8 @@ Two concurrent `POST /v1/stream-sessions/start` calls could otherwise race past 
 There are three kinds of token in the system:
 
 1. **API token** (long-lived, opaque, agent-facing). Plaintext format `ups_<env>_<8 id>_<22 secret>`. The `prefix` (everything except the last segment) is stored in DB and is the unique lookup index; the last segment is argon2id-hashed in `hash`. Shown to the dashboard user exactly once on creation.
-2. **Session token** (4h TTL, JWT, agent-facing). Minted by `POST /v1/stream-sessions/start`. Embedded in SRT streamids. Carries `acc`/`sub`/`cam`/`sid`/`jti`/`exp`/`lim` claims. Validated by the streaming server via `/v1/ingest/validate-stream` (Phase 2).
+2. **Session token** (4h TTL, JWT, agent-facing). Minted by `POST /v1/stream-sessions/start` and returned at the top level of the response. Carries `acc`/`sub`/`cam`/`sid`/`jti`/`exp`/`lim` claims. *Not* placed in the SRT streamid — see "stream_key" below. Currently a back-compat carrier for non-ingest callers; the live ingest validation path no longer reads it.
+4. **Stream key** (4h TTL, opaque, ingest-only). Short random token (`sess_<16 hex>`) minted per session and stored on `stream_sessions.streamid` as `publish:sess_<hex>`. This is what rides in the SRT streamid query parameter and what `/v1/ingest/validate-stream` looks the session up by.
 3. **Supabase Auth JWT** (1h TTL, JWT, dashboard-user-facing). Issued by Supabase Auth; verified using `UPSTREAM_SUPABASE_JWT_SECRET`.
 
 ## Phased delivery
@@ -136,10 +137,10 @@ There are three kinds of token in the system:
 ## Phase 2 — MediaMTX ingest webhook flow
 
 ```
-agent ──SRT publish, streamid=publish:<jwt>──► upstream-streaming-server
+agent ──SRT publish, streamid=publish:<stream_key>──► upstream-streaming-server
                                                         │
    POST /v1/ingest/validate-stream                      │ X-Upstream-Webhook-Secret
-   { "streamid": "publish:<jwt>" }                      │
+   { "streamid": "publish:<stream_key>" }               │
    ◄── { "accept": true, "expected": { "codec":..., "width":..., ... } }
                                                         │
                                                         │ accept publish, run ffprobe

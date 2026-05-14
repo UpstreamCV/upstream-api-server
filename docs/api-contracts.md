@@ -165,15 +165,15 @@ Response 200:
     "agent_id": "uuid",
     "camera_id": "uuid",
     "state": "approved",
-    "srt_url": "srt://ingest.upstream.tv:8890?streamid=publish:<jwt>&latency=200",
-    "streamid": "publish:<jwt>",
+    "srt_url": "srt://ingest.upstream.tv:8890?streamid=publish:sess_<hex>&latency=200",
+    "streamid": "publish:sess_<hex>",
     "expires_at": "2026-05-13T00:00:00Z",
     "started_at": null,
     "ended_at": null,
     "requested": { "width": 1280, "height": 720, "fps": 30, "codec": "h264", "bitrate_kbps": 3000 },
     "approved":  { "width": 1280, "height": 720, "fps": 30, "codec": "h264", "bitrate_kbps": 3000 }
   },
-  "srt_url": "srt://ingest.upstream.tv:8890?streamid=publish:<jwt>&latency=200",
+  "srt_url": "srt://ingest.upstream.tv:8890?streamid=publish:sess_<hex>&latency=200",
   "session_token": "<jwt>",
   "expires_at": "2026-05-13T00:00:00Z"
 }
@@ -246,7 +246,7 @@ Errors: `token_not_found`, `forbidden.role`.
 
 ## Session JWT claims
 
-The token embedded in SRT streamids:
+The session JWT returned at `session_token` on the response (not embedded in the SRT streamid — see below):
 
 ```json
 {
@@ -263,11 +263,13 @@ The token embedded in SRT streamids:
 }
 ```
 
-Signed HS256 with `UPSTREAM_SESSION_JWT_SECRET`. TTL is `UPSTREAM_SESSION_TOKEN_TTL_SECONDS` (default 14400 = 4h). The streaming server enforces the `lim` claim as the contract for what the agent is allowed to stream.
+Signed HS256 with `UPSTREAM_SESSION_JWT_SECRET`. TTL is `UPSTREAM_SESSION_TOKEN_TTL_SECONDS` (default 14400 = 4h). The ingest validation path no longer reads this token; it remains for non-ingest callers that already consume the field.
 
 ## SRT streamid format
 
-Ingest connections set `streamid=publish:<jwt>` (the literal prefix `publish:` followed by the JWT). The `publish:` prefix is reserved for ingest; subscribe-style connections will use a different prefix in Phase 4/5.
+Ingest connections set `streamid=publish:sess_<16 hex>` — the literal prefix `publish:` followed by a short opaque random key (~21 chars total). The full streamid is unique-indexed on `stream_sessions.streamid` and is what `/v1/ingest/validate-stream` looks up. The `publish:` prefix is reserved for ingest; subscribe-style connections will use a different prefix in Phase 4/5.
+
+Why opaque, not the JWT: libsrt's `streamid` query parameter is capped at ~512 bytes, and a signed JWT carrying the `lim` claim object exceeds that — FFmpeg surfaces this as "Query string option 'streamid' value is too long". A short DB-backed key sidesteps the limit and removes a round of JWT verification from the ingest hot path; the API row is the source of truth either way.
 
 ## Environment variables (consumed by this service)
 
@@ -278,8 +280,8 @@ Ingest connections set `streamid=publish:<jwt>` (the literal prefix `publish:` f
 | `UPSTREAM_SUPABASE_ANON_KEY` | yes | Supabase anon key (currently unused in hot path) |
 | `UPSTREAM_SUPABASE_SERVICE_ROLE_KEY` | yes | Supabase service role key (for future storage uploads) |
 | `UPSTREAM_SUPABASE_JWT_SECRET` | yes | Verifies dashboard user JWTs |
-| `UPSTREAM_SESSION_JWT_SECRET` | yes | Signs session JWTs (independent of Supabase) |
-| `UPSTREAM_STREAMID_HMAC_KEY` | yes | Reserved for the compact streamid form (currently unused; we embed the full JWT) |
+| `UPSTREAM_SESSION_JWT_SECRET` | yes | Signs session JWTs returned at `session_token` (independent of Supabase) |
+| `UPSTREAM_STREAMID_HMAC_KEY` | yes | Reserved for a future signed streamid form (currently unused; ingest uses an opaque DB-backed key) |
 | `UPSTREAM_MEDIAMTX_WEBHOOK_SECRET` | yes | Verifies `/v1/ingest/*` callers |
 | `UPSTREAM_PROCESSOR_WEBHOOK_SECRET` | yes | Verifies `/v1/processor/*` callers |
 | `UPSTREAM_PROMETHEUS_AUTH_TOKEN` | yes | Will gate `/admin/metrics` (Phase 6) |
@@ -304,7 +306,7 @@ Preflight: should this incoming SRT connection be accepted?
 
 Request:
 ```json
-{ "streamid": "publish:<jwt>", "remote_addr": "203.0.113.42" }
+{ "streamid": "publish:sess_<hex>", "remote_addr": "203.0.113.42" }
 ```
 
 Response 200 (accepted):
@@ -330,7 +332,7 @@ Response 200 (rejected — always 200 with `accept: false`, never 4xx, because t
 }
 ```
 
-Reason codes: `streamid_malformed`, `invalid_session_token`, `session_not_found`, `token_jti_mismatch`, `stream_state_invalid`, `session_expired`.
+Reason codes: `streamid_malformed`, `session_not_found`, `stream_state_invalid`, `session_expired`.
 
 ### `POST /v1/ingest/stream-started`
 

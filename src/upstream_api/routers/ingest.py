@@ -8,8 +8,10 @@ lifecycle:
   - stream-ended:       SRT connection closed
   - validation-failed:  ffprobe mismatch / unsupported codec / etc.
 
-All four require the shared webhook secret. Stream identity is carried inside
-the streamid as a JWT signed by `UPSTREAM_SESSION_JWT_SECRET`.
+All four require the shared webhook secret. Stream identity is carried in
+the streamid as a short opaque key (``publish:sess_<hex>``) minted by the
+API and stored on the session row; validate-stream looks the session up by
+the full streamid value rather than decoding a JWT.
 """
 
 from __future__ import annotations
@@ -28,13 +30,10 @@ from upstream_api.schemas.ingest import (
     ValidateStreamResponse,
     ValidationFailedRequest,
 )
-from upstream_api.security.deps import CurrentIngest, PoolDep, SettingsDep
-from upstream_api.security.session_jwt import (
-    SessionTokenError,
-    verify_session_token,
-)
-from upstream_api.security.streamid import extract_session_token
+from upstream_api.security.deps import CurrentIngest, PoolDep
+from upstream_api.security.streamid import extract_stream_key
 from upstream_api.services.stream_validation import (
+    load_session_by_streamid,
     load_session_state,
     mark_ended,
     mark_failed,
@@ -50,46 +49,29 @@ async def validate_stream(
     body: ValidateStreamRequest,
     _ingest: CurrentIngest,
     pool: PoolDep,
-    settings: SettingsDep,
 ) -> ValidateStreamResponse:
     """Synchronous preflight: should this streamid be allowed to publish?
 
-    Verifies the JWT signature, then confirms the session row matches the
-    JWT's jti and is still in the `approved` state. Returns the approved
-    parameters as `expected`; the streaming server must enforce these against
-    what ffprobe actually observes.
+    Confirms the streamid matches an active session row that's still in the
+    `approved` state and not expired. Returns the approved parameters as
+    `expected`; the streaming server must enforce these against what ffprobe
+    actually observes.
     """
     try:
-        token = extract_session_token(body.streamid)
+        extract_stream_key(body.streamid)
     except ValueError:
         return ValidateStreamResponse(
             accept=False, reason="Malformed streamid.", reason_code="streamid_malformed"
         )
 
-    try:
-        claims = verify_session_token(token, secret=settings.session_jwt_secret.get_secret_value())
-    except SessionTokenError as exc:
-        return ValidateStreamResponse(
-            accept=False, reason=str(exc), reason_code="invalid_session_token"
-        )
-
     async with pool.acquire() as conn:
-        session = await load_session_state(conn, claims.session_id)
+        session = await load_session_by_streamid(conn, body.streamid)
 
     if session is None:
         return ValidateStreamResponse(
             accept=False,
             reason="Session not found.",
             reason_code="session_not_found",
-        )
-    if session.session_token_jti != claims.jti:
-        # Defends against a JWT being replayed after the session was rotated
-        # or revoked but the old token leaked.
-        return ValidateStreamResponse(
-            accept=False,
-            session_id=session.id,
-            reason="Token does not match current session jti.",
-            reason_code="token_jti_mismatch",
         )
     if session.state != "approved":
         return ValidateStreamResponse(

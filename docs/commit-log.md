@@ -4,6 +4,47 @@ Reverse chronological. Newest at top. Every meaningful commit gets an entry foll
 
 ---
 
+## 2026-05-13 - Use a short opaque key in SRT streamid instead of the session JWT
+
+### Summary
+`upstream run` reached the API-issued SRT URL but FFmpeg rejected it with `libsrt Query string option 'streamid' value is too long / Invalid argument`. Root cause: `POST /v1/stream-sessions/start` was packing the full session JWT into `streamid=publish:<jwt>...`. A signed JWT carrying the `lim` claim object (acc/sub/cam/sid/jti/iat/exp + nested limits) blows past libsrt's ~512-byte streamid cap. A dev override with `streamid=publish:agenttest` worked, which is what surfaced the size issue.
+
+Switched ingest to a short opaque scheme: `streamid=publish:sess_<16 hex>`. The key is minted per session, stored in the existing unique-indexed `stream_sessions.streamid` column, and `/v1/ingest/validate-stream` now looks the session row up by the full streamid value instead of decoding/verifying a JWT. The session JWT is still minted and returned at the top level of the response (`session_token`) for any non-ingest caller, but it no longer participates in the SRT URL.
+
+Net streamid size: `publish:sess_<16 hex>` = 29 bytes (was several hundred for a signed JWT).
+
+### Files touched
+- `src/upstream_api/security/streamid.py` — replaced JWT-wrapping helper with `mint_stream_key()` (returns `sess_<16 hex>`) and renamed `extract_session_token` → `extract_stream_key`. Updated module docstring to spell out the libsrt size constraint that motivates the design.
+- `src/upstream_api/services/session_lifecycle.py` — `start_session` now generates a fresh stream_key via `mint_stream_key()` and puts that in `streamid`. JWT minting is unchanged; the token still rides in `StartSessionResult.session_token`.
+- `src/upstream_api/services/stream_validation.py` — added `load_session_by_streamid(conn, streamid)` and factored the column list / row builder out of `load_session_state` so both lookups share one shape.
+- `src/upstream_api/routers/ingest.py` — `validate_stream` no longer verifies a JWT signature or compares jti; it shape-checks the `publish:` prefix and looks the session up by streamid, then runs the same state/expiry gates. Reason codes `invalid_session_token` and `token_jti_mismatch` are gone (no JWT to verify against, no rotation surface from the URL).
+- `scripts/smoke_local.py` — verifies the streamid carries a `sess_…` key under 64 bytes, then verifies the JWT separately from the top-level `session_token` field.
+- `tests/test_streamid.py` — rewritten around `mint_stream_key()` / `extract_stream_key()`; added a size assertion (`< 64 bytes`) so a future regression that re-embeds a JWT trips the suite.
+- `tests/test_ingest_validate.py` — FakeConn now matches `where streamid = $1`; happy path uses a fresh `mint_stream_key()`. Dropped `test_validate_stream_rejects_jti_mismatch` (no JWT in this path); added `test_validate_stream_rejects_unknown_streamid` to cover the `session_not_found` case for a well-formed-but-unknown key.
+- `docs/architecture.md`, `docs/api-contracts.md` — updated streamid format, token-model section, reason-code list, and the `UPSTREAM_STREAMID_HMAC_KEY` note.
+
+### System interaction notes
+- The agent (upstream-agent) treats `streamid` and `session_token` as opaque (per `upstream_agent/diagnostics/api.py`), so a shorter streamid is a drop-in change on the client side.
+- An attacker who learns a leaked streamid is no worse off than under the old design: the URL was already a bearer credential (anyone with the JWT-in-streamid could publish). The active-session and `expires_at` checks remain; once the session enters `streaming` or `ended` the streamid is unusable.
+- No DB migration required — `streamid` is already `text not null unique` on `stream_sessions`. The change is purely in what we put in that column.
+- `UPSTREAM_SESSION_JWT_SECRET` is still required: the JWT is still minted for `session_token`. No env var changes.
+
+### How to verify
+```sh
+cd upstream-api-server
+make test                                 # local suite, no DB needed
+uv run python scripts/smoke_local.py      # against a running API + dev token
+
+# Then end-to-end against the deployed stack:
+ssh -i ~/.ssh/upstream-api.pem ec2-user@18.225.104.21
+cd ~/upstream-api-server && git pull
+cd deploy && docker compose up -d --build api
+# On the agent host:
+upstream run            # ffmpeg should no longer log "streamid too long"
+```
+
+---
+
 ## 2026-05-13 - Support Supabase's asymmetric JWT signing keys (ES256)
 
 ### Summary

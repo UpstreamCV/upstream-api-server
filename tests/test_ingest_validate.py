@@ -9,16 +9,16 @@ from fastapi.testclient import TestClient
 from upstream_api.app import create_app
 from upstream_api.config import get_settings
 from upstream_api.db.pool import get_pool
-from upstream_api.security.session_jwt import SessionLimits, mint_session_token
-from upstream_api.security.streamid import build_streamid
+from upstream_api.security.streamid import build_streamid, mint_stream_key
 
 
 class FakeConn:
-    def __init__(self, session_rows: dict[UUID, dict[str, Any]] | None = None) -> None:
+    def __init__(self, session_rows: dict[str, dict[str, Any]] | None = None) -> None:
+        # Keyed by streamid (the column the new flow looks up by).
         self.session_rows = session_rows or {}
 
     async def fetchrow(self, query: str, *args: Any) -> dict[str, Any] | None:
-        if "from stream_sessions" in query:
+        if "from stream_sessions" in query and "where streamid" in query:
             return self.session_rows.get(args[0])
         return None
 
@@ -45,7 +45,7 @@ class FakePool:
 
 
 def _session_row(
-    *, session_id: UUID, jti: UUID, state: str, expires_at: datetime
+    *, session_id: UUID, state: str, expires_at: datetime
 ) -> dict[str, Any]:
     return {
         "id": session_id,
@@ -54,7 +54,7 @@ def _session_row(
         "camera_id": uuid4(),
         "state": state,
         "expires_at": expires_at,
-        "session_token_jti": jti,
+        "session_token_jti": uuid4(),
         "lim_width": 1280,
         "lim_height": 720,
         "lim_fps": 30,
@@ -62,22 +62,6 @@ def _session_row(
         "lim_bitrate_kbps": 3000,
         "lim_latency_mode": "balanced",
     }
-
-
-def _mint(jti: UUID | None = None) -> tuple[str, UUID]:
-    settings = get_settings()
-    session_id = uuid4()
-    token, _claims = mint_session_token(
-        secret=settings.session_jwt_secret.get_secret_value(),
-        account_id=uuid4(),
-        agent_id=uuid4(),
-        camera_id=uuid4(),
-        session_id=session_id,
-        limits=SessionLimits(width=1280, height=720, fps=30, codec="h264", bitrate_kbps=3000),
-        ttl_seconds=settings.session_token_ttl_seconds,
-        jti=jti,
-    )
-    return token, session_id
 
 
 def _client(pool: FakePool) -> TestClient:
@@ -95,16 +79,14 @@ def _webhook_headers() -> dict[str, str]:
 
 
 def test_validate_stream_accepts_a_fresh_approved_session() -> None:
-    jti = uuid4()
-    token, session_id = _mint(jti=jti)
+    streamid = build_streamid(mint_stream_key())
+    session_id = uuid4()
     row = _session_row(
         session_id=session_id,
-        jti=jti,
         state="approved",
         expires_at=datetime.now(tz=UTC) + timedelta(hours=1),
     )
-    pool = FakePool(FakeConn({session_id: row}))
-    streamid = build_streamid(token)
+    pool = FakePool(FakeConn({streamid: row}))
     client = _client(pool)
     r = client.post(
         "/v1/ingest/validate-stream",
@@ -132,42 +114,33 @@ def test_validate_stream_rejects_malformed_streamid() -> None:
     assert r.json()["reason_code"] == "streamid_malformed"
 
 
-def test_validate_stream_rejects_jti_mismatch() -> None:
-    # Mint with one jti but the DB row carries a different one — simulates a
-    # leaked old JWT being replayed after the session was rotated.
-    token, session_id = _mint(jti=uuid4())
-    row = _session_row(
-        session_id=session_id,
-        jti=uuid4(),  # different
-        state="approved",
-        expires_at=datetime.now(tz=UTC) + timedelta(hours=1),
-    )
-    pool = FakePool(FakeConn({session_id: row}))
+def test_validate_stream_rejects_unknown_streamid() -> None:
+    # Well-formed streamid, but no session row matches — could be a stale
+    # key from a long-since-ended session or a probe attempt.
+    pool = FakePool(FakeConn())
     client = _client(pool)
     r = client.post(
         "/v1/ingest/validate-stream",
-        json={"streamid": build_streamid(token)},
+        json={"streamid": build_streamid(mint_stream_key())},
         headers=_webhook_headers(),
     )
     body = r.json()
     assert body["accept"] is False
-    assert body["reason_code"] == "token_jti_mismatch"
+    assert body["reason_code"] == "session_not_found"
 
 
 def test_validate_stream_rejects_wrong_state() -> None:
-    jti = uuid4()
-    token, session_id = _mint(jti=jti)
+    streamid = build_streamid(mint_stream_key())
     row = _session_row(
-        session_id=session_id,
-        jti=jti,
+        session_id=uuid4(),
         state="ended",
         expires_at=datetime.now(tz=UTC) + timedelta(hours=1),
     )
-    pool = FakePool(FakeConn({session_id: row}))
+    pool = FakePool(FakeConn({streamid: row}))
     client = _client(pool)
     r = client.post(
         "/v1/ingest/validate-stream",
-        json={"streamid": build_streamid(token)},
+        json={"streamid": streamid},
         headers=_webhook_headers(),
     )
     body = r.json()
@@ -176,19 +149,17 @@ def test_validate_stream_rejects_wrong_state() -> None:
 
 
 def test_validate_stream_rejects_expired_session() -> None:
-    jti = uuid4()
-    token, session_id = _mint(jti=jti)
+    streamid = build_streamid(mint_stream_key())
     row = _session_row(
-        session_id=session_id,
-        jti=jti,
+        session_id=uuid4(),
         state="approved",
         expires_at=datetime.now(tz=UTC) - timedelta(seconds=1),
     )
-    pool = FakePool(FakeConn({session_id: row}))
+    pool = FakePool(FakeConn({streamid: row}))
     client = _client(pool)
     r = client.post(
         "/v1/ingest/validate-stream",
-        json={"streamid": build_streamid(token)},
+        json={"streamid": streamid},
         headers=_webhook_headers(),
     )
     body = r.json()

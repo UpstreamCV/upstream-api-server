@@ -20,7 +20,7 @@ from upstream_api.security.session_jwt import (
     SessionTokenClaims,
     mint_session_token,
 )
-from upstream_api.security.streamid import build_streamid
+from upstream_api.security.streamid import build_streamid, mint_stream_key
 from upstream_api.services.limits import LimitsSnapshot, RequestedStream, check_session_start
 from upstream_api.services.usage import record_event
 
@@ -132,7 +132,10 @@ async def start_session(
         jti=jti,
     )
 
-    streamid = build_streamid(session_token)
+    # Short opaque key in the SRT streamid; the signed JWT is still returned
+    # to the agent as `session_token` for any non-ingest use, but libsrt's
+    # streamid is capped at ~512 bytes so we never put the JWT in the URL.
+    streamid = build_streamid(mint_stream_key())
     srt_url = _build_srt_url(streamid, latency_mode=approved.latency_mode)
 
     try:
