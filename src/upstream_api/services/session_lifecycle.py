@@ -263,6 +263,19 @@ async def stop_session(
         state = updated["state"]
         ended_at = updated["ended_at"]
 
+        # Mirror to cameras.status so the cameras list view returns to "idle".
+        # The streaming-server's runOnNotReady hook only fires after MediaMTX
+        # actually had the stream attached, so an agent-driven /stop (or our
+        # own stale-session cleanup) bypasses that mirror unless we do it here.
+        await conn.execute(
+            """
+            update cameras
+               set status = 'idle'
+             where id = (select camera_id from stream_sessions where id = $1)
+            """,
+            session_id,
+        )
+
         duration_seconds: float | None = None
         if row["started_at"] is not None and ended_at is not None:
             duration_seconds = (ended_at - row["started_at"]).total_seconds()
