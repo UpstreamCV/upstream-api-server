@@ -153,7 +153,7 @@ Response `200`:
     "agent_id": "0b91a1a8-7d3d-4c91-9c6e-ce5b9f0e6e3e",
     "camera_id": "9c8c7e3e-c1a6-4d6c-bdda-b8c0f5a3d211",
     "state": "approved",
-    "srt_url": "srt://73.203.70.44:18890?streamid=publish:sess_4f7a2b9c3e1d8a05&latency=200",
+    "srt_url": "srt://ingest.upstreamcv.com:18890?streamid=publish:sess_4f7a2b9c3e1d8a05&latency=200",
     "streamid": "publish:sess_4f7a2b9c3e1d8a05",
     "expires_at": "2026-05-13T06:00:00Z",
     "started_at": null,
@@ -161,7 +161,7 @@ Response `200`:
     "requested": { "width": 1280, "height": 720, "fps": 30, "codec": "h264", "bitrate_kbps": 3000, "latency_mode": "balanced" },
     "approved":  { "width": 1280, "height": 720, "fps": 30, "codec": "h264", "bitrate_kbps": 3000, "latency_mode": "balanced" }
   },
-  "srt_url": "srt://73.203.70.44:18890?streamid=publish:sess_4f7a2b9c3e1d8a05&latency=200",
+  "srt_url": "srt://ingest.upstreamcv.com:18890?streamid=publish:sess_4f7a2b9c3e1d8a05&latency=200",
   "session_token": "eyJhbGciOiJIUzI1NiI…",
   "expires_at": "2026-05-13T06:00:00Z"
 }
@@ -288,7 +288,7 @@ Expected output:
 ```
   ok  agent_id=0b91a1a8-7d3d-4c91-9c6e-ce5b9f0e6e3e
   ok  camera_id=9c8c7e3e-c1a6-4d6c-bdda-b8c0f5a3d211
-  ok  srt_url=srt://73.203.70.44:18890?streamid=publish:sess_4f7a2b9c3e1d8a05&latency=200…
+  ok  srt_url=srt://ingest.upstreamcv.com:18890?streamid=publish:sess_4f7a2b9c3e1d8a05&latency=200…
   ok  stream_key=sess_4f7a2b9c3e1d8a05
   ok  jwt claims session_id=2b6f0ad4-e7c4-4d61-aa1e-a8d4c47e9b22
   ok  session stopped

@@ -49,9 +49,9 @@ class Settings(BaseSettings):
     snapshot_max_bytes: int = 5 * 1024 * 1024  # 5 MB; Caddy must allow >= this on /v1/snapshots
 
     # SRT ingest endpoint advertised back to the agent in `srt_url`. Defaults
-    # point at the current operator-run streaming server; override per env
-    # once we have a stable ingest hostname or move boxes.
-    srt_ingest_host: str = "73.203.70.44"
+    # point at the public ingest hostname; override per env (dev/staging can
+    # set these to a raw IP for a local streaming server).
+    srt_ingest_host: str = "ingest.upstreamcv.com"
     srt_ingest_port: int = 18890
 
     @property
