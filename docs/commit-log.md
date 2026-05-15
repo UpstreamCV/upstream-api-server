@@ -97,6 +97,23 @@ cd deploy && docker compose up -d --build api
 
 ---
 
+## 2026-05-15 - mediamtx_provisioning: POST→PATCH fallback (PATCH alone 404s)
+
+### Fix
+The Phase 2 commit assumed `PATCH /v3/config/paths/patch/{name}` was
+idempotent against MediaMTX 1.9.3. It isn't — PATCH 404s on a missing
+path; POST `add/{name}` 400s on an existing one. Verified live against
+the deployed MediaMTX. Switched `provision_path` to POST first (the
+common case: each `sess_<hex>` is unique), with a PATCH fallback on a
+400 conflict (the retry case: orphan path from a prior failed deprovision,
+or api-server retried provisioning). Test suite updated to assert both
+paths exercise correctly and that PATCH is NOT called on first-time
+success.
+
+`uv run pytest -q` → 182 passing.
+
+---
+
 ## 2026-05-14 - Phase 2 / FU-6: per-session SRT passphrase via MediaMTX path provisioning
 
 ### Summary

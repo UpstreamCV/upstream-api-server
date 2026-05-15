@@ -83,8 +83,13 @@ async def provision_path(
 ) -> None:
     """Create or update the MediaMTX path with a session-specific passphrase.
 
-    Uses `PATCH /v3/config/paths/patch/{path}` which is idempotent —
-    creates if missing, updates if present, never 409s on retry.
+    MediaMTX 1.9.3's path-management API is split: `POST add/{name}` only
+    creates (400 on existing), `PATCH patch/{name}` only updates (404 on
+    missing). Neither is independently idempotent. We try POST first
+    (the common case — each `sess_<hex>` is unique per session, so the
+    path doesn't yet exist) and fall back to PATCH on a 400 conflict
+    (the retry case — api-server retried after a prior failure, or a
+    previous deprovision failed leaving an orphan path).
 
     Args:
         client: shared `httpx.AsyncClient` from the app lifespan (the same
@@ -97,23 +102,44 @@ async def provision_path(
             the api-server returns to the agent in the SRT URL.
 
     Raises:
-        MediaMTXProvisioningFailure: any transport error or non-2xx.
+        MediaMTXProvisioningFailure: transport error or non-2xx (after the
+            POST→PATCH fallback has been exhausted).
     """
-    url = f"{base_url.rstrip('/')}/v3/config/paths/patch/{path}"
+    base = base_url.rstrip("/")
     body: dict[str, object] = {
         "source": "publisher",
         "srtPublishPassphrase": passphrase,
         **_hook_paths(),
     }
+
+    add_url = f"{base}/v3/config/paths/add/{path}"
     try:
-        response = await client.patch(url, json=body)
+        response = await client.post(add_url, json=body)
+    except httpx.HTTPError as exc:
+        raise MediaMTXProvisioningFailure(reason="transport", body=str(exc)) from exc
+
+    if 200 <= response.status_code < 300:
+        return
+
+    # MediaMTX 1.9.3 returns 400 with body `{"error":"path already exists"}`
+    # when add is attempted on an existing path. Fall back to PATCH which
+    # updates in place. We don't parse the body — any 400 from add could
+    # plausibly be "already exists" given that we control the path name and
+    # have already shape-validated the payload.
+    if response.status_code != 400:
+        raise MediaMTXProvisioningFailure(
+            reason="status",
+            status=response.status_code,
+            body=response.text[:512],
+        )
+
+    patch_url = f"{base}/v3/config/paths/patch/{path}"
+    try:
+        response = await client.patch(patch_url, json=body)
     except httpx.HTTPError as exc:
         raise MediaMTXProvisioningFailure(reason="transport", body=str(exc)) from exc
 
     if not 200 <= response.status_code < 300:
-        # Body is at most a few hundred bytes (MediaMTX returns JSON or
-        # text); safe to keep for log lines. Truncated by the dataclass's
-        # body cap in case MediaMTX ever surprises us.
         raise MediaMTXProvisioningFailure(
             reason="status",
             status=response.status_code,
