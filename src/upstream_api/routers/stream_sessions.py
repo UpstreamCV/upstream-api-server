@@ -16,6 +16,7 @@ from upstream_api.errors import (
     UnsupportedMediaTypeError,
 )
 from upstream_api.observability.context import session_id_var
+from upstream_api.observability.logging import get_logger
 from upstream_api.schemas.stream_sessions import (
     StreamSessionListResponse,
     StreamSessionResponse,
@@ -26,7 +27,6 @@ from upstream_api.schemas.stream_validations import (
     StreamValidationListResponse,
     StreamValidationResponse,
 )
-from upstream_api.observability.logging import get_logger
 from upstream_api.security.deps import CurrentAgent, CurrentCaller, PoolDep, SettingsDep
 from upstream_api.security.streamid import extract_stream_key
 from upstream_api.services.http_client import HttpClientDep
