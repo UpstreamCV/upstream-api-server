@@ -17,6 +17,7 @@ headers, so the secret rides in the URL path segment.
 
 from __future__ import annotations
 
+import contextlib
 import re
 from typing import Annotated
 
@@ -203,16 +204,17 @@ async def stream_ended(
 
     # Best-effort MediaMTX path teardown — outside the DB txn so a
     # streaming-server outage can't roll back the lifecycle write.
-    try:
+    # ValueError covers the edge case where streamid lacks the `publish:`
+    # prefix; both are silently swallowed here because the session row
+    # is already correctly transitioned and a stale MediaMTX path will
+    # be cleaned up by the next session start (POST add → 400 → PATCH
+    # fallback) or by the deferred FU-7 reconciler.
+    with contextlib.suppress(MediaMTXProvisioningFailure, ValueError):
         await deprovision_path(
             http,
             base_url=settings.mediamtx_api_base_url,
             path=extract_stream_key(session.streamid),
         )
-    except (MediaMTXProvisioningFailure, ValueError):
-        # ValueError: streamid didn't carry a `publish:` prefix; logged
-        # but not actionable here.
-        pass
 
     session_id_var.set(body.session_id)
     return IngestActionResponse(session_id=body.session_id, state=state)
@@ -274,14 +276,14 @@ async def validation_failed(
         session = await load_session_state(conn, body.session_id)
 
     if session is not None:
-        try:
+        # Same best-effort semantics as `/stream-ended` above; see the
+        # comment there for why both exception types are swallowed.
+        with contextlib.suppress(MediaMTXProvisioningFailure, ValueError):
             await deprovision_path(
                 http,
                 base_url=settings.mediamtx_api_base_url,
                 path=extract_stream_key(session.streamid),
             )
-        except (MediaMTXProvisioningFailure, ValueError):
-            pass
 
     session_id_var.set(body.session_id)
     return IngestActionResponse(session_id=body.session_id, state=state)

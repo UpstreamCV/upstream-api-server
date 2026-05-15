@@ -189,9 +189,7 @@ def _build_client(conn: FakeConn, account_id: UUID) -> TestClient:
     app.dependency_overrides[current_agent] = lambda: _agent_auth(account_id)
 
     base = get_settings()
-    overridden: Settings = base.model_copy(
-        update={"mediamtx_api_base_url": _MEDIAMTX_API}
-    )
+    overridden: Settings = base.model_copy(update={"mediamtx_api_base_url": _MEDIAMTX_API})
     app.dependency_overrides[get_settings] = lambda: overridden
 
     return TestClient(app)
@@ -296,14 +294,11 @@ def test_start_marks_session_failed_on_mediamtx_5xx() -> None:
     # was approved, then MediaMTX provisioning failed". An UPDATE that
     # sets state='failed' should appear in the captured executes.
     failed_updates = [
-        q for q, _ in conn.executes
-        if "update stream_sessions" in q and "'failed'" in q
+        q for q, _ in conn.executes if "update stream_sessions" in q and "'failed'" in q
     ]
     # mark_failed uses fetchrow (not execute) for the UPDATE, so
     # check the stream_validations insert it makes as a side-effect:
-    failed_validations = [
-        q for q, _ in conn.executes if "insert into stream_validations" in q
-    ]
+    failed_validations = [q for q, _ in conn.executes if "insert into stream_validations" in q]
     # Either the UPDATE or the validations insert proves mark_failed ran.
     assert failed_updates or failed_validations, (
         "mark_failed must have been invoked after MediaMTX 5xx"
