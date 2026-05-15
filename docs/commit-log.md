@@ -97,6 +97,41 @@ cd deploy && docker compose up -d --build api
 
 ---
 
+## 2026-05-15 - Add /start router integration tests (provision + failure paths)
+
+### Summary
+Phase 2 had unit tests for `provision_path` (the HTTP wrapper) and for
+`start_session` (the DB layer), but the **router glue** that calls
+`provision_path` AFTER the DB transaction commits — and translates a
+`MediaMTXProvisioningFailure` into `mark_failed` + a 502 — was untested.
+Added `tests/test_stream_sessions_router.py` with 4 cases:
+
+- Happy path — `/start` returns 200; respx confirms POST `add` was
+  called with the per-session passphrase + lifecycle hooks; PATCH was
+  NOT called.
+- MediaMTX 5xx — `/start` returns 502 `upstream_unavailable`; the
+  session row gets `mark_failed`'d (verified via the captured
+  `stream_validations` insert).
+- MediaMTX transport error — same 502 path, no `httpx` exception
+  leaks.
+- POST→PATCH fallback — when MediaMTX returns 400 (path already
+  exists), `/start` still returns 200; both POST and PATCH fire.
+
+### Why
+Closes the audit gap from `~/.claude/plans/luminous-coalescing-goblet.md`
+A3. A future refactor could plausibly accidentally move the
+`provision_path` call inside the DB transaction (rollback on MediaMTX
+failure), or forget the `mark_failed` on failure, or change the error
+code — without these tests, the only signal would be a production 5xx.
+
+### Files touched
+- `tests/test_stream_sessions_router.py` (NEW) — 4 tests, ~280 lines.
+
+### Verification
+`uv run pytest -q` → 186 passing (was 182, +4).
+
+---
+
 ## 2026-05-15 - mediamtx_provisioning: POST→PATCH fallback (PATCH alone 404s)
 
 ### Fix
