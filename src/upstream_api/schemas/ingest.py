@@ -52,6 +52,43 @@ class ValidationFailedRequest(BaseModel):
     failure_message: str = Field(min_length=1, max_length=512)
 
 
+class ExpectedConfigResponse(BaseModel):
+    """M5.1 — per-session expected media config returned to the on_ready hook.
+
+    State-agnostic: returned for ``approved``, ``streaming``, even
+    ``ended`` sessions. The hook fires after MediaMTX marks the path
+    ready, which on a reconnect can be a session already past
+    ``approved``. ``validate-stream`` is intentionally state-gated and
+    therefore unsuitable for this lookup.
+    """
+
+    session_id: UUID
+    account_id: UUID
+    agent_id: UUID
+    camera_id: UUID
+    state: str
+    expires_at: datetime
+    expected: dict[str, Any]
+
+
+class StreamValidationReportRequest(BaseModel):
+    """M5.1 — report-only validation row insert.
+
+    Carries the comparator's verdict (passed + mismatch_fields) and the
+    observed/expected snapshots so the API can persist a
+    ``stream_validations`` row WITHOUT mutating ``stream_sessions.state``
+    or deprovisioning the MediaMTX path. M5.2 will flip the streaming
+    server's failure branch over to ``/validation-failed`` for
+    enforcement; this endpoint remains for observe-mode reporting.
+    """
+
+    session_id: UUID
+    passed: bool
+    observed: ObservedStream
+    expected: dict[str, Any]
+    mismatch_fields: list[str] = Field(default_factory=list, max_length=16)
+
+
 class IngestActionResponse(BaseModel):
     session_id: UUID
     state: str

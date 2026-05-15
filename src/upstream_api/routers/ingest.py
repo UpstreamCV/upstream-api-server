@@ -20,6 +20,7 @@ from __future__ import annotations
 import contextlib
 import re
 from typing import Annotated
+from uuid import UUID
 
 from fastapi import APIRouter, Path
 from fastapi.responses import Response
@@ -28,12 +29,14 @@ from upstream_api.errors import ConflictError, NotFoundError
 from upstream_api.observability.context import session_id_var
 from upstream_api.observability.logging import get_logger
 from upstream_api.schemas.ingest import (
+    ExpectedConfigResponse,
     IngestActionResponse,
     LookupSessionRequest,
     LookupSessionResponse,
     MediaMTXAuthRequest,
     StreamEndedRequest,
     StreamStartedRequest,
+    StreamValidationReportRequest,
     ValidateStreamRequest,
     ValidateStreamResponse,
     ValidationFailedRequest,
@@ -52,6 +55,7 @@ from upstream_api.services.mediamtx_provisioning import (
 )
 from upstream_api.services.stream_validation import (
     check_session_admit,
+    insert_validation_report,
     load_session_by_streamid,
     load_session_state,
     mark_ended,
@@ -287,6 +291,82 @@ async def validation_failed(
 
     session_id_var.set(body.session_id)
     return IngestActionResponse(session_id=body.session_id, state=state)
+
+
+@router.get("/expected/{session_id}", response_model=ExpectedConfigResponse)
+async def get_expected_config(
+    session_id: UUID,
+    _ingest: CurrentIngest,
+    pool: PoolDep,
+) -> ExpectedConfigResponse:
+    """M5.1 — return the per-session `expected` block for the comparator.
+
+    State-agnostic by design. The streaming-server `runOnReady` hook fires
+    after MediaMTX has accepted a publisher; on a reconnect the session
+    may already be `streaming`. Unlike `/validate-stream`, this endpoint
+    never gates on state — the comparator just needs the approved
+    limits. Webhook-secret-gated; returns 404 if the session row is gone.
+    """
+    async with pool.acquire() as conn:
+        session = await load_session_state(conn, session_id)
+    if session is None:
+        raise NotFoundError("Session not found.", code="session_not_found")
+
+    session_id_var.set(session.id)
+    expected = {
+        "codec": session.lim_codec,
+        "width": session.lim_width,
+        "height": session.lim_height,
+        "fps": session.lim_fps,
+        "bitrate_kbps": session.lim_bitrate_kbps,
+        "latency_mode": session.lim_latency_mode,
+    }
+    return ExpectedConfigResponse(
+        session_id=session.id,
+        account_id=session.account_id,
+        agent_id=session.agent_id,
+        camera_id=session.camera_id,
+        state=session.state,
+        expires_at=session.expires_at,
+        expected=expected,
+    )
+
+
+@router.post("/stream-validations", response_model=IngestActionResponse)
+async def post_stream_validation_report(
+    body: StreamValidationReportRequest,
+    _ingest: CurrentIngest,
+    pool: PoolDep,
+) -> IngestActionResponse:
+    """M5.1 — report-only validation row insert.
+
+    Inserts a ``stream_validations`` row without mutating the session
+    state machine. Accepts both ``passed=true`` (observe-mode success
+    snapshot) and ``passed=false`` (observe-mode mismatch report) — the
+    latter does NOT transition the session to ``failed`` and does NOT
+    deprovision the MediaMTX path. M5.2 will route mismatches to
+    ``/validation-failed`` for enforcement; until then this endpoint
+    lets the dashboard surface mismatches while the preview keeps
+    playing.
+
+    Returns the (unchanged) current session state for response shape
+    parity with ``stream-started`` / ``stream-ended``.
+    """
+    observed = body.observed.model_dump()
+    async with pool.acquire() as conn, conn.transaction():
+        await insert_validation_report(
+            conn,
+            session_id=body.session_id,
+            passed=body.passed,
+            observed=observed,
+            expected=body.expected,
+            mismatch_fields=list(body.mismatch_fields),
+        )
+        session = await load_session_state(conn, body.session_id)
+    # Existence guaranteed by insert_validation_report; assert for type checker.
+    assert session is not None
+    session_id_var.set(session.id)
+    return IngestActionResponse(session_id=session.id, state=session.state)
 
 
 def _redact_key(stream_key: str) -> str:

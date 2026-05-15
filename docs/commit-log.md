@@ -4,6 +4,71 @@ Reverse chronological. Newest at top. Every meaningful commit gets an entry foll
 
 ---
 
+## 2026-05-15 - M5.1: add report-only media validation endpoints
+
+### Summary
+Two additive ingest endpoints for the streaming-server's M5.1
+observe/report path. Neither mutates session state.
+
+### What changed
+- `GET /v1/ingest/expected/{session_id}` — state-agnostic per-session
+  expected-config lookup. Returns the same `expected` block
+  `validate-stream` returns on accept (`codec`, `width`, `height`,
+  `fps`, `bitrate_kbps`, `latency_mode`), plus `account_id`,
+  `agent_id`, `camera_id`, `state`, `expires_at`. Webhook-secret-gated
+  via the existing `CurrentIngest` dep. Unlike `validate-stream` it
+  does **not** state-gate: the streaming-server's `runOnReady` hook
+  may fire after a reconnect into an already-`streaming` session and
+  still needs the limits to run its comparator.
+- `POST /v1/ingest/stream-validations` — report-only validation row
+  insert. Accepts both `passed=true` and `passed=false`; in both
+  cases it ONLY inserts a `stream_validations` row. It does NOT call
+  `_sync_camera_status`, does NOT UPDATE `stream_sessions`, does NOT
+  call `deprovision_path`. M5.2 will route mismatches to the existing
+  `/validation-failed` endpoint for enforcement; until then this
+  endpoint lets the dashboard surface mismatches while preview keeps
+  playing.
+
+### Files
+- `src/upstream_api/schemas/ingest.py` — add `ExpectedConfigResponse`
+  and `StreamValidationReportRequest`; reuse `ObservedStream`.
+- `src/upstream_api/services/stream_validation.py` — add
+  `insert_validation_report()` helper. Existence-checks the session
+  and inserts a single `stream_validations` row.
+- `src/upstream_api/routers/ingest.py` — add the two handlers and
+  the `UUID` import (path-param needs it imported at module scope
+  for `from __future__ import annotations` to resolve at FastAPI
+  registration time).
+- `tests/test_ingest_stream_validations.py` — 9 new tests:
+  - GET: returns expected for `approved` (happy path)
+  - GET: returns expected for `streaming` (state-agnostic — the M5.1
+    -critical case)
+  - GET: 404 on missing session
+  - GET: 401 on missing/wrong webhook secret (x2)
+  - POST: `passed=true` inserts a row, state untouched
+  - POST: `passed=false` inserts a row with mismatch_fields, state
+    STILL untouched
+  - POST: 401 on missing webhook secret
+  - POST: 404 on missing session
+
+### Test runs
+`uv run pytest` — 195/195 pass.
+`uv run ruff check src tests` — clean.
+`uv run ruff format --check src tests` — clean.
+`uv run mypy src` — clean (52 source files).
+
+### Strict non-goals
+- No DB migration; reuses `stream_validations` from
+  `20260512130300_stream_sessions.sql`.
+- No change to existing routes (validate-stream, stream-started,
+  stream-ended, validation-failed, lookup-session, mediamtx-auth).
+- No dashboard changes (TS types + ValidationPanel were already
+  wired since the M4-era validations endpoint).
+- The streaming-server side ships in a paired commit in
+  `upstream-streaming-server`.
+
+---
+
 ## 2026-05-14 - Enable Supabase Realtime on stream_sessions and cameras
 
 ### Summary
