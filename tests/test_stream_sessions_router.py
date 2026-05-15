@@ -197,14 +197,13 @@ def _build_client(conn: FakeConn, account_id: UUID) -> TestClient:
 
 @pytest.fixture(autouse=True)
 def _reset_usage_cache() -> None:
-    """The session-started usage event is best-effort and may probe
-    `to_regclass`; FakeConn.fetchval returns False for that, but the
-    cached truthy from prior tests would short-circuit. Same pattern as
+    """The session-started usage event probes `to_regclass` once and
+    then caches the result module-globally. Reset before each test so
+    a prior test that ran against a fixture returning `True` can't
+    short-circuit our `False` here. Same pattern as
     test_session_lifecycle.py.
     """
-    usage_service._USAGE_TABLE_EXISTS = None
-    yield
-    usage_service._USAGE_TABLE_EXISTS = None
+    usage_service.reset_usage_table_cache()
 
 
 def _start_body(camera_id: UUID) -> dict[str, Any]:
