@@ -295,6 +295,56 @@ async def mark_failed(
     return str(row["state"])
 
 
+async def insert_validation_report(
+    conn: asyncpg.Connection,
+    *,
+    session_id: UUID,
+    passed: bool,
+    observed: dict[str, Any],
+    expected: dict[str, Any],
+    mismatch_fields: list[str],
+) -> UUID:
+    """Insert a ``stream_validations`` row WITHOUT mutating session state.
+
+    M5.1 report-only path. By design this helper does NOT:
+
+    - update ``stream_sessions.state`` (so ``passed=false`` rows do not
+      flip a streaming session to ``failed``);
+    - touch ``cameras.status`` (so the dashboard does not show 'error');
+    - deprovision the MediaMTX path (so live preview keeps working).
+
+    M5.2 will flip the streaming server to ``mark_failed`` for the
+    enforcement path; this helper persists in parallel for the
+    observe/report path.
+
+    Returns the new validation row id. Raises ``NotFoundError`` if the
+    session row does not exist (the FK would also reject, but catching
+    it here gives the canonical error envelope to the caller).
+    """
+    exists = await conn.fetchval(
+        "select 1 from stream_sessions where id = $1",
+        session_id,
+    )
+    if exists is None:
+        raise NotFoundError("Session not found.", code="session_not_found")
+
+    new_id = await conn.fetchval(
+        """
+        insert into stream_validations
+            (session_id, passed, observed, expected, mismatch_fields)
+        values ($1, $2, $3::jsonb, $4::jsonb, $5)
+        returning id
+        """,
+        session_id,
+        passed,
+        json.dumps(observed),
+        json.dumps(expected),
+        mismatch_fields,
+    )
+    assert isinstance(new_id, UUID)
+    return new_id
+
+
 async def _sync_camera_status(conn: asyncpg.Connection, session_id: UUID, status: str) -> None:
     """Mirror a session-state transition onto ``cameras.status``.
 
