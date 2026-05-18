@@ -90,6 +90,7 @@ Each router owns its own path prefix. They consume `services.*` and never write 
 - `cameras.py` — `POST /v1/cameras/register`. Upserts on `(agent_id, external_id)` if provided.
 - `stream_sessions.py` — `POST /v1/stream-sessions/start`, `POST /v1/stream-sessions/{id}/stop`, `GET /v1/stream-sessions/{id}`.
 - `api_tokens.py` — `POST /v1/api-tokens` (issue with one-time plaintext), `DELETE /v1/api-tokens/{id}` (soft-revoke).
+- `snapshots.py` — three routers in one file: `router` (`POST /v1/snapshots`, agent token), `camera_router` (`GET /v1/cameras/{camera_id}/latest-frame`, `current_caller`), `ingest_router` (`POST /v1/ingest/snapshots`, `current_ingest` webhook; identity derived from `session_id`, `streaming`-only). Shared file-validation / quota / upload-insert logic in module-private helpers (`_read_validated_jpeg`, `_enforce_snapshot_quota`, `_persist_snapshot`).
 
 ### `schemas/`
 
@@ -110,6 +111,7 @@ Pydantic v2 request/response models, one file per resource: `agents.py`, `camera
 - `test_session_jwt.py` — JWT mint/verify, expiry, tampering, audience/issuer enforcement.
 - `test_streamid.py` — `publish:` round-trip + rejection of unknown prefixes.
 - `test_shared_secret.py` — constant-time compare semantics.
+- `test_ingest_snapshots.py` — webhook-authed `POST /v1/ingest/snapshots`: happy path, 401 (missing/wrong secret), 404 unknown session, 409 non-streaming (approved/ended/failed/expired), file/quota errors, storage-failure leaves no row, tenant-spoof fields ignored; plus `GET /v1/cameras/{camera_id}/latest-frame` happy/not-found regression.
 
 ## `scripts/`
 
