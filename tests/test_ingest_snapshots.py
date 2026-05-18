@@ -24,6 +24,7 @@ from upstream_api.app import create_app
 from upstream_api.config import get_settings
 from upstream_api.db.pool import get_pool
 from upstream_api.security.deps import AgentAuth, CallerAuth, current_caller
+from upstream_api.services import storage
 
 # --- shared asyncpg fakes (same shape as tests/test_snapshots.py) -----------
 
@@ -466,3 +467,47 @@ def test_latest_frame_not_found() -> None:
     r = client.get(f"/v1/cameras/{_LF_CAMERA}/latest-frame")
     assert r.status_code == 404
     assert r.json()["error"]["code"] == "snapshot_not_found"
+
+
+# --- regression: real storage client path (unhashable-Settings bug) ---------
+
+
+class _FakeSupabaseBucket:
+    def __init__(self) -> None:
+        self.uploads: list[tuple[str, bytes]] = []
+
+    def upload(self, key: str, data: bytes, _opts: dict[str, str]) -> dict[str, Any]:
+        self.uploads.append((key, data))
+        return {}
+
+
+class _FakeSupabaseClient:
+    def __init__(self) -> None:
+        bucket = _FakeSupabaseBucket()
+        self.storage = type("S", (), {"from_": lambda _self, _n: bucket})()
+        self._bucket = bucket
+
+
+def test_ingest_happy_path_through_real_storage_client() -> None:
+    """End-to-end: patch create_client (NOT upload_bytes) so the real
+    _client(settings) path runs. Reproduces the deployed 500
+    (TypeError: unhashable type: 'Settings') and proves it is fixed.
+    """
+    storage._client.cache_clear()
+    session = _session_row(state="streaming")
+    conn = FakeConn(session_row=session)
+    client = _client(conn)
+    fake = _FakeSupabaseClient()
+    try:
+        with patch("upstream_api.services.storage.create_client", return_value=fake):
+            r = client.post(
+                "/v1/ingest/snapshots",
+                data=_form(session["id"]),
+                files={"file": ("frame.jpg", io.BytesIO(_JPEG_BYTES), "image/jpeg")},
+                headers=_webhook_headers(),
+            )
+    finally:
+        storage._client.cache_clear()
+    assert r.status_code == 201, r.text
+    assert len(fake._bucket.uploads) == 1
+    assert fake._bucket.uploads[0][1] == _JPEG_BYTES
