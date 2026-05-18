@@ -51,10 +51,11 @@ Every non-2xx response uses this shape:
 | 404 | `account_limits_missing` | `account_limits` row not present for the account |
 | 409 | `camera_already_streaming` | another active session exists for the camera |
 | 409 | `agent_account_mismatch` | agent_id given doesn't belong to the calling account |
-| 409 | `stream_state_invalid` | ingest webhook fired on a session in the wrong state (e.g. `stream-started` on an already-ended session) |
+| 409 | `stream_state_invalid` | ingest webhook fired on a session in the wrong state (e.g. `stream-started` on an already-ended session; or `POST /v1/ingest/snapshots` for a session not in `streaming`) |
 | 403 | `forbidden_account` | dashboard user is not a member of the `account_id` they queried |
 | 403 | `account_id_required` | dashboard user has multiple memberships but did not pass `?account_id=` |
 | 403 | `forbidden_resource` | heartbeat references a `camera_id` or `session_id` not owned by the agent |
+| 400 | `empty_upload` | snapshot upload had a zero-byte body |
 | 413 | `snapshot_too_large` | snapshot upload exceeds `UPSTREAM_SNAPSHOT_MAX_BYTES` |
 | 415 | `invalid_content_type` | snapshot upload was not `image/jpeg` |
 | 429 | `snapshot_quota_exceeded` | trailing-30-day snapshot bytes would exceed `account_limits.snapshot_storage_mb` |
@@ -572,6 +573,50 @@ Response 201: `SnapshotUploadResponse`:
 ```
 
 Errors: `camera_not_found`, `agent_account_mismatch`, `invalid_content_type`, `snapshot_too_large`, `snapshot_quota_exceeded`, `account_limits_missing`.
+
+### `POST /v1/ingest/snapshots`
+
+Auth: `current_ingest` (header `X-Upstream-Webhook-Secret`). This is the
+**streaming-server** producer path (M6.2) — used after the streaming server's
+M6.1A local extraction. Agents do **not** use this endpoint; they use
+`POST /v1/snapshots`. The dashboard continues to read frames via
+`GET /v1/cameras/{camera_id}/latest-frame` (unchanged).
+
+Multipart form. Bytes are uploaded to Supabase Storage; the row references the storage key.
+
+Form fields:
+- `session_id`: UUID (required) — the session **must be in state `streaming`**
+- `captured_at`: ISO datetime
+- `width`, `height`: int, optional
+- `file`: JPEG, `Content-Type: image/jpeg`, ≤ `UPSTREAM_SNAPSHOT_MAX_BYTES` (default 5 MB)
+
+`account_id`, `agent_id`, and `camera_id` are **derived server-side from the
+session row** and never trusted from the request. Any `camera_id` / `agent_id`
+/ `account_id` / `storage_key` form fields are ignored, so a caller cannot
+write into another tenant's storage path (`storage_key` is always
+`<account_id>/<camera_id>/<yyyymmdd>/<uuid>.jpg` from the session's tenant).
+
+Response 201: `SnapshotUploadResponse` (identical shape to `POST /v1/snapshots`;
+`session_id` is always populated since it is required here):
+```json
+{
+  "id": "uuid",
+  "camera_id": "uuid",
+  "session_id": "uuid",
+  "storage_key": "<account_id>/<camera_id>/20260518/<uuid>.jpg",
+  "bytes": 187432,
+  "width": 1280,
+  "height": 720,
+  "captured_at": "2026-05-18T20:00:30Z",
+  "created_at": "2026-05-18T20:00:31Z"
+}
+```
+
+Errors: `invalid_webhook_secret` (401), `session_not_found` (404),
+`stream_state_invalid` (409 — session not `streaming`; `details.current_state`
+carries the actual state), `invalid_content_type` (415), `empty_upload` (400),
+`snapshot_too_large` (413), `snapshot_quota_exceeded` (429),
+`account_limits_missing` (404).
 
 ## Endpoints — Phase 4: reads (auth: `current_agent` OR `current_user`)
 

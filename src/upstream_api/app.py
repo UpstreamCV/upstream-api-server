@@ -96,6 +96,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(heartbeats.history_router)  # /v1/agents/{id}/heartbeats etc.
     app.include_router(snapshots.router)
     app.include_router(snapshots.camera_router)  # /v1/cameras/{id}/latest-frame
+    app.include_router(snapshots.ingest_router)  # /v1/ingest/snapshots
     app.include_router(ingest.router)
     app.include_router(users.router)
     app.include_router(accounts.router)

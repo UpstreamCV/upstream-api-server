@@ -4,6 +4,64 @@ Reverse chronological. Newest at top. Every meaningful commit gets an entry foll
 
 ---
 
+## 2026-05-18 - M6.2-delta: webhook-authed POST /v1/ingest/snapshots
+
+### Summary
+Adds the streaming-server snapshot upload path so M6.1A's locally
+extracted JPEG can reach Storage + the dashboard. Webhook-secret authed
+(`X-Upstream-Webhook-Secret`), not agent-token authed. `account_id` /
+`agent_id` / `camera_id` are derived from the session row — never trusted
+from the request. Only `streaming` sessions are accepted. Reuses the
+existing Storage/quota/`snapshots`-table pipeline; no DB migration.
+
+### What changed
+- New `POST /v1/ingest/snapshots` (third router `ingest_router` in
+  `routers/snapshots.py`, full-path, mounted separately — same convention
+  as `camera_router`). Resolves the session via `load_session_state`;
+  404 `session_not_found` if missing, 409 `stream_state_invalid`
+  (`details.current_state`) if not `streaming`.
+- Extracted the shared pipeline into module-private helpers
+  `_read_validated_jpeg` / `_enforce_snapshot_quota` / `_persist_snapshot`.
+  `POST /v1/snapshots` refactored onto the same helpers — behavior and SQL
+  byte-identical (its 7 tests pass unchanged).
+- Tenant-spoof-safe: only `session_id`/`captured_at`/`file`/`width`/
+  `height` are declared, so any `camera_id`/`agent_id`/`account_id`/
+  `storage_key` form fields are ignored; `storage_key` is server-built
+  from the session's tenant.
+
+### Files
+- `src/upstream_api/routers/snapshots.py` — 3 helpers + `ingest_router` +
+  `ingest_upload_snapshot`; `upload_snapshot` refactored onto the helpers;
+  new imports (`asyncpg`, `Settings`, `session_id_var`, `CurrentIngest`,
+  `load_session_state`).
+- `src/upstream_api/app.py` — `app.include_router(snapshots.ingest_router)`.
+- `tests/test_ingest_snapshots.py` (new) — 17 cases: happy, 401
+  (missing/wrong secret), 404 unknown session, 409 (approved/ended/
+  failed/expired), 415/400/413 file, 429 quota, 404 account_limits, 500
+  storage-failure (no insert), tenant-spoof ignored, plus 2 latest-frame
+  regression tests.
+- `docs/api-contracts.md` — new endpoint section + `empty_upload` row +
+  widened `stream_state_invalid` row.
+- `docs/module-map.md` — `routers/` + `tests/` bullets.
+
+### Test runs
+`uv run pytest` — 219/219 pass.
+`uv run ruff check src tests` — clean.
+`uv run ruff format --check src tests` — clean.
+`uv run mypy src` — clean (52 source files).
+
+### Strict non-goals
+- No streaming-server / dashboard / agent change (the M6.1B/M6.2 wiring
+  that POSTs the local JPEG is a separate, later task).
+- No DB migration (reuses the `snapshots` table).
+- No change to `POST /v1/snapshots` semantics, the `snapshots` bucket
+  privacy, `load_session_state`, or M4/M5 auth/lifecycle/validation.
+- No `expires_at` check — a `streaming` row past expiry is accepted;
+  session expiry remains governed by the ingest lifecycle webhooks.
+- M6 is not complete.
+
+---
+
 ## 2026-05-15 - M5.1: add report-only media validation endpoints
 
 ### Summary
