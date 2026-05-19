@@ -70,6 +70,19 @@ class Settings(BaseSettings):
     # AWS api-server's Elastic IP).
     mediamtx_api_base_url: str = "http://localhost:9997"
 
+    # M8.0 — base of the internal MediaMTX RTSP read path advertised to a
+    # processor in `GET /v1/internal/processor/eligible-sessions`. The full
+    # URL is built as ``{mediamtx_rtsp_base}/{stream_key}`` where stream_key
+    # is the session's MediaMTX path (the `publish:` prefix stripped from
+    # `streamid`). This is the *read* surface, NOT the SRT publish URL —
+    # `srt_url` is never returned to a processor. Like `mediamtx_base_url`
+    # this must be reachable only from trusted internal hosts (MediaMTX has
+    # no auth on the RTSP read path; it is firewalled in production).
+    #   local/container: rtsp://host.docker.internal:8554
+    #   same docker net: rtsp://mediamtx:8554
+    #   deployed:        rtsp://<internal-streaming-host>:8554
+    mediamtx_rtsp_base: str = "rtsp://host.docker.internal:8554"
+
     @property
     def is_production(self) -> bool:
         return self.environment == "production"
