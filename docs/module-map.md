@@ -80,6 +80,7 @@ Notable design choices:
 - `limits.py` — `load_account_limits()`, `check_session_start()`, `check_camera_defaults()`, `check_camera_slot_available()`. Raises `LimitExceeded(code="limit_exceeded.*")` with stable codes the agent SDK can switch on.
 - `session_lifecycle.py` — `start_session()`, `stop_session()`. Owns the state machine. `start_session` fetches the camera once, derives `agent_id`, checks busy + limits, mints the JWT, inserts the row, writes `usage_events`.
 - `usage.py` — `record_event()`. Wraps the insert in a `conn.transaction()` savepoint so a missing-`usage_events`-table error (until Phase 5) doesn't abort the parent transaction.
+- `processor.py` (M8.0) — `fetch_eligible_sessions()` (the eligibility WHERE clause is the single source of truth; inner `join lateral` picks the latest validation), `upsert_processor_status()` (upsert by `(processor_id, stream_session_id)`), `insert_observation()`, plus `coerce_jsonb` / `parse_iso_datetime` coercion helpers.
 
 ### `routers/`
 
@@ -91,10 +92,11 @@ Each router owns its own path prefix. They consume `services.*` and never write 
 - `stream_sessions.py` — `POST /v1/stream-sessions/start`, `POST /v1/stream-sessions/{id}/stop`, `GET /v1/stream-sessions/{id}`.
 - `api_tokens.py` — `POST /v1/api-tokens` (issue with one-time plaintext), `DELETE /v1/api-tokens/{id}` (soft-revoke).
 - `snapshots.py` — three routers in one file: `router` (`POST /v1/snapshots`, agent token), `camera_router` (`GET /v1/cameras/{camera_id}/latest-frame`, `current_caller`), `ingest_router` (`POST /v1/ingest/snapshots`, `current_ingest` webhook; identity derived from `session_id`, `streaming`-only). Shared file-validation / quota / upload-insert logic in module-private helpers (`_read_validated_jpeg`, `_enforce_snapshot_quota`, `_persist_snapshot`).
+- `processor.py` (M8.0) — `/v1/internal/processor` prefix, all `CurrentProcessor`-authed: `GET /eligible-sessions` (SQL-only safety filter; builds `internal_rtsp_url`, never returns `srt_url`), `POST /status` (upsert), `POST /observations` (mock types only). Tenant always derived from the session via `load_session_state`.
 
 ### `schemas/`
 
-Pydantic v2 request/response models, one file per resource: `agents.py`, `cameras.py`, `stream_sessions.py`, `api_tokens.py`.
+Pydantic v2 request/response models, one file per resource: `agents.py`, `cameras.py`, `stream_sessions.py`, `api_tokens.py`, `processor.py` (M8.0; `Literal` enums for processor status + the 3 mock observation types).
 
 ### `observability/`
 
@@ -112,6 +114,7 @@ Pydantic v2 request/response models, one file per resource: `agents.py`, `camera
 - `test_streamid.py` — `publish:` round-trip + rejection of unknown prefixes.
 - `test_shared_secret.py` — constant-time compare semantics.
 - `test_ingest_snapshots.py` — webhook-authed `POST /v1/ingest/snapshots`: happy path, 401 (missing/wrong secret), 404 unknown session, 409 non-streaming (approved/ended/failed/expired), file/quota errors, storage-failure leaves no row, tenant-spoof fields ignored; plus `GET /v1/cameras/{camera_id}/latest-frame` happy/not-found regression.
+- `test_processor.py` (M8.0) — 31 cases: auth (missing/wrong/ingest-secret-rejected/correct), the full eligibility matrix (streaming+validated included; approved/ended/expired/failed/clock-expired/no-validation/latest-failed/older-pass-latest-fail excluded; older-fail-latest-pass included; mixed set), safe-field guarantees (no `srt_url`/token/secret), `internal_rtsp_url` shape, package-id default + metadata override, a production-SQL pin guarding the fake, plus status/observation success + 422 invalid + 404 unknown-session + 401 auth.
 
 ## `scripts/`
 

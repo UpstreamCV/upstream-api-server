@@ -333,7 +333,8 @@ Authenticated via `CurrentCaller`. The `resource_id` is the value the client rec
 | `UPSTREAM_SESSION_JWT_SECRET` | yes | Signs session JWTs returned at `session_token` (independent of Supabase) |
 | `UPSTREAM_STREAMID_HMAC_KEY` | yes | Reserved for a future signed streamid form (currently unused; ingest uses an opaque DB-backed key) |
 | `UPSTREAM_MEDIAMTX_WEBHOOK_SECRET` | yes | Verifies `/v1/ingest/*` callers |
-| `UPSTREAM_PROCESSOR_WEBHOOK_SECRET` | yes | Verifies `/v1/processor/*` callers |
+| `UPSTREAM_PROCESSOR_WEBHOOK_SECRET` | yes | Verifies `/v1/internal/processor/*` callers (M8.0) |
+| `UPSTREAM_MEDIAMTX_RTSP_BASE` | no | Internal MediaMTX RTSP read base advertised to a processor (default `rtsp://host.docker.internal:8554`). The read surface, **not** the SRT publish URL |
 | `UPSTREAM_PROMETHEUS_AUTH_TOKEN` | yes | Will gate `/admin/metrics` (Phase 6) |
 | `UPSTREAM_SRT_INGEST_HOST` | no | SRT ingest host advertised in `srt_url` (default `ingest.upstreamcv.com`) |
 | `UPSTREAM_SRT_INGEST_PORT` | no | SRT ingest port (default `18890`) |
@@ -779,8 +780,79 @@ Response 200:
 
 Errors: `account_id_required`, `forbidden_account`.
 
-## Future endpoints (planned)
+## Endpoints — M8.0 Processor Readiness Gate (auth: `current_processor`)
 
-### Phase 5 — processor (auth: `current_processor`)
-- `GET /v1/processor/sessions/active`
-- `POST /v1/processor/sessions/{id}/status`
+The safe API contract a future `upstream-processor` uses to discover only
+processable streams, report status, and post mock observations. All three
+require `X-Upstream-Webhook-Secret` matching `UPSTREAM_PROCESSOR_WEBHOOK_SECRET`
+(a **distinct** secret from the ingest webhook secret). M8.0 does not decode
+video and does not run DeepStream — it only creates the contract M8.1 (mock
+processor) and M8.2 (DeepStream POC) consume.
+
+### `GET /v1/internal/processor/eligible-sessions`
+
+Query: `limit` (1–500, default 200).
+
+Returns a session **only if** (filter enforced entirely in SQL):
+- `stream_sessions.state = 'streaming'` (excludes approved / ended / expired / failed)
+- `expires_at > now()` (excludes a streaming row past its clock TTL)
+- a `stream_validations` row exists (excludes streaming-with-no-validation)
+- the **latest** validation has `passed = true` (excludes streaming-then-failed,
+  even if an older validation passed)
+
+`internal_rtsp_url` is built as `{UPSTREAM_MEDIAMTX_RTSP_BASE}/{stream_key}` from
+the session's `streamid`. The response never contains `srt_url`, an agent/API
+token, a session token, a passphrase, or any secret.
+
+Response 200:
+```json
+{
+  "sessions": [
+    {
+      "session_id": "<uuid>",
+      "stream_key": "sess_0123456789abcdef",
+      "camera_id": "<uuid>",
+      "account_id": "<uuid>",
+      "internal_rtsp_url": "rtsp://host.docker.internal:8554/sess_0123456789abcdef",
+      "package_id": "mock.detect.v0",
+      "runtime": "mock",
+      "approved": {"codec": "h264", "width": 1280, "height": 720, "fps": 30, "bitrate_kbps": 3000},
+      "validation": {
+        "passed": true,
+        "observed": {},
+        "expected": {},
+        "mismatch_fields": [],
+        "created_at": "2026-05-18T12:00:00Z"
+      },
+      "zones_lines": null,
+      "started_at": "2026-05-18T11:59:00Z",
+      "processor_eligible": true
+    }
+  ]
+}
+```
+
+`package_id` is `mock.detect.v0` unless overridden by `cameras.metadata->>'package_id'`.
+No package-registry table exists yet (deferred).
+
+### `POST /v1/internal/processor/status`
+
+Upserts the current status of one processor working one session, keyed by
+`(processor_id, stream_session_id)`. The session must exist; `account_id` /
+`camera_id` are derived from the session row, never trusted from the body.
+`status` ∈ `starting | attached | processing | lagging | failed | stopped`
+(invalid → 422 `validation_error`). Unknown session → 404 `session_not_found`.
+
+### `POST /v1/internal/processor/observations`
+
+Appends one observation. M8.0 only accepts `type` ∈
+`processor.mock_frame_seen | processor.mock_heartbeat | processor.mock_detection`
+(invalid → 422 `validation_error`). Session must exist (404 otherwise);
+`account_id` / `camera_id` derived from the session row. Returns `{id, count}`.
+
+### Intentionally deferred (not in M8.0)
+
+- `upstream-processor` repo, DeepStream runtime, YOLO/person detection, Triton
+- package-registry / model-registry tables, package marketplace
+- dashboard zones/lines UI, custom line-crossing, rules engine, billing
+- WebSocket event delivery, the stale-session sweeper

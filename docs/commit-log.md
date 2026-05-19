@@ -4,6 +4,73 @@ Reverse chronological. Newest at top. Every meaningful commit gets an entry foll
 
 ---
 
+## 2026-05-18 - M8.0: Processor Readiness Gate
+
+### Summary
+Adds the safe API contract a future `upstream-processor` uses to discover
+only processable streams, report status, and post mock observations —
+before any processor or DeepStream code exists. Wires the already-present
+but unrouted `current_processor` shared-secret dependency to a new
+`/v1/internal/processor` router. The eligibility filter lives entirely in
+SQL: a session is returned only if `state='streaming'` AND `expires_at >
+now()` AND its **latest** `stream_validations` row exists with
+`passed=true` — so the documented gap (validation enforcement may be OFF
+and a failed stream may still be readable) cannot leak an unsafe stream.
+`account_id`/`camera_id` are always derived from the session row, never
+trusted from the request. No `srt_url`, token, or secret is ever returned.
+M8.0 does not decode video and does not run DeepStream.
+
+### Files touched
+- `supabase/migrations/20260518140000_processor_status_observations.sql` (new)
+  — `processor_statuses` (upsert by `(processor_id, stream_session_id)`,
+  6-value status CHECK, RLS member-select, `set_updated_at` trigger) and
+  append-only `observations` (open `type`, API-enforced; RLS member-select).
+- `src/upstream_api/config.py` — new `mediamtx_rtsp_base`
+  (`UPSTREAM_MEDIAMTX_RTSP_BASE`); read surface, not the SRT publish URL.
+- `src/upstream_api/schemas/processor.py` (new) — eligible/status/observation
+  request+response models; `Literal` enums for status + the 3 mock types.
+- `src/upstream_api/services/processor.py` (new) — eligibility SQL (inner
+  `join lateral` picks the single latest validation), status upsert,
+  observation insert, jsonb/datetime coercion helpers.
+- `src/upstream_api/routers/processor.py` (new) — 3 endpoints, all
+  `CurrentProcessor`-authed; tenant derived via `load_session_state`;
+  malformed `streamid` rows skipped (logged) not 500.
+- `src/upstream_api/app.py` — `include_router(processor.router)`.
+- `tests/test_processor.py` (new) — 31 cases; `tests/test_app_routes.py`
+  — 3 new routes added to the manifest.
+- `docs/api-contracts.md` — M8.0 endpoint section, env-var rows.
+
+### Functions/classes changed
+- `services.processor.fetch_eligible_sessions / upsert_processor_status /
+  insert_observation` — single-statement DB helpers, tenant passed in by
+  the caller (derived from the session, never the body).
+- `routers.processor.eligible_sessions / report_status / post_observation`
+  — auth-gated handlers; status/observation reuse `load_session_state` for
+  tenant + 404.
+
+### System interaction notes
+`current_processor (X-Upstream-Webhook-Secret) → routers.processor →
+services.processor / services.stream_validation.load_session_state →
+asyncpg pool → processor_statuses|observations|stream_sessions →
+safe-field response`. The ingest webhook secret does **not** authenticate
+these routes (separate `UPSTREAM_PROCESSOR_WEBHOOK_SECRET`).
+
+### Testing/checks
+- `uv run pytest` — 252/252 pass (31 new).
+- `uv run ruff check src tests` — clean.
+- `uv run ruff format --check src tests` — clean.
+- `uv run mypy src` — clean (strict).
+- No live DB verification: route-level tests use a fake asyncpg pool. The
+  eligibility fake re-implements the documented WHERE clause and a
+  separate test pins the production SQL so the two cannot drift.
+
+### Follow-up TODOs
+- M8.1: build `upstream-processor`, mock runtime consuming this contract.
+- Deferred: package/model registry tables, DeepStream config generation,
+  zones/lines, rules engine, stale-session sweeper.
+
+---
+
 ## 2026-05-18 - M6.2-delta: webhook-authed POST /v1/ingest/snapshots
 
 ### Summary
