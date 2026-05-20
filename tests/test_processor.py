@@ -572,6 +572,84 @@ def test_observation_roi_occupancy_accepted() -> None:
     assert args[5] == "processor.roi_occupancy"
 
 
+def test_observation_zone_entered_accepted() -> None:
+    """P4-D adds per-track zone transition observations. The processor
+    pairs the stable tracker_id with per-object roi_labels and emits
+    one zone_entered per stable outside-to-inside transition."""
+    session_id, account_id, camera_id = uuid4(), uuid4(), uuid4()
+    conn = FakeSessionConn(
+        _session_row(session_id=session_id, account_id=account_id, camera_id=camera_id)
+    )
+    r = _client(conn).post(
+        "/v1/internal/processor/observations",
+        json=_obs_body(session_id, type_="processor.zone_entered"),
+        headers=_headers(),
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["count"] == 1
+    assert UUID(body["id"])
+    assert len(conn.observation_inserts) == 1
+    _q, args = conn.observation_inserts[0]
+    assert args[0] == account_id
+    assert args[1] == camera_id
+    assert args[5] == "processor.zone_entered"
+
+
+def test_observation_zone_exited_accepted() -> None:
+    """Pairs with ``zone_entered``: emitted on stable inside-to-outside
+    transition (object observed without the zone label for N frames)."""
+    session_id, account_id, camera_id = uuid4(), uuid4(), uuid4()
+    conn = FakeSessionConn(
+        _session_row(session_id=session_id, account_id=account_id, camera_id=camera_id)
+    )
+    r = _client(conn).post(
+        "/v1/internal/processor/observations",
+        json=_obs_body(session_id, type_="processor.zone_exited"),
+        headers=_headers(),
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["count"] == 1
+    assert UUID(body["id"])
+    assert len(conn.observation_inserts) == 1
+    _q, args = conn.observation_inserts[0]
+    assert args[0] == account_id
+    assert args[1] == camera_id
+    assert args[5] == "processor.zone_exited"
+
+
+def test_future_observation_types_still_rejected() -> None:
+    """The processing-layer taxonomy still defers dwell / track update
+    until their own milestones. The api-server whitelist must NOT have
+    accidentally grown — a Literal widening that adds the wrong types
+    fails here."""
+    session_id = uuid4()
+    conn = FakeSessionConn(
+        _session_row(session_id=session_id, account_id=uuid4(), camera_id=uuid4())
+    )
+    for deferred_type in (
+        "processor.dwell_exceeded",
+        "processor.dwell_started",
+        "processor.dwell_updated",
+        "processor.track_update",
+        "processor.track_state",
+        "processor.direction_detected",
+        "processor.detection_seen",
+        "processor.frame_summary",
+        "processor.scene_quality_warning",
+    ):
+        r = _client(conn).post(
+            "/v1/internal/processor/observations",
+            json=_obs_body(session_id, type_=deferred_type),
+            headers=_headers(),
+        )
+        assert r.status_code == 422, (
+            f"{deferred_type!r} unexpectedly accepted (status {r.status_code})"
+        )
+        assert r.json()["error"]["code"] == "validation_error"
+
+
 def test_observation_unknown_session_rejected() -> None:
     conn = FakeSessionConn(None)
     r = _client(conn).post(
