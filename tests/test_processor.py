@@ -519,6 +519,34 @@ def test_observation_invalid_type_rejected() -> None:
     assert conn.observation_inserts == []
 
 
+def test_observation_line_crossing_accepted() -> None:
+    """P4-B widens the ``Literal`` whitelist with the first real
+    DeepStream-backed observation type. The processing-layer rolls out
+    types one-at-a-time; this test pins the wire contract for
+    ``processor.line_crossing`` so a future Literal edit that drops
+    or renames it fails fast."""
+    session_id, account_id, camera_id = uuid4(), uuid4(), uuid4()
+    conn = FakeSessionConn(
+        _session_row(session_id=session_id, account_id=account_id, camera_id=camera_id)
+    )
+    r = _client(conn).post(
+        "/v1/internal/processor/observations",
+        json=_obs_body(session_id, type_="processor.line_crossing"),
+        headers=_headers(),
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["count"] == 1
+    assert UUID(body["id"])
+    # Tenant columns derived from the session, not the request body.
+    assert len(conn.observation_inserts) == 1
+    _q, args = conn.observation_inserts[0]
+    assert args[0] == account_id
+    assert args[1] == camera_id
+    # And: ``type`` value reached the insert as the new literal.
+    assert args[5] == "processor.line_crossing"
+
+
 def test_observation_unknown_session_rejected() -> None:
     conn = FakeSessionConn(None)
     r = _client(conn).post(
