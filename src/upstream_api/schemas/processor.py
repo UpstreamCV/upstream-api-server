@@ -37,6 +37,11 @@ ProcessorObservationType = Literal[
     "processor.mock_heartbeat",
     "processor.mock_detection",
     "processor.line_crossing",
+    # P4-C: second real DeepStream-backed type. The analytics worker
+    # emits ROI occupancy snapshots gated by an on-change-OR-interval
+    # policy (never per-frame). Same DB column / route / auth as
+    # processor.line_crossing — only the Literal widens.
+    "processor.roi_occupancy",
 ]
 
 

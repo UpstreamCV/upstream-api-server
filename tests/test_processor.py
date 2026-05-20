@@ -547,6 +547,31 @@ def test_observation_line_crossing_accepted() -> None:
     assert args[5] == "processor.line_crossing"
 
 
+def test_observation_roi_occupancy_accepted() -> None:
+    """P4-C widens the ``Literal`` whitelist with the second real
+    DeepStream-backed observation type. The analytics worker emits
+    these snapshots gated by an on-change-OR-interval policy (never
+    per-frame); the api-server side only needs to accept the literal."""
+    session_id, account_id, camera_id = uuid4(), uuid4(), uuid4()
+    conn = FakeSessionConn(
+        _session_row(session_id=session_id, account_id=account_id, camera_id=camera_id)
+    )
+    r = _client(conn).post(
+        "/v1/internal/processor/observations",
+        json=_obs_body(session_id, type_="processor.roi_occupancy"),
+        headers=_headers(),
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["count"] == 1
+    assert UUID(body["id"])
+    assert len(conn.observation_inserts) == 1
+    _q, args = conn.observation_inserts[0]
+    assert args[0] == account_id
+    assert args[1] == camera_id
+    assert args[5] == "processor.roi_occupancy"
+
+
 def test_observation_unknown_session_rejected() -> None:
     conn = FakeSessionConn(None)
     r = _client(conn).post(
