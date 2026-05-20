@@ -42,6 +42,16 @@ ProcessorObservationType = Literal[
     # policy (never per-frame). Same DB column / route / auth as
     # processor.line_crossing — only the Literal widens.
     "processor.roi_occupancy",
+    # P4-D: per-track zone transitions. The analytics worker pairs the
+    # stable tracker_id (P3) with per-object roi_labels (P3.5) to emit
+    # one zone_entered when a tracked object stably enters a configured
+    # ROI and one zone_exited when it stably leaves. Stability is
+    # measured in consecutive observed frames (default 5) so detection
+    # / tracker / analytics jitter does not flood. Disappearance does
+    # NOT emit zone_exited — only an observed-with-no-label trajectory
+    # does. Same DB column / route / auth; only the Literal widens.
+    "processor.zone_entered",
+    "processor.zone_exited",
 ]
 
 
