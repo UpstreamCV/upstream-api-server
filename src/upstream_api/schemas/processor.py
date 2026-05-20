@@ -24,11 +24,19 @@ ProcessorStatusValue = Literal[
     "stopped",
 ]
 
-# M8.0 only accepts mock observation types. M8.1+ widens this.
+# M8.0 only accepted mock observation types. P4-B (processing layer)
+# adds ``processor.line_crossing`` — emitted by the DeepStream analytics
+# probe when nvdsanalytics' ``objLCCumCnt`` counter increments. The DB
+# column ``observations.type`` is plain text with no CHECK constraint
+# (see migration ``20260518140000_processor_status_observations.sql``),
+# so widening this whitelist does not require a DDL change. Future
+# observation types (ROI occupancy, zone enter/exit, dwell, etc.) are
+# added one-at-a-time per the processing-layer taxonomy.
 ProcessorObservationType = Literal[
     "processor.mock_frame_seen",
     "processor.mock_heartbeat",
     "processor.mock_detection",
+    "processor.line_crossing",
 ]
 
 
