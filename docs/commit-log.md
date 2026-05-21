@@ -4,6 +4,56 @@ Reverse chronological. Newest at top. Every meaningful commit gets an entry foll
 
 ---
 
+## 2026-05-21 - P5-A: Recent observations read endpoint
+
+### Summary
+Adds `GET /v1/cameras/{camera_id}/observations/recent` so operators can see
+recent processor observations for a camera without direct DB access — closing
+the blind-testing gap the P5-A0 probe identified (the processor writes seven
+real observation types via P4-B..P4-E, but nothing could read them back).
+Read-only, `current_caller`-authed (agent token OR dashboard user JWT),
+double-scoped to the caller's account: an explicit camera-ownership 404 check
+AND an `account_id`-scoped query. `type` is an optional exact-match filter
+over the open-vocabulary `observations.type` column — an unknown value
+returns an empty list, never a 422. The response models `type` as a plain
+string (not `ProcessorObservationType`) so older or future observation types
+never break a read. Newest-first by `observed_at`, `limit` 1-200 (default 50).
+No migration — the `observations` table and its indexes already exist (M8.0).
+API-server only; the dashboard panel is the separate P5-B task.
+
+### Files touched
+- `src/upstream_api/schemas/processor.py` — new `ObservationRecord` and
+  `RecentObservationsResponse` models (`account_id` omitted from the read
+  response; `type` is plain `str`, not the write-side `Literal`).
+- `src/upstream_api/services/processor.py` — new `_RECENT_OBSERVATIONS_SQL`
+  constant and `fetch_recent_observations` helper, double-scoped by
+  `account_id` + `camera_id`, optional `type` filter, `observed_at desc`.
+- `src/upstream_api/routers/cameras.py` — new `list_recent_observations`
+  handler; lean `select account_id from cameras` ownership check reusing the
+  existing `camera_not_found` 404 code (no cross-tenant existence oracle).
+- `tests/test_observations.py` (new) — 23 cases (route happy path, ordering,
+  payload passthrough, limit bounds, type filter, open-vocabulary unknown
+  type, 404 unknown/cross-tenant camera, 401 unauthenticated, tenant
+  scoping, response-shape, all 7 P4 types round-tripping, production-SQL pin).
+- `tests/test_app_routes.py` — new route added to the mounted-routes manifest.
+- `docs/api-contracts.md` — endpoint contract under Phase 4.5 reads.
+
+### Testing/checks
+- `uv run pytest` — all pass (23 new in `test_observations.py`).
+- `uv run ruff check src tests` / `ruff format --check` — clean.
+- `uv run mypy src` — clean (strict).
+- No live DB verification: route-level tests use a fake asyncpg pool whose
+  `fetch` re-implements the WHERE/ORDER/LIMIT; a separate test pins the
+  production SQL so the simulation cannot drift.
+
+### Strict non-goals
+- No dashboard panel (P5-B), no session-scoped companion endpoint, no
+  overlays, no rules/events/webhooks, no server-side idempotency.
+- No DB migration; no new index (the `observations` table from M8.0 is
+  reused — `camera_id` has no dedicated index, acceptable at debug volume).
+
+---
+
 ## 2026-05-18 - M8.0: Processor Readiness Gate
 
 ### Summary

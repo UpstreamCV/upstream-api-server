@@ -18,6 +18,7 @@ def test_expected_routes_are_mounted() -> None:
         "/v1/cameras/register:POST",
         "/v1/cameras:GET",
         "/v1/cameras/{camera_id}:GET",
+        "/v1/cameras/{camera_id}/observations/recent:GET",
         "/v1/stream-sessions/start:POST",
         "/v1/stream-sessions/{session_id}/stop:POST",
         "/v1/stream-sessions/{session_id}:GET",
