@@ -23,6 +23,7 @@ from uuid import UUID
 import asyncpg
 
 from upstream_api.schemas.processor import (
+    PerceptionSnapshotIngestRequest,
     ProcessorObservationRequest,
     ProcessorStatusRequest,
 )
@@ -115,6 +116,38 @@ select
  limit $4
 """
 
+# P5-C latest perception snapshot. UPSERT keyed on camera_id alone — one
+# latest-state row per camera, overwritten by each newer snapshot. Distinct
+# from the append-only observations path.
+_UPSERT_PERCEPTION_SNAPSHOT_SQL = """
+insert into latest_perception_snapshots (
+    account_id, camera_id, stream_session_id, processor_id, package_id,
+    snapshot, observed_at
+)
+values ($1, $2, $3, $4, $5, $6::jsonb, $7)
+on conflict (camera_id) do update set
+    account_id        = excluded.account_id,
+    stream_session_id = excluded.stream_session_id,
+    processor_id      = excluded.processor_id,
+    package_id        = excluded.package_id,
+    snapshot          = excluded.snapshot,
+    observed_at       = excluded.observed_at
+returning id, camera_id, stream_session_id, processor_id, package_id,
+          snapshot, observed_at, updated_at
+"""
+
+# P5-C read path. Double-scoped by account_id AND camera_id — defense in
+# depth on top of the router's separate camera-ownership check. account_id
+# is NOT selected onto the response.
+_LATEST_PERCEPTION_SNAPSHOT_SQL = """
+select
+    id, camera_id, stream_session_id, processor_id, package_id,
+    snapshot, observed_at, updated_at
+  from latest_perception_snapshots
+ where account_id = $1
+   and camera_id = $2
+"""
+
 
 async def fetch_eligible_sessions(
     conn: asyncpg.Connection,
@@ -191,6 +224,41 @@ async def fetch_recent_observations(
         limit,
     )
     return [dict(r) for r in rows]
+
+
+async def upsert_perception_snapshot(
+    conn: asyncpg.Connection,
+    *,
+    account_id: UUID,
+    camera_id: UUID,
+    req: PerceptionSnapshotIngestRequest,
+) -> dict[str, Any]:
+    row = await conn.fetchrow(
+        _UPSERT_PERCEPTION_SNAPSHOT_SQL,
+        account_id,
+        camera_id,
+        req.stream_session_id,
+        req.processor_id,
+        req.package_id,
+        json.dumps(req.snapshot),
+        req.observed_at,
+    )
+    assert row is not None  # INSERT ... RETURNING always yields a row.
+    return dict(row)
+
+
+async def fetch_latest_perception_snapshot(
+    conn: asyncpg.Connection,
+    *,
+    account_id: UUID,
+    camera_id: UUID,
+) -> dict[str, Any] | None:
+    row = await conn.fetchrow(
+        _LATEST_PERCEPTION_SNAPSHOT_SQL,
+        account_id,
+        camera_id,
+    )
+    return dict(row) if row is not None else None
 
 
 def coerce_jsonb(value: object) -> dict[str, Any]:

@@ -21,6 +21,9 @@ from upstream_api.observability.logging import get_logger
 from upstream_api.schemas.processor import (
     ApprovedStreamSummary,
     EligibleProcessorSession,
+    LatestPerceptionSnapshotResponse,
+    PerceptionSnapshotIngestRequest,
+    PerceptionSnapshotRecord,
     ProcessorEligibleSessionsResponse,
     ProcessorObservationRequest,
     ProcessorObservationResponse,
@@ -35,6 +38,7 @@ from upstream_api.services.processor import (
     fetch_eligible_sessions,
     insert_observation,
     parse_iso_datetime,
+    upsert_perception_snapshot,
     upsert_processor_status,
 )
 from upstream_api.services.stream_validation import load_session_state
@@ -189,3 +193,44 @@ async def post_observation(
         )
 
     return ProcessorObservationResponse(id=new_id, count=1)
+
+
+@router.post(
+    "/perception-snapshots",
+    response_model=LatestPerceptionSnapshotResponse,
+)
+async def post_perception_snapshot(
+    body: PerceptionSnapshotIngestRequest,
+    _auth: CurrentProcessor,
+    pool: PoolDep,
+) -> LatestPerceptionSnapshotResponse:
+    """Upsert the latest perception snapshot for one camera (P5-C).
+
+    The session must exist; ``account_id`` / ``camera_id`` are derived from
+    the session row, never trusted from the request. One row per camera — a
+    newer snapshot overwrites the older one. This is latest visual state,
+    NOT the append-only ``observations`` event log."""
+    async with pool.acquire() as conn, conn.transaction():
+        session = await load_session_state(conn, body.stream_session_id)
+        if session is None:
+            raise NotFoundError("Session not found.", code="session_not_found")
+        session_id_var.set(session.id)
+        row = await upsert_perception_snapshot(
+            conn,
+            account_id=session.account_id,
+            camera_id=session.camera_id,
+            req=body,
+        )
+
+    return LatestPerceptionSnapshotResponse(
+        snapshot=PerceptionSnapshotRecord(
+            id=row["id"],
+            camera_id=row["camera_id"],
+            stream_session_id=row["stream_session_id"],
+            processor_id=row["processor_id"],
+            package_id=row["package_id"],
+            snapshot=coerce_jsonb(row["snapshot"]),
+            observed_at=parse_iso_datetime(row["observed_at"]),
+            updated_at=parse_iso_datetime(row["updated_at"]),
+        )
+    )

@@ -788,6 +788,33 @@ Response 200: `{ "observations": [ObservationRecord, ...] }` newest first (by `o
 
 Errors: `camera_not_found` (404 — unknown camera **or** a camera in another account; identical response, no existence oracle).
 
+### `GET /v1/cameras/{camera_id}/perception/latest`
+
+P5-C. The latest **perception snapshot** for one camera — current visual
+state (detected objects + configured ROI/line geometry) for a dashboard
+overlay. Distinct from observations: a snapshot is latest-state (one upserted
+row per camera), not an append-only event. No dashboard overlay yet (P5-D).
+
+Query: `account_id`.
+
+Response 200: `{ "snapshot": PerceptionSnapshotRecord }` where `PerceptionSnapshotRecord` is:
+```json
+{
+  "id": "uuid",
+  "camera_id": "uuid",
+  "stream_session_id": "uuid",
+  "processor_id": "proc-1",
+  "package_id": "deepstream.analytics_probe.v0",
+  "snapshot": { "frame": {}, "objects": [], "geometry": {}, "source": {}, "debug": {} },
+  "observed_at": "2026-05-21T12:00:00Z",
+  "updated_at": "2026-05-21T12:00:01Z"
+}
+```
+
+`snapshot` is returned as stored (opaque JSON — the server does not deep-validate its shape). `account_id` is not echoed. The query is double-scoped by account and camera.
+
+Errors: `camera_not_found` (404 — unknown camera or a camera in another account); `perception_snapshot_not_found` (404 — the processor has not posted a snapshot for this camera yet; mirrors `latest-frame`'s missing-resource convention).
+
 ### `GET /v1/dashboard/summary`
 
 Query: `account_id`.
@@ -876,6 +903,19 @@ Appends one observation. M8.0 only accepts `type` ∈
 `processor.mock_frame_seen | processor.mock_heartbeat | processor.mock_detection`
 (invalid → 422 `validation_error`). Session must exist (404 otherwise);
 `account_id` / `camera_id` derived from the session row. Returns `{id, count}`.
+
+### `POST /v1/internal/processor/perception-snapshots`
+
+P5-C. Upserts the **latest perception snapshot** for one camera — the
+processor's current visual state (detected objects + configured geometry).
+One row per camera: a newer snapshot overwrites the older one (latest-state,
+**not** the append-only `observations` log). Session must exist (404
+`session_not_found` otherwise); `account_id` / `camera_id` are derived from
+the session row, never trusted from the body. Body:
+`{stream_session_id, processor_id?, package_id?, observed_at, snapshot}` —
+`snapshot` is an opaque JSON object (envelope validated; nested shape not
+deep-validated server-side). Returns `{snapshot: PerceptionSnapshotRecord}`.
+Read it back via `GET /v1/cameras/{camera_id}/perception/latest`.
 
 ### Intentionally deferred (not in M8.0)
 
