@@ -52,6 +52,18 @@ ProcessorObservationType = Literal[
     # does. Same DB column / route / auth; only the Literal widens.
     "processor.zone_entered",
     "processor.zone_exited",
+    # P4-E: dwell observations layered on top of P4-D's stable zone
+    # membership. ``dwell_started`` fires once per zone enter event;
+    # ``dwell_updated`` emits periodically while the tracked object
+    # is still inside (default 30s); ``dwell_exceeded`` fires once
+    # when the dwell duration crosses the configured threshold
+    # (default 60s). No DB migration; processor closes the dwell
+    # session on the matching zone_exited (or never, if the track
+    # vanishes — matching P4-D's "disappearance does NOT emit
+    # zone_exited" invariant).
+    "processor.dwell_started",
+    "processor.dwell_updated",
+    "processor.dwell_exceeded",
 ]
 
 
