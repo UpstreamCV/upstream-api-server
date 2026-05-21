@@ -155,3 +155,28 @@ class ProcessorObservationRequest(BaseModel):
 class ProcessorObservationResponse(BaseModel):
     id: UUID
     count: int
+
+
+class ObservationRecord(BaseModel):
+    """One ``observations`` row, shaped for a read response (P5-A).
+
+    ``type`` is a plain ``str``, deliberately NOT ``ProcessorObservationType``:
+    the DB column has no CHECK constraint (open vocabulary), so a read must
+    never 422/500 on a row whose ``type`` predates or postdates the current
+    write whitelist. ``account_id`` is intentionally omitted — the caller is
+    already scoped to their own account, so echoing it adds nothing.
+    """
+
+    id: UUID
+    camera_id: UUID
+    stream_session_id: UUID
+    processor_id: str | None
+    package_id: str | None
+    type: str
+    payload: dict[str, Any]
+    observed_at: datetime
+    created_at: datetime
+
+
+class RecentObservationsResponse(BaseModel):
+    observations: list[ObservationRecord]

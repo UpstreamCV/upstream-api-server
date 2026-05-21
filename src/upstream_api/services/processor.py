@@ -99,6 +99,22 @@ values ($1, $2, $3, $4, $5, $6, $7::jsonb, $8)
 returning id
 """
 
+# P5-A read path. Double-scoped by account_id AND camera_id — defense in
+# depth on top of the router's separate camera-ownership check. account_id
+# is NOT selected onto the response (the caller is already account-scoped).
+# An unknown `type` filter simply matches zero rows; it is never an error.
+_RECENT_OBSERVATIONS_SQL = """
+select
+    id, camera_id, stream_session_id, processor_id, package_id,
+    type, payload, observed_at, created_at
+  from observations
+ where account_id = $1
+   and camera_id = $2
+   and ($3::text is null or type = $3)
+ order by observed_at desc
+ limit $4
+"""
+
 
 async def fetch_eligible_sessions(
     conn: asyncpg.Connection,
@@ -157,6 +173,24 @@ async def insert_observation(
     )
     assert isinstance(new_id, UUID)
     return new_id
+
+
+async def fetch_recent_observations(
+    conn: asyncpg.Connection,
+    *,
+    account_id: UUID,
+    camera_id: UUID,
+    type_: str | None,
+    limit: int,
+) -> list[dict[str, Any]]:
+    rows = await conn.fetch(
+        _RECENT_OBSERVATIONS_SQL,
+        account_id,
+        camera_id,
+        type_,
+        limit,
+    )
+    return [dict(r) for r in rows]
 
 
 def coerce_jsonb(value: object) -> dict[str, Any]:

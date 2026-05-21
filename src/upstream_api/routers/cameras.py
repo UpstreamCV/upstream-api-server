@@ -12,6 +12,10 @@ from upstream_api.schemas.cameras import (
     CameraRegisterRequest,
     CameraResponse,
 )
+from upstream_api.schemas.processor import (
+    ObservationRecord,
+    RecentObservationsResponse,
+)
 from upstream_api.security.deps import CurrentAgent, CurrentCaller, PoolDep
 from upstream_api.services.limits import (
     RequestedStream,
@@ -19,6 +23,7 @@ from upstream_api.services.limits import (
     check_camera_slot_available,
     load_account_limits,
 )
+from upstream_api.services.processor import coerce_jsonb, fetch_recent_observations
 
 router = APIRouter(prefix="/v1/cameras", tags=["cameras"])
 
@@ -204,3 +209,54 @@ async def get_camera(
     if row is None or row["account_id"] != scope_account:
         raise NotFoundError("Camera not found.", code="camera_not_found")
     return _camera_to_response(row)
+
+
+@router.get(
+    "/{camera_id}/observations/recent",
+    response_model=RecentObservationsResponse,
+)
+async def list_recent_observations(
+    camera_id: UUID,
+    caller: CurrentCaller,
+    pool: PoolDep,
+    account_id: Annotated[UUID | None, Query()] = None,
+    type: Annotated[str | None, Query(max_length=128)] = None,
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+) -> RecentObservationsResponse:
+    """Most recent processor observations for one camera. Newest first.
+
+    A debug/visibility read (P5-A) so operators can see processor output
+    without direct DB access. Scoped to the caller's account both by an
+    explicit camera-ownership check and by the account-scoped query.
+    """
+    scope_account = caller.resolve_account(account_id)
+    async with pool.acquire() as conn:
+        owner_row = await conn.fetchrow(
+            "select account_id from cameras where id = $1",
+            camera_id,
+        )
+        if owner_row is None or owner_row["account_id"] != scope_account:
+            raise NotFoundError("Camera not found.", code="camera_not_found")
+
+        rows = await fetch_recent_observations(
+            conn,
+            account_id=scope_account,
+            camera_id=camera_id,
+            type_=type,
+            limit=limit,
+        )
+    observations = [
+        ObservationRecord(
+            id=r["id"],
+            camera_id=r["camera_id"],
+            stream_session_id=r["stream_session_id"],
+            processor_id=r["processor_id"],
+            package_id=r["package_id"],
+            type=r["type"],
+            payload=coerce_jsonb(r["payload"]),
+            observed_at=r["observed_at"],
+            created_at=r["created_at"],
+        )
+        for r in rows
+    ]
+    return RecentObservationsResponse(observations=observations)

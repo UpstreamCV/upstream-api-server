@@ -761,6 +761,33 @@ Response 200: `{ "validations": [StreamValidationResponse, ...] }` newest first.
 
 Errors: `session_not_found`.
 
+### `GET /v1/cameras/{camera_id}/observations/recent`
+
+P5-A. Recent processor observations for one camera, so operators can see
+processor output (line crossings, ROI occupancy, zone transitions, dwell)
+without direct DB access. Read-only; no dashboard panel yet (P5-B).
+
+Query: `account_id`, `type` (str, optional exact-match filter), `limit` (1-200, default 50).
+
+Response 200: `{ "observations": [ObservationRecord, ...] }` newest first (by `observed_at`), where `ObservationRecord` is:
+```json
+{
+  "id": "uuid",
+  "camera_id": "uuid",
+  "stream_session_id": "uuid",
+  "processor_id": "proc-1",
+  "package_id": "pkg.detect.v1",
+  "type": "processor.dwell_exceeded",
+  "payload": { "...": "as stored" },
+  "observed_at": "2026-05-21T12:00:00Z",
+  "created_at": "2026-05-21T12:00:01Z"
+}
+```
+
+`type` is a plain string (the `observations.type` column is open vocabulary — no CHECK constraint), so older or future observation types never break a read. An unknown `type` filter returns an empty list, not an error. `payload` is returned as stored. `account_id` is not echoed (the caller is already account-scoped). The query is double-scoped by account and camera, and the camera must belong to the caller's account.
+
+Errors: `camera_not_found` (404 — unknown camera **or** a camera in another account; identical response, no existence oracle).
+
 ### `GET /v1/dashboard/summary`
 
 Query: `account_id`.
