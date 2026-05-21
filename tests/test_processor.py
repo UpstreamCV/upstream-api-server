@@ -619,19 +619,75 @@ def test_observation_zone_exited_accepted() -> None:
     assert args[5] == "processor.zone_exited"
 
 
+def test_observation_dwell_started_accepted() -> None:
+    """P4-E adds dwell observations layered on top of P4-D's zone
+    membership. ``dwell_started`` fires once when a tracked object
+    enters a zone; the api-server side just needs to accept the
+    literal."""
+    session_id, account_id, camera_id = uuid4(), uuid4(), uuid4()
+    conn = FakeSessionConn(
+        _session_row(session_id=session_id, account_id=account_id, camera_id=camera_id)
+    )
+    r = _client(conn).post(
+        "/v1/internal/processor/observations",
+        json=_obs_body(session_id, type_="processor.dwell_started"),
+        headers=_headers(),
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["count"] == 1
+    assert UUID(body["id"])
+    _q, args = conn.observation_inserts[0]
+    assert args[0] == account_id
+    assert args[1] == camera_id
+    assert args[5] == "processor.dwell_started"
+
+
+def test_observation_dwell_updated_accepted() -> None:
+    """``dwell_updated`` emits periodically while the tracked object is
+    still inside the zone (default 30s interval)."""
+    session_id, account_id, camera_id = uuid4(), uuid4(), uuid4()
+    conn = FakeSessionConn(
+        _session_row(session_id=session_id, account_id=account_id, camera_id=camera_id)
+    )
+    r = _client(conn).post(
+        "/v1/internal/processor/observations",
+        json=_obs_body(session_id, type_="processor.dwell_updated"),
+        headers=_headers(),
+    )
+    assert r.status_code == 200, r.text
+    _q, args = conn.observation_inserts[0]
+    assert args[5] == "processor.dwell_updated"
+
+
+def test_observation_dwell_exceeded_accepted() -> None:
+    """``dwell_exceeded`` fires once when the configured threshold
+    is crossed (default 60s)."""
+    session_id, account_id, camera_id = uuid4(), uuid4(), uuid4()
+    conn = FakeSessionConn(
+        _session_row(session_id=session_id, account_id=account_id, camera_id=camera_id)
+    )
+    r = _client(conn).post(
+        "/v1/internal/processor/observations",
+        json=_obs_body(session_id, type_="processor.dwell_exceeded"),
+        headers=_headers(),
+    )
+    assert r.status_code == 200, r.text
+    _q, args = conn.observation_inserts[0]
+    assert args[5] == "processor.dwell_exceeded"
+
+
 def test_future_observation_types_still_rejected() -> None:
-    """The processing-layer taxonomy still defers dwell / track update
-    until their own milestones. The api-server whitelist must NOT have
-    accidentally grown — a Literal widening that adds the wrong types
-    fails here."""
+    """The processing-layer taxonomy still defers track / telemetry /
+    debug types until their own milestones. The api-server whitelist
+    must NOT have accidentally grown — a Literal widening that adds
+    the wrong types fails here. P4-E flips the three dwell types out
+    of this guard since they're now supported."""
     session_id = uuid4()
     conn = FakeSessionConn(
         _session_row(session_id=session_id, account_id=uuid4(), camera_id=uuid4())
     )
     for deferred_type in (
-        "processor.dwell_exceeded",
-        "processor.dwell_started",
-        "processor.dwell_updated",
         "processor.track_update",
         "processor.track_state",
         "processor.direction_detected",
