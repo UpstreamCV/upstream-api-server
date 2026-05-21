@@ -13,7 +13,9 @@ from upstream_api.schemas.cameras import (
     CameraResponse,
 )
 from upstream_api.schemas.processor import (
+    LatestPerceptionSnapshotResponse,
     ObservationRecord,
+    PerceptionSnapshotRecord,
     RecentObservationsResponse,
 )
 from upstream_api.security.deps import CurrentAgent, CurrentCaller, PoolDep
@@ -23,7 +25,11 @@ from upstream_api.services.limits import (
     check_camera_slot_available,
     load_account_limits,
 )
-from upstream_api.services.processor import coerce_jsonb, fetch_recent_observations
+from upstream_api.services.processor import (
+    coerce_jsonb,
+    fetch_latest_perception_snapshot,
+    fetch_recent_observations,
+)
 
 router = APIRouter(prefix="/v1/cameras", tags=["cameras"])
 
@@ -260,3 +266,54 @@ async def list_recent_observations(
         for r in rows
     ]
     return RecentObservationsResponse(observations=observations)
+
+
+@router.get(
+    "/{camera_id}/perception/latest",
+    response_model=LatestPerceptionSnapshotResponse,
+)
+async def get_latest_perception_snapshot(
+    camera_id: UUID,
+    caller: CurrentCaller,
+    pool: PoolDep,
+    account_id: Annotated[UUID | None, Query()] = None,
+) -> LatestPerceptionSnapshotResponse:
+    """Latest perception snapshot for one camera (P5-C).
+
+    Current visual state — detected objects + configured geometry — for a
+    dashboard overlay. Returns 404 ``perception_snapshot_not_found`` when the
+    processor has not posted a snapshot yet (same missing-resource convention
+    as latest-frame). Scoped to the caller's account both by an explicit
+    camera-ownership check and by the account-scoped query.
+    """
+    scope_account = caller.resolve_account(account_id)
+    async with pool.acquire() as conn:
+        owner_row = await conn.fetchrow(
+            "select account_id from cameras where id = $1",
+            camera_id,
+        )
+        if owner_row is None or owner_row["account_id"] != scope_account:
+            raise NotFoundError("Camera not found.", code="camera_not_found")
+
+        row = await fetch_latest_perception_snapshot(
+            conn,
+            account_id=scope_account,
+            camera_id=camera_id,
+        )
+    if row is None:
+        raise NotFoundError(
+            "No perception snapshot for this camera yet.",
+            code="perception_snapshot_not_found",
+        )
+    return LatestPerceptionSnapshotResponse(
+        snapshot=PerceptionSnapshotRecord(
+            id=row["id"],
+            camera_id=row["camera_id"],
+            stream_session_id=row["stream_session_id"],
+            processor_id=row["processor_id"],
+            package_id=row["package_id"],
+            snapshot=coerce_jsonb(row["snapshot"]),
+            observed_at=row["observed_at"],
+            updated_at=row["updated_at"],
+        )
+    )

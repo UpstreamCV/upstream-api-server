@@ -180,3 +180,42 @@ class ObservationRecord(BaseModel):
 
 class RecentObservationsResponse(BaseModel):
     observations: list[ObservationRecord]
+
+
+class PerceptionSnapshotIngestRequest(BaseModel):
+    """``POST /v1/internal/processor/perception-snapshots`` request body (P5-C).
+
+    No ``account_id`` / ``camera_id`` — the server derives tenant from the
+    session, never trusting the body. ``snapshot`` is accepted as an opaque
+    ``dict``: the envelope is validated strongly, but the nested
+    objects/geometry are deliberately not deep-validated server-side so the
+    snapshot shape can iterate without lock-stepping a server migration.
+    """
+
+    stream_session_id: UUID
+    processor_id: str | None = Field(default=None, max_length=128)
+    package_id: str | None = Field(default=None, max_length=128)
+    observed_at: datetime
+    snapshot: dict[str, Any] = Field(default_factory=dict)
+
+
+class PerceptionSnapshotRecord(BaseModel):
+    """One ``latest_perception_snapshots`` row, shaped for a read response.
+
+    Latest visual state for one camera (upsert, one row per camera) — distinct
+    from the append-only ``observations`` event log. ``account_id`` is omitted;
+    the caller is already account-scoped.
+    """
+
+    id: UUID
+    camera_id: UUID
+    stream_session_id: UUID
+    processor_id: str | None
+    package_id: str | None
+    snapshot: dict[str, Any]
+    observed_at: datetime
+    updated_at: datetime
+
+
+class LatestPerceptionSnapshotResponse(BaseModel):
+    snapshot: PerceptionSnapshotRecord

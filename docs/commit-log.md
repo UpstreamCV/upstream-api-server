@@ -4,6 +4,53 @@ Reverse chronological. Newest at top. Every meaningful commit gets an entry foll
 
 ---
 
+## 2026-05-21 - P5-C: Latest perception snapshot API
+
+### Summary
+Adds the API foundation for visual overlays. A "perception snapshot" is the
+processor's current visual state — detected objects (bbox, tracker id, class,
+confidence, ROI labels) plus the configured ROI/line geometry. It is a
+dedicated **latest-state** path, deliberately separate from `observations`
+(which is an append-only event log): a new `latest_perception_snapshots`
+table holds ONE upserted row per camera. A new internal processor write
+endpoint upserts it (tenant derived from the session, never the body); a new
+camera-scoped `current_caller` read endpoint serves it for a future dashboard
+overlay (P5-D). Nothing was added to `ProcessorObservationType` / the
+`observations` table — the two paths share nothing.
+
+### Files touched
+- `supabase/migrations/20260521120000_latest_perception_snapshots.sql` (new)
+  — `latest_perception_snapshots` (unique `(camera_id)` upsert target,
+  `snapshot` jsonb, `set_updated_at` trigger, RLS member-select).
+- `src/upstream_api/schemas/processor.py` — `PerceptionSnapshotIngestRequest`,
+  `PerceptionSnapshotRecord`, `LatestPerceptionSnapshotResponse`. `snapshot`
+  is an opaque `dict` (envelope validated; nested shape not deep-validated).
+- `src/upstream_api/services/processor.py` — `_UPSERT_PERCEPTION_SNAPSHOT_SQL`
+  (`on conflict (camera_id)`), `_LATEST_PERCEPTION_SNAPSHOT_SQL`,
+  `upsert_perception_snapshot`, `fetch_latest_perception_snapshot`.
+- `src/upstream_api/routers/processor.py` — `POST /v1/internal/processor/perception-snapshots`
+  (`current_processor`; tenant via `load_session_state`).
+- `src/upstream_api/routers/cameras.py` — `GET /v1/cameras/{camera_id}/perception/latest`
+  (`current_caller`; camera-ownership 404; 404 `perception_snapshot_not_found`
+  when none yet, mirroring latest-frame).
+- `tests/test_perception_snapshots.py` (new) — 19 cases. `tests/test_app_routes.py`
+  — 2 new routes in the manifest.
+- `docs/api-contracts.md` — both endpoints.
+
+### Testing/checks
+- `uv run pytest` — all pass (19 new).
+- `uv run ruff check src tests` / `ruff format --check` — clean.
+- `uv run mypy src` — clean (strict).
+- No live DB verification: route-level tests use a fake asyncpg pool; a
+  separate test pins the production upsert/read SQL.
+
+### Strict non-goals
+- No dashboard overlay (P5-D), no bounding-box drawing, no live WebRTC
+  overlay, no geometry editor, no rules/events/webhooks.
+- Latest-state only — no historical perception snapshots.
+
+---
+
 ## 2026-05-21 - P5-A: Recent observations read endpoint
 
 ### Summary
