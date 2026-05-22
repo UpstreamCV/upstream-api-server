@@ -20,6 +20,7 @@ from upstream_api.observability.context import session_id_var
 from upstream_api.observability.logging import get_logger
 from upstream_api.schemas.processor import (
     ApprovedStreamSummary,
+    EligibleGeometryConfig,
     EligibleProcessorSession,
     LatestPerceptionSnapshotResponse,
     PerceptionSnapshotIngestRequest,
@@ -124,6 +125,14 @@ async def eligible_sessions(
                     expected=coerce_jsonb(row["v_expected"]),
                     mismatch_fields=list(row["v_mismatch_fields"]),
                     created_at=parse_iso_datetime(row["v_created_at"]),
+                ),
+                geometry_config=(
+                    EligibleGeometryConfig(
+                        revision=row["gc_revision"],
+                        config=coerce_jsonb(row["gc_config"]),
+                    )
+                    if row["gc_revision"] is not None
+                    else None
                 ),
                 started_at=parse_iso_datetime(row["started_at"]),
             )

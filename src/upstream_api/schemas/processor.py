@@ -90,6 +90,21 @@ class ProcessorValidationSummary(BaseModel):
     created_at: datetime
 
 
+class EligibleGeometryConfig(BaseModel):
+    """The camera's saved geometry config, carried in eligible-sessions (P6-A).
+
+    ``revision`` is the DB row revision (bumps on every save) — the
+    processor's signal that geometry changed between sessions. ``config`` is
+    the geometry config JSON, kept as an opaque ``dict``: the envelope is
+    strongly typed, but the nested shape is validated on the write path
+    (``PUT /v1/cameras/{id}/geometry-config``), not re-validated here. The
+    processor consumes this in P6-C; in P6-A it is wire-carried only.
+    """
+
+    revision: int
+    config: dict[str, Any]
+
+
 class EligibleProcessorSession(BaseModel):
     session_id: UUID
     # The MediaMTX path / read identifier (`sess_<16hex>`). Not a secret; it
@@ -102,9 +117,10 @@ class EligibleProcessorSession(BaseModel):
     runtime: str
     approved: ApprovedStreamSummary
     validation: ProcessorValidationSummary
-    # Zone/line geometry is deferred (no dashboard drawing UI yet). Always
-    # null in M8.0; the field exists so M8.3+ does not break the contract.
-    zones_lines: None = None
+    # P6-A: the camera's dashboard-authored ROI/line geometry config, or
+    # null when the camera has no saved config. Wire-carried only — the
+    # processor begins consuming it in P6-C.
+    geometry_config: EligibleGeometryConfig | None = None
     started_at: datetime | None
     processor_eligible: bool = True
 

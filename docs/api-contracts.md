@@ -815,6 +815,92 @@ Response 200: `{ "snapshot": PerceptionSnapshotRecord }` where `PerceptionSnapsh
 
 Errors: `camera_not_found` (404 — unknown camera or a camera in another account); `perception_snapshot_not_found` (404 — the processor has not posted a snapshot for this camera yet; mirrors `latest-frame`'s missing-resource convention).
 
+### `GET /v1/cameras/{camera_id}/geometry-config`
+
+P6-A. The dashboard-authored ROI/line **geometry config** for one camera —
+the shapes the processor's analytics uses. This is **processing geometry
+only**: presentation (colors, stroke, fill, opacity, CSS) is deliberately
+not modelled here and is rejected (422) — overlay styling stays
+frontend-owned.
+
+Query: `account_id`.
+
+Response 200: `{ "geometry_config": GeometryConfigRecord }` where
+`GeometryConfigRecord` is:
+```json
+{
+  "id": "uuid|null",
+  "camera_id": "uuid",
+  "revision": 3,
+  "config": {
+    "version": 1,
+    "frame": {"width": 1280, "height": 720, "coordinate_space": "normalized"},
+    "rois": [
+      {
+        "id": "entry-roi",
+        "label": "Entry ROI",
+        "type": "polygon",
+        "points": [{"x": 0.05, "y": 0.05}, {"x": 0.95, "y": 0.05}, {"x": 0.95, "y": 0.95}],
+        "enabled": true
+      }
+    ],
+    "lines": [
+      {
+        "id": "entry-line",
+        "label": "Entry Line",
+        "points": [{"x": 0.25, "y": 0.5}, {"x": 0.75, "y": 0.5}],
+        "direction": "any",
+        "enabled": true
+      }
+    ]
+  },
+  "is_default": false,
+  "created_at": "2026-05-22T12:00:00Z",
+  "updated_at": "2026-05-22T12:00:01Z"
+}
+```
+
+Two distinct, never-conflated numbers: `config.version` is the JSON **schema
+version** (always `1`); `revision` is the DB **row revision** — `0` for the
+unsaved probe default, `1` on first save, `+1` on every subsequent PUT.
+
+When a camera has no saved config the endpoint returns the **probe-default**
+config (near-full-frame `entry-roi` + horizontal `entry-line`) with
+`is_default: true`, `revision: 0`, `id: null`, and null timestamps. A saved
+config returns `is_default: false`.
+
+Coordinates are normalized floats in `[0, 1]` (resolution independent);
+`frame.width/height` record only the reference resolution the geometry was
+authored against.
+
+Errors: `camera_not_found` (404 — unknown camera or a camera in another
+account).
+
+### `PUT /v1/cameras/{camera_id}/geometry-config`
+
+P6-A. Full-replace upsert of a camera's geometry config. Query: `account_id`.
+
+Body: `{ "config": GeometryConfig }` — the `config` object from the record
+above. `account_id` / `camera_id` are derived from the authenticated caller
+and path; any tenant fields in the body are ignored.
+
+The new config overwrites any prior one and the row `revision` bumps by one
+(first save → `revision: 1`). Response 200: `{ "geometry_config":
+GeometryConfigRecord }` with `is_default: false`.
+
+Validation (→ 422 `validation_error`): `config.version` must be `1`;
+`frame.coordinate_space` must be `normalized`; ROI/line `id` must match
+`^[a-z0-9][a-z0-9-]{0,63}$`; ROI ids unique; line ids unique; each ROI
+polygon ≥ 3 points (≤ 64); each line exactly 2 points; ≤ 20 rois and ≤ 20
+lines; every point `x`/`y` in `[0, 1]`; `label` ≤ 80 chars; unknown fields
+(including any styling field) rejected.
+
+Errors: `camera_not_found` (404). No PATCH — replacement only.
+
+Geometry saved here is **not** applied to a running processor session: the
+processor picks it up on its next session (P6-C). No dashboard editor yet
+(P6-B).
+
 ### `GET /v1/dashboard/summary`
 
 Query: `account_id`.
@@ -878,7 +964,7 @@ Response 200:
         "mismatch_fields": [],
         "created_at": "2026-05-18T12:00:00Z"
       },
-      "zones_lines": null,
+      "geometry_config": null,
       "started_at": "2026-05-18T11:59:00Z",
       "processor_eligible": true
     }
@@ -888,6 +974,14 @@ Response 200:
 
 `package_id` is `mock.detect.v0` unless overridden by `cameras.metadata->>'package_id'`.
 No package-registry table exists yet (deferred).
+
+`geometry_config` (P6-A) carries the camera's saved geometry config so the
+processor does not need a separate fetch. It is `null` when the camera has no
+saved config (the processor applies its own probe default); otherwise it is
+`{"revision": <int>, "config": <GeometryConfig>}` — see
+`GET /v1/cameras/{camera_id}/geometry-config`. The processor begins consuming
+this field in P6-C; P6-A only wire-carries it (this field replaces the former
+always-null `zones_lines` placeholder).
 
 ### `POST /v1/internal/processor/status`
 

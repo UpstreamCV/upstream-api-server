@@ -1,6 +1,7 @@
 from typing import Any
 
 from fastapi import Request
+from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -112,7 +113,10 @@ async def http_exception_handler(_request: Request, exc: Exception) -> JSONRespo
 
 async def validation_exception_handler(_request: Request, exc: Exception) -> JSONResponse:
     if isinstance(exc, RequestValidationError):
-        details = {"errors": exc.errors()}
+        # ``jsonable_encoder`` so a custom validator that raises ``ValueError``
+        # (its error object lands in ``ctx``) does not break JSON encoding —
+        # already-serializable field errors pass through unchanged.
+        details = {"errors": jsonable_encoder(exc.errors())}
     else:
         details = {"errors": [{"msg": str(exc)}]}
     return _envelope(

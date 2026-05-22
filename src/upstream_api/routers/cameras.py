@@ -12,6 +12,10 @@ from upstream_api.schemas.cameras import (
     CameraRegisterRequest,
     CameraResponse,
 )
+from upstream_api.schemas.geometry import (
+    GeometryConfigResponse,
+    GeometryConfigUpdateRequest,
+)
 from upstream_api.schemas.processor import (
     LatestPerceptionSnapshotResponse,
     ObservationRecord,
@@ -19,6 +23,11 @@ from upstream_api.schemas.processor import (
     RecentObservationsResponse,
 )
 from upstream_api.security.deps import CurrentAgent, CurrentCaller, PoolDep
+from upstream_api.services.geometry import (
+    default_geometry_config_record,
+    fetch_geometry_config,
+    upsert_geometry_config,
+)
 from upstream_api.services.limits import (
     RequestedStream,
     check_camera_defaults,
@@ -317,3 +326,74 @@ async def get_latest_perception_snapshot(
             updated_at=row["updated_at"],
         )
     )
+
+
+@router.get(
+    "/{camera_id}/geometry-config",
+    response_model=GeometryConfigResponse,
+)
+async def get_geometry_config(
+    camera_id: UUID,
+    caller: CurrentCaller,
+    pool: PoolDep,
+    account_id: Annotated[UUID | None, Query()] = None,
+) -> GeometryConfigResponse:
+    """Dashboard-authored ROI/line geometry for one camera (P6-A).
+
+    Returns the saved config, or the probe-default config with
+    ``is_default = true`` / ``revision = 0`` when the camera has none yet.
+    Scoped to the caller's account by an explicit camera-ownership check
+    and by the account-scoped query.
+    """
+    scope_account = caller.resolve_account(account_id)
+    async with pool.acquire() as conn:
+        owner_row = await conn.fetchrow(
+            "select account_id from cameras where id = $1",
+            camera_id,
+        )
+        if owner_row is None or owner_row["account_id"] != scope_account:
+            raise NotFoundError("Camera not found.", code="camera_not_found")
+
+        record = await fetch_geometry_config(
+            conn,
+            account_id=scope_account,
+            camera_id=camera_id,
+        )
+    if record is None:
+        record = default_geometry_config_record(camera_id)
+    return GeometryConfigResponse(geometry_config=record)
+
+
+@router.put(
+    "/{camera_id}/geometry-config",
+    response_model=GeometryConfigResponse,
+)
+async def put_geometry_config(
+    camera_id: UUID,
+    body: GeometryConfigUpdateRequest,
+    caller: CurrentCaller,
+    pool: PoolDep,
+    account_id: Annotated[UUID | None, Query()] = None,
+) -> GeometryConfigResponse:
+    """Replace the ROI/line geometry config for one camera (P6-A).
+
+    Full replacement — the new config overwrites any prior one and the row
+    revision bumps by one. ``account_id`` / ``camera_id`` are derived from
+    the authenticated caller and path, never trusted from the request body.
+    """
+    scope_account = caller.resolve_account(account_id)
+    async with pool.acquire() as conn, conn.transaction():
+        owner_row = await conn.fetchrow(
+            "select account_id from cameras where id = $1",
+            camera_id,
+        )
+        if owner_row is None or owner_row["account_id"] != scope_account:
+            raise NotFoundError("Camera not found.", code="camera_not_found")
+
+        record = await upsert_geometry_config(
+            conn,
+            account_id=scope_account,
+            camera_id=camera_id,
+            config=body.config,
+        )
+    return GeometryConfigResponse(geometry_config=record)

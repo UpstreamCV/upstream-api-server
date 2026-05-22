@@ -4,6 +4,68 @@ Reverse chronological. Newest at top. Every meaningful commit gets an entry foll
 
 ---
 
+## 2026-05-22 - P6-A: Geometry config API
+
+### Summary
+Adds backend support for dashboard-driven ROI/line geometry. Users will draw
+zones/lines in the dashboard (P6-B) and the processor will use those saved
+shapes (P6-C); P6-A is the storage + API foundation. A new
+`camera_geometry_configs` table holds ONE upserted config row per camera. Two
+new `current_caller` camera-scoped endpoints read and write it (`GET`/`PUT
+/v1/cameras/{camera_id}/geometry-config`) — the repo's first `PUT`. The
+processor eligible-sessions response carries the saved config in a new
+`geometry_config` field (replacing the always-null `zones_lines`
+placeholder). Geometry is **processing geometry only** — colors/CSS/styling
+are rejected (422), staying frontend-owned. Coordinates are normalized
+`[0, 1]` for resolution independence. `config.version` (schema version,
+always 1) and the DB row `revision` (bumps on every save) are kept strictly
+separate.
+
+### Files touched
+- `supabase/migrations/20260522120000_camera_geometry_configs.sql` (new) —
+  `camera_geometry_configs` (unique `(camera_id)` upsert target, `revision`
+  int, `config` jsonb, `set_updated_at` trigger, RLS member-select).
+- `src/upstream_api/schemas/geometry.py` (new) — `GeometryPoint`,
+  `GeometryFrame`, `GeometryRoi`, `GeometryLine`, `GeometryConfig` (all
+  `extra="forbid"`; duplicate-id `model_validator`), `GeometryConfigRecord`,
+  `GeometryConfigResponse`, `GeometryConfigUpdateRequest`.
+- `src/upstream_api/services/geometry.py` (new) — `DEFAULT_GEOMETRY_CONFIG` +
+  `default_geometry_config_record`, `_SELECT_GEOMETRY_CONFIG_SQL` /
+  `fetch_geometry_config`, `_UPSERT_GEOMETRY_CONFIG_SQL` /
+  `upsert_geometry_config` (revision bump on conflict).
+- `src/upstream_api/routers/cameras.py` — `GET`/`PUT
+  /v1/cameras/{camera_id}/geometry-config` (`current_caller`;
+  camera-ownership 404; default fallback on GET).
+- `src/upstream_api/schemas/processor.py` — new `EligibleGeometryConfig`
+  envelope; `EligibleProcessorSession.zones_lines` → `geometry_config`.
+- `src/upstream_api/services/processor.py` — `_ELIGIBLE_SESSIONS_SQL` left
+  joins `camera_geometry_configs`.
+- `src/upstream_api/routers/processor.py` — eligible-sessions row mapping
+  builds the `geometry_config` envelope.
+- `src/upstream_api/errors.py` — `validation_exception_handler` now
+  `jsonable_encoder`s `exc.errors()` so a `model_validator` `ValueError`
+  (its object lands in `ctx`) does not break JSON encoding.
+- `tests/test_camera_geometry_config.py` (new) — 29 cases. `tests/test_processor.py`
+  — `geometry_config` null/envelope + SQL pin. `tests/test_app_routes.py` —
+  2 new routes.
+- `docs/api-contracts.md` — both endpoints + the eligible-sessions field.
+
+### Testing/checks
+- `uv run pytest` — all pass (333 total; 31 new).
+- `uv run ruff check src tests` / `ruff format --check` — clean.
+- `uv run mypy src` — clean (strict).
+- No live DB verification: route-level tests use a fake asyncpg pool; separate
+  tests pin the production upsert/select SQL and the migration file structure.
+
+### Strict non-goals
+- No dashboard geometry editor (P6-B), no processor consumption of the config
+  (P6-C) — saved geometry only takes effect on a future session.
+- No live reload, no geometry history, no overlay style settings.
+- No styling fields (colors/CSS/stroke/fill/opacity) stored — rejected at the
+  schema layer.
+
+---
+
 ## 2026-05-21 - P5-C: Latest perception snapshot API
 
 ### Summary
