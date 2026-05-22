@@ -43,6 +43,9 @@ class _Candidate:
     account_id: UUID = field(default_factory=uuid4)
     camera_id: UUID = field(default_factory=uuid4)
     session_id: UUID = field(default_factory=uuid4)
+    # P6-A: the LEFT JOIN onto camera_geometry_configs. None = no saved row.
+    geometry_revision: int | None = None
+    geometry_config: dict[str, Any] | None = None
 
     def is_eligible(self) -> bool:
         if self.state != "streaming":
@@ -72,6 +75,8 @@ class _Candidate:
             "v_expected": {"codec": "h264", "width": 1280},
             "v_mismatch_fields": [],
             "v_created_at": now - timedelta(seconds=10),
+            "gc_revision": self.geometry_revision,
+            "gc_config": self.geometry_config,
         }
 
 
@@ -331,7 +336,7 @@ def test_response_contains_internal_rtsp_url_built_from_base_and_streamid() -> N
     assert s["internal_rtsp_url"] == f"{_RTSP_BASE}/{_STREAM_KEY}"
     assert s["stream_key"] == _STREAM_KEY
     assert s["runtime"] == "mock"
-    assert s["zones_lines"] is None
+    assert s["geometry_config"] is None
     assert s["approved"] == {
         "codec": "h264",
         "width": 1280,
@@ -373,6 +378,30 @@ def test_limit_query_param_is_passed_through() -> None:
     assert conn.last_limit == 5
 
 
+def test_geometry_config_null_when_no_saved_row() -> None:
+    """P6-A: a camera with no saved geometry config carries a null
+    ``geometry_config`` — the processor applies its own probe default."""
+    conn = FakeEligibleConn([_Candidate("streaming", _FUTURE, [True])])
+    r = _client(conn).get("/v1/internal/processor/eligible-sessions", headers=_headers())
+    assert r.json()["sessions"][0]["geometry_config"] is None
+
+
+def test_geometry_config_envelope_when_saved_row_exists() -> None:
+    """P6-A: a saved config is carried as a ``{revision, config}`` envelope
+    so the processor can both apply the geometry and log its revision."""
+    cfg = {
+        "version": 1,
+        "frame": {"width": 1280, "height": 720, "coordinate_space": "normalized"},
+        "rois": [],
+        "lines": [],
+    }
+    conn = FakeEligibleConn(
+        [_Candidate("streaming", _FUTURE, [True], geometry_revision=3, geometry_config=cfg)]
+    )
+    r = _client(conn).get("/v1/internal/processor/eligible-sessions", headers=_headers())
+    assert r.json()["sessions"][0]["geometry_config"] == {"revision": 3, "config": cfg}
+
+
 def test_production_eligibility_sql_pins_every_predicate() -> None:
     """Guards the FakeEligibleConn simulation against drifting from the
     real query that runs in production."""
@@ -383,6 +412,9 @@ def test_production_eligibility_sql_pins_every_predicate() -> None:
     assert "join lateral" in sql
     assert "order by created_at desc" in sql
     assert "limit 1" in sql
+    # P6-A: geometry config is LEFT-joined so a camera with no config still
+    # appears in the result (geometry_config just comes back null).
+    assert "left join camera_geometry_configs gc on gc.camera_id = ss.camera_id" in sql
     # The SRT publish URL must never be selected onto a processor surface.
     assert "srt_url" not in sql
 

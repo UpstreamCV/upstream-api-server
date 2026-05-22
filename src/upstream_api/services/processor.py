@@ -50,7 +50,9 @@ select
     v.observed          as v_observed,
     v.expected          as v_expected,
     v.mismatch_fields   as v_mismatch_fields,
-    v.created_at        as v_created_at
+    v.created_at        as v_created_at,
+    gc.revision         as gc_revision,
+    gc.config           as gc_config
   from stream_sessions ss
   join cameras c on c.id = ss.camera_id
   join lateral (
@@ -60,6 +62,7 @@ select
           order by created_at desc
           limit 1
        ) v on true
+  left join camera_geometry_configs gc on gc.camera_id = ss.camera_id
  where ss.state = 'streaming'
    and ss.expires_at > now()
    and v.passed = true
