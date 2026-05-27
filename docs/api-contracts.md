@@ -979,9 +979,12 @@ No package-registry table exists yet (deferred).
 processor does not need a separate fetch. It is `null` when the camera has no
 saved config (the processor applies its own probe default); otherwise it is
 `{"revision": <int>, "config": <GeometryConfig>}` — see
-`GET /v1/cameras/{camera_id}/geometry-config`. The processor begins consuming
-this field in P6-C; P6-A only wire-carries it (this field replaces the former
-always-null `zones_lines` placeholder).
+`GET /v1/cameras/{camera_id}/geometry-config`. P6-C ships the consumer: the
+DeepStream analytics worker now renders the saved geometry into its
+nvdsanalytics runtime config on its next eligible session, and stamps the
+revision + source onto its status payload and emitted observations'
+`source` block. (This field replaces the former always-null `zones_lines`
+placeholder.)
 
 ### `POST /v1/internal/processor/status`
 
