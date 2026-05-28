@@ -26,6 +26,7 @@ from upstream_api.schemas.reliability import (
     ReliabilitySummaryResponse,
     ReliabilitySummaryStatus,
 )
+from upstream_api.services.processor import coerce_jsonb
 from upstream_api.services.reliability_evaluator import (
     evaluate_camera,
     has_recent_evaluable_signal,
@@ -73,7 +74,13 @@ def _to_record(row: dict[str, Any]) -> ReliabilityFindingRecord:
         message=row["message"],
         likely_cause=row["likely_cause"],
         recommended_action=row["recommended_action"],
-        evidence=row["evidence"] if isinstance(row["evidence"], dict) else {},
+        # asyncpg returns JSONB as ``str`` unless a codec is registered; the
+        # fake pool in tests hands back ``dict`` or ``str`` depending on the
+        # construction path. ``coerce_jsonb`` (same helper the processor read
+        # path uses) handles both. The previous ``isinstance(..., dict) else {}``
+        # short-circuited to {} in production, silently dropping every
+        # finding's evidence in the API response.
+        evidence=coerce_jsonb(row["evidence"]),
         dedupe_key=row["dedupe_key"],
         detector_version=row["detector_version"],
         first_seen_at=row["first_seen_at"],

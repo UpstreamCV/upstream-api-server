@@ -168,7 +168,9 @@ class FakeReliabilityConn:
                 row["message"] = args[7]
                 row["likely_cause"] = args[8]
                 row["recommended_action"] = args[9]
-                row["evidence"] = json.loads(args[10]) if isinstance(args[10], str) else args[10]
+                # Keep as a JSON string to mirror asyncpg's JSONB return; see
+                # comment in _row_from_insert_args.
+                row["evidence"] = args[10] if isinstance(args[10], str) else json.dumps(args[10])
                 row["last_seen_at"] = datetime.now(tz=UTC)
                 return row
         return None
@@ -192,7 +194,13 @@ def _row_from_insert_args(args: tuple[Any, ...]) -> dict[str, Any]:
         "message": args[8],
         "likely_cause": args[9],
         "recommended_action": args[10],
-        "evidence": json.loads(args[11]) if isinstance(args[11], str) else args[11],
+        # Store evidence the same way asyncpg returns JSONB to the reader:
+        # as a JSON string. The previous "deserialize back to dict" was a
+        # test-only shortcut that masked a real production bug — the
+        # response builder was checking ``isinstance(..., dict) else {}`` and
+        # silently dropping every finding's evidence in prod (where asyncpg
+        # gives a str, not a dict).
+        "evidence": args[11] if isinstance(args[11], str) else json.dumps(args[11]),
         "dedupe_key": args[12],
         "detector_version": args[13],
         "first_seen_at": now,
