@@ -18,8 +18,10 @@ from upstream_api.schemas.geometry import (
 )
 from upstream_api.schemas.processor import (
     LatestPerceptionSnapshotResponse,
+    LatestProcessorStatusResponse,
     ObservationRecord,
     PerceptionSnapshotRecord,
+    ProcessorStatusRecord,
     RecentObservationsResponse,
 )
 from upstream_api.security.deps import CurrentAgent, CurrentCaller, PoolDep
@@ -37,6 +39,7 @@ from upstream_api.services.limits import (
 from upstream_api.services.processor import (
     coerce_jsonb,
     fetch_latest_perception_snapshot,
+    fetch_latest_processor_status,
     fetch_recent_observations,
 )
 
@@ -323,6 +326,73 @@ async def get_latest_perception_snapshot(
             package_id=row["package_id"],
             snapshot=coerce_jsonb(row["snapshot"]),
             observed_at=row["observed_at"],
+            updated_at=row["updated_at"],
+        )
+    )
+
+
+@router.get(
+    "/{camera_id}/processor-status/latest",
+    response_model=LatestProcessorStatusResponse,
+)
+async def get_latest_processor_status(
+    camera_id: UUID,
+    caller: CurrentCaller,
+    pool: PoolDep,
+    account_id: Annotated[UUID | None, Query()] = None,
+    stream_session_id: Annotated[UUID | None, Query()] = None,
+) -> LatestProcessorStatusResponse:
+    """Latest processor status for one camera (P6-D).
+
+    The full ``processor_statuses`` row including the ``payload`` JSONB —
+    where the P6-C analytics worker stamps the ``applied_geometry`` lineage
+    block (``source``, ``revision``, ``line_count``, ``roi_count``). This is
+    the read counterpart that lets a dashboard chip / verification script
+    confirm the processor actually picked up the operator's saved geometry.
+
+    Returns 404 ``processor_status_not_found`` when no row matches — same
+    missing-resource convention as ``perception/latest`` (no synthetic
+    default to invent for a processor that has never reported in). Pass
+    ``stream_session_id`` to narrow to a specific run when multiple
+    processor restarts have stamped multiple rows for the same camera.
+    """
+    scope_account = caller.resolve_account(account_id)
+    async with pool.acquire() as conn:
+        owner_row = await conn.fetchrow(
+            "select account_id from cameras where id = $1",
+            camera_id,
+        )
+        if owner_row is None or owner_row["account_id"] != scope_account:
+            raise NotFoundError("Camera not found.", code="camera_not_found")
+
+        row = await fetch_latest_processor_status(
+            conn,
+            account_id=scope_account,
+            camera_id=camera_id,
+            stream_session_id=stream_session_id,
+        )
+    if row is None:
+        raise NotFoundError(
+            "No processor status for this camera yet.",
+            code="processor_status_not_found",
+        )
+    return LatestProcessorStatusResponse(
+        status=ProcessorStatusRecord(
+            id=row["id"],
+            camera_id=row["camera_id"],
+            stream_session_id=row["stream_session_id"],
+            processor_id=row["processor_id"],
+            runtime=row["runtime"],
+            package_id=row["package_id"],
+            status=row["status"],
+            fps_input=row["fps_input"],
+            fps_processed=row["fps_processed"],
+            last_frame_at=row["last_frame_at"],
+            last_observation_at=row["last_observation_at"],
+            error_code=row["error_code"],
+            error_message=row["error_message"],
+            payload=coerce_jsonb(row["payload"]),
+            created_at=row["created_at"],
             updated_at=row["updated_at"],
         )
     )
