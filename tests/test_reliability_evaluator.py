@@ -1182,3 +1182,68 @@ def test_unstable_confidence_dedupe_refreshes_existing(monkeypatch: Any) -> None
     _run(conn, account, camera)
     assert all(u["dedupe_key"] != key for u in conn.upserts)
     assert any(u["id"] == existing_id for u in conn.updates)
+
+
+# ---------------------------------------------------------------------------
+# stream-not-live resolve symmetry across M1 + M2 rules.
+# ---------------------------------------------------------------------------
+
+
+def test_scene_too_dark_resolves_when_session_no_longer_live(monkeypatch: Any) -> None:
+    """If the workflow that triggered the dark-scene finding has ended,
+    resolve the finding rather than leaving it stamped with stale evidence.
+    Matches the stream_valid_processor_silent fix shipped in 08cf5b6."""
+    account, camera = uuid4(), uuid4()
+    _install_brightness(monkeypatch, ImageBrightness(mean=5.0, width=1, height=1))
+    now = datetime.now(tz=UTC)
+    ended_session = {
+        "id": uuid4(),
+        "state": "streaming",  # stale state column
+        "created_at": now - timedelta(hours=2),
+        "started_at": now - timedelta(hours=2),
+        "ended_at": now - timedelta(minutes=15),  # session ended
+        "expires_at": now + timedelta(hours=1),
+    }
+    conn = FakeEvalConn(
+        session=ended_session,
+        snapshot=_snapshot(age_seconds=5, storage_key="acct/cam/d/k.jpg"),
+        observation_at=now - timedelta(seconds=5),
+        processor_status=_processor_status(age_seconds=5),
+    )
+    _run(conn, account, camera)
+    dark_key = f"camera:{camera}:scene_quality:scene_too_dark_for_reliable_detection"
+    assert all(u["dedupe_key"] != dark_key for u in conn.upserts)
+    assert any(
+        dark_key in r["dedupe_keys"] and r["reason"] == "stream_no_longer_live"
+        for r in conn.resolves
+    )
+
+
+def test_unstable_confidence_resolves_when_session_no_longer_live() -> None:
+    """If the workflow that triggered the confidence finding has ended,
+    resolve it rather than leaving it stamped with stale stats."""
+    account, camera = uuid4(), uuid4()
+    now = datetime.now(tz=UTC)
+    ended_session = {
+        "id": uuid4(),
+        "state": "streaming",
+        "created_at": now - timedelta(hours=2),
+        "started_at": now - timedelta(hours=2),
+        "ended_at": now - timedelta(minutes=15),
+        "expires_at": now + timedelta(hours=1),
+    }
+    conn = FakeEvalConn(
+        session=ended_session,
+        snapshot=_snapshot(age_seconds=5),
+        observation_at=now - timedelta(seconds=5),
+        processor_status=_processor_status(age_seconds=5),
+        perception=_perception(
+            confidences=[0.20, 0.25, 0.30, 0.22, 0.28, 0.24, 0.21, 0.26],
+        ),
+    )
+    _run(conn, account, camera)
+    key = f"camera:{camera}:detection:unstable_detection_confidence"
+    assert all(u["dedupe_key"] != key for u in conn.upserts)
+    assert any(
+        key in r["dedupe_keys"] and r["reason"] == "stream_no_longer_live" for r in conn.resolves
+    )
