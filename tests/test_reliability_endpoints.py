@@ -139,7 +139,7 @@ class FakeReliabilityConn:
         return None
 
     async def fetch(self, query: str, *args: Any) -> list[dict[str, Any]]:
-        # Repo: list open for camera.
+        # Repo: list open for camera (severity-first ordering).
         if "from reliability_findings" in query and "status     = 'open'" in query:
             limit = int(args[2])
             rows = [r for r in self.open_findings.values() if r["status"] == "open"]
@@ -148,6 +148,17 @@ class FakeReliabilityConn:
                     _SEV_RANK[r["severity"]],
                     -int(r["last_seen_at"].timestamp()),
                 )
+            )
+            return rows[:limit]
+
+        # M4: list by status (newest-resolved-first ordering, used by the
+        # Reliability tab's "Recently resolved" section).
+        if "from reliability_findings" in query and "and status     = $3" in query:
+            wanted_status = args[2]
+            limit = int(args[3])
+            rows = [r for r in self.open_findings.values() if r["status"] == wanted_status]
+            rows.sort(
+                key=lambda r: -int((r.get("resolved_at") or r["last_seen_at"]).timestamp()),
             )
             return rows[:limit]
 
@@ -843,3 +854,104 @@ def test_confidence_finding_appears_in_findings_endpoint() -> None:
     assert r.status_code == 200, r.text
     types = [f["finding_type"] for f in r.json()["findings"]]
     assert _CONFIDENCE_TYPE in types
+
+
+# ===========================================================================
+# ?status= query param (M4 Reliability tab "Recently resolved").
+# ===========================================================================
+
+
+def test_findings_default_returns_open_only() -> None:
+    """Backward compat: omitting status returns open findings, matching the
+    M0 contract the Monitor card depends on."""
+    account, camera = uuid4(), uuid4()
+    conn = FakeReliabilityConn(
+        camera_account_id=account,
+        session_row=_session(state="streaming"),
+        snapshot_row=_snapshot(age_seconds=120),  # triggers latest_frame_stale
+        observation_at=datetime.now(tz=UTC) - timedelta(seconds=5),
+        processor_status_row=_processor_status(age_seconds=5),
+    )
+    client = _caller_client(conn, account_id=account)
+    # First read opens the finding.
+    client.get(_FINDINGS_PATH.format(camera_id=camera))
+    # Heal the frame to resolve.
+    conn.snapshot_row = _snapshot(age_seconds=5)
+    client.get(_FINDINGS_PATH.format(camera_id=camera))
+    # Default (open) should now return no findings -- the only one resolved.
+    r = client.get(_FINDINGS_PATH.format(camera_id=camera))
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert all(f["status"] == "open" for f in body["findings"])
+
+
+def test_findings_with_status_resolved_returns_resolved_history() -> None:
+    """M4 tab consumes ``?status=resolved`` for the Recently resolved section."""
+    account, camera = uuid4(), uuid4()
+    conn = FakeReliabilityConn(
+        camera_account_id=account,
+        session_row=_session(state="streaming"),
+        snapshot_row=_snapshot(age_seconds=120),
+        observation_at=datetime.now(tz=UTC) - timedelta(seconds=5),
+        processor_status_row=_processor_status(age_seconds=5),
+    )
+    client = _caller_client(conn, account_id=account)
+    client.get(_FINDINGS_PATH.format(camera_id=camera))  # opens
+    conn.snapshot_row = _snapshot(age_seconds=5)
+    client.get(_FINDINGS_PATH.format(camera_id=camera))  # resolves
+    r = client.get(_FINDINGS_PATH.format(camera_id=camera) + "?status=resolved")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert len(body["findings"]) == 1
+    f = body["findings"][0]
+    assert f["status"] == "resolved"
+    assert f["finding_type"] == "latest_frame_stale"
+    assert f["resolved_at"] is not None
+    assert f["resolved_reason"] == "healthy"
+
+
+def test_findings_with_bogus_status_returns_422() -> None:
+    """Closed Literal enum -- anything else is rejected by FastAPI before
+    the handler runs. Prevents the dashboard from accidentally passing
+    something the SQL can't satisfy."""
+    account, camera = uuid4(), uuid4()
+    conn = FakeReliabilityConn(camera_account_id=account)
+    r = _caller_client(conn, account_id=account).get(
+        _FINDINGS_PATH.format(camera_id=camera) + "?status=banana"
+    )
+    assert r.status_code == 422
+
+
+def test_findings_status_open_is_explicit_alias_for_default() -> None:
+    """Explicit ``?status=open`` returns the same shape as omitting status."""
+    account, camera = uuid4(), uuid4()
+    conn = FakeReliabilityConn(
+        camera_account_id=account,
+        session_row=_session(state="streaming"),
+        snapshot_row=_snapshot(age_seconds=120),
+        observation_at=datetime.now(tz=UTC) - timedelta(seconds=5),
+        processor_status_row=_processor_status(age_seconds=5),
+    )
+    client = _caller_client(conn, account_id=account)
+    client.get(_FINDINGS_PATH.format(camera_id=camera))  # opens
+    default = client.get(_FINDINGS_PATH.format(camera_id=camera)).json()["findings"]
+    explicit = client.get(_FINDINGS_PATH.format(camera_id=camera) + "?status=open").json()[
+        "findings"
+    ]
+    assert [f["finding_type"] for f in default] == [f["finding_type"] for f in explicit]
+
+
+def test_findings_status_resolved_is_empty_when_nothing_resolved() -> None:
+    account, camera = uuid4(), uuid4()
+    conn = FakeReliabilityConn(
+        camera_account_id=account,
+        session_row=_session(state="streaming"),
+        snapshot_row=_snapshot(age_seconds=120),
+        observation_at=datetime.now(tz=UTC) - timedelta(seconds=5),
+        processor_status_row=_processor_status(age_seconds=5),
+    )
+    client = _caller_client(conn, account_id=account)
+    client.get(_FINDINGS_PATH.format(camera_id=camera))  # opens, never resolved
+    r = client.get(_FINDINGS_PATH.format(camera_id=camera) + "?status=resolved")
+    assert r.status_code == 200
+    assert r.json()["findings"] == []

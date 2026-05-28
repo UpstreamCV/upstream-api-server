@@ -102,6 +102,12 @@ returning {_RETURNING_COLUMNS}
 
 # Severity ordering for `order by`. critical first, info last. Postgres has no
 # enum here (the column is plain text with a CHECK), so we map via case.
+#
+# Two SQL variants by status:
+#   - 'open'      -> severity-desc then last_seen_at-desc (priority first)
+#   - any other   -> last_seen_at-desc only; resolved history orders newest-
+#                    resolved first because operators reading the history
+#                    care about recency, not original severity
 _LIST_OPEN_SQL = f"""
 select {_RETURNING_COLUMNS}
   from reliability_findings
@@ -116,6 +122,16 @@ select {_RETURNING_COLUMNS}
           end,
           last_seen_at desc
  limit $3
+"""
+
+_LIST_BY_STATUS_SQL = f"""
+select {_RETURNING_COLUMNS}
+  from reliability_findings
+ where account_id = $1
+   and camera_id  = $2
+   and status     = $3
+ order by coalesce(resolved_at, last_seen_at) desc
+ limit $4
 """
 
 
@@ -225,6 +241,32 @@ async def list_open_findings_for_camera(
     camera_id: UUID,
     limit: int,
 ) -> list[dict[str, Any]]:
-    """Open findings for one camera, severity-desc then most-recently-seen."""
+    """Open findings for one camera, severity-desc then most-recently-seen.
+
+    Kept as the dedicated open path because the summary endpoint and the
+    reliability evaluator both depend on the severity-first ordering. For
+    any other status (resolved/suppressed/ignored) callers use
+    ``list_findings_for_camera``.
+    """
     rows = await conn.fetch(_LIST_OPEN_SQL, account_id, camera_id, limit)
+    return [dict(r) for r in rows]
+
+
+async def list_findings_for_camera(
+    conn: asyncpg.Connection,
+    *,
+    account_id: UUID,
+    camera_id: UUID,
+    status: str,
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Findings for one camera filtered by ``status``, recency-first.
+
+    Used by the Reliability tab's "Recently resolved" section. Ordering is
+    ``coalesce(resolved_at, last_seen_at) desc`` -- resolved rows have a
+    resolved_at; suppressed/ignored may not. Recency is what operators
+    care about for history. Open rows go through ``list_open_findings_for_camera``
+    instead so the summary's severity-first ordering stays canonical.
+    """
+    rows = await conn.fetch(_LIST_BY_STATUS_SQL, account_id, camera_id, status, limit)
     return [dict(r) for r in rows]
