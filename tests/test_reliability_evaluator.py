@@ -18,6 +18,9 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
 
+from upstream_api.config import get_settings
+from upstream_api.services import snapshot_brightness as snapshot_brightness_module
+from upstream_api.services.image_analysis import ImageBrightness
 from upstream_api.services.reliability_evaluator import (
     DETECTOR_VERSION,
     evaluate_camera,
@@ -211,14 +214,48 @@ def _session(*, state: str = "streaming", age_seconds: float = 5) -> dict[str, A
     }
 
 
-def _snapshot(*, age_seconds: float) -> dict[str, Any]:
+def _snapshot(
+    *,
+    age_seconds: float,
+    storage_key: str | None = None,
+    width: int | None = None,
+    height: int | None = None,
+) -> dict[str, Any]:
+    """Build a snapshot row.
+
+    ``storage_key`` defaults to ``None`` so existing tests (which predate the
+    brightness rule) still skip the brightness load — ``_maybe_load_brightness``
+    treats a falsy storage_key as "nothing to evaluate". Brightness-rule tests
+    pass an explicit storage_key (and use ``_brightness`` to inject the
+    canned reading).
+    """
     now = datetime.now(tz=UTC)
     return {
         "id": uuid4(),
         "captured_at": now - timedelta(seconds=age_seconds),
         "created_at": now - timedelta(seconds=age_seconds),
         "session_id": None,
+        "storage_key": storage_key,
+        "width": width,
+        "height": height,
     }
+
+
+def _install_brightness(monkeypatch: Any, reading: ImageBrightness | None) -> dict[str, int]:
+    """Monkeypatch the brightness loader to return ``reading``.
+
+    Returns a ``calls`` dict the caller can read post-test to confirm the
+    loader was (or wasn't) invoked — important for the stale-frame
+    short-circuit test.
+    """
+    counter = {"calls": 0}
+
+    async def _stub(*, settings: Any, snapshot_id: Any, storage_key: str) -> Any:
+        counter["calls"] += 1
+        return reading
+
+    monkeypatch.setattr(snapshot_brightness_module, "get_brightness_for_snapshot", _stub)
+    return counter
 
 
 def _processor_status(
@@ -252,7 +289,14 @@ def _processor_status(
 
 
 def _run(conn: FakeEvalConn, account_id: UUID, camera_id: UUID) -> None:
-    asyncio.run(evaluate_camera(conn, account_id=account_id, camera_id=camera_id))
+    asyncio.run(
+        evaluate_camera(
+            conn,
+            settings=get_settings(),
+            account_id=account_id,
+            camera_id=camera_id,
+        )
+    )
 
 
 def _by_dedupe(upserts: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
@@ -577,3 +621,183 @@ def test_reopen_takes_the_update_path_not_insert() -> None:
     assert all(u["dedupe_key"] != geom_key for u in conn.upserts)
     # Captured an UPDATE that touched the preopen row.
     assert any(u["id"] == existing_id for u in conn.updates)
+
+
+# ---------------------------------------------------------------------------
+# scene_too_dark_for_reliable_detection (M1 — first production CV signal).
+# ---------------------------------------------------------------------------
+
+
+_DARK_KEY_SUFFIX = "scene_quality:scene_too_dark_for_reliable_detection"
+
+
+def test_scene_too_dark_triggers_on_dark_snapshot(monkeypatch: Any) -> None:
+    """Brightness 20 < threshold 45 → warning opens with the canonical evidence
+    shape and the operator-facing copy from the brief."""
+    account, camera = uuid4(), uuid4()
+    _install_brightness(
+        monkeypatch,
+        ImageBrightness(mean=20.0, width=1280, height=720),
+    )
+    conn = FakeEvalConn(
+        session=_session(state="streaming"),
+        snapshot=_snapshot(age_seconds=5, storage_key="acct/cam/d/k.jpg"),
+        observation_at=datetime.now(tz=UTC) - timedelta(seconds=5),
+        processor_status=_processor_status(age_seconds=5),
+    )
+    _run(conn, account, camera)
+    dark_key = f"camera:{camera}:{_DARK_KEY_SUFFIX}"
+    upserts = _by_dedupe(conn.upserts)
+    assert dark_key in upserts
+    upsert = upserts[dark_key]
+    assert upsert["finding_type"] == "scene_too_dark_for_reliable_detection"
+    assert upsert["category"] == "scene_quality"
+    assert upsert["severity"] == "warning"
+    assert upsert["likely_cause"] == "low_light"
+
+    ev = upsert["evidence"]
+    assert ev["brightness_mean"] == 20.0
+    assert ev["brightness_threshold"] == 45
+    assert ev["image_width"] == 1280
+    assert ev["image_height"] == 720
+    assert ev["source"] == "latest_frame_snapshot"
+    assert "snapshot_id" in ev
+    assert "captured_at" in ev
+
+    # Pin the no-secrets posture: no storage URLs / keys / bucket names.
+    leaky_substrings = ("http://", "https://", "supabase", "acct/cam", "service_role")
+    serialized = json.dumps(ev).lower()
+    for s in leaky_substrings:
+        assert s not in serialized, ev
+
+
+def test_scene_too_dark_resolves_when_brightness_recovers(monkeypatch: Any) -> None:
+    """Bright snapshot → _RuleResolved with the brightness-specific reason."""
+    account, camera = uuid4(), uuid4()
+    _install_brightness(
+        monkeypatch,
+        ImageBrightness(mean=180.0, width=1280, height=720),
+    )
+    conn = FakeEvalConn(
+        session=_session(state="streaming"),
+        snapshot=_snapshot(age_seconds=5, storage_key="acct/cam/d/k.jpg"),
+        observation_at=datetime.now(tz=UTC) - timedelta(seconds=5),
+        processor_status=_processor_status(age_seconds=5),
+    )
+    _run(conn, account, camera)
+    dark_key = f"camera:{camera}:{_DARK_KEY_SUFFIX}"
+    assert all(u["dedupe_key"] != dark_key for u in conn.upserts)
+    # The resolve call used the brightness-specific reason, not bulk "healthy".
+    matching = [
+        r
+        for r in conn.resolves
+        if dark_key in r["dedupe_keys"] and r["reason"] == "brightness_above_threshold"
+    ]
+    assert matching, conn.resolves
+
+
+def test_scene_too_dark_skipped_when_snapshot_is_stale(monkeypatch: Any) -> None:
+    """Stale frame → brightness load is bypassed entirely. The stale-frame rule
+    owns this case; warning about darkness on out-of-date evidence would be
+    lying about current scene state."""
+    account, camera = uuid4(), uuid4()
+    calls = _install_brightness(
+        monkeypatch,
+        ImageBrightness(mean=10.0, width=1, height=1),
+    )
+    conn = FakeEvalConn(
+        session=_session(state="streaming"),
+        snapshot=_snapshot(age_seconds=600, storage_key="acct/cam/d/k.jpg"),
+        observation_at=datetime.now(tz=UTC) - timedelta(seconds=5),
+        processor_status=_processor_status(age_seconds=5),
+    )
+    _run(conn, account, camera)
+    dark_key = f"camera:{camera}:{_DARK_KEY_SUFFIX}"
+    # No finding either way.
+    assert all(u["dedupe_key"] != dark_key for u in conn.upserts)
+    assert all(dark_key not in r["dedupe_keys"] for r in conn.resolves)
+    # And critically: the loader was not invoked. The download cost is paid
+    # only when there's a fresh-enough snapshot to warn about.
+    assert calls["calls"] == 0
+
+
+def test_scene_too_dark_skipped_when_brightness_loader_returns_none(
+    monkeypatch: Any,
+) -> None:
+    """Download or decode failed → None → rule does nothing. The summary
+    endpoint must not 500, and we must not flip a finding closed based on
+    missing data."""
+    account, camera = uuid4(), uuid4()
+    _install_brightness(monkeypatch, None)
+    conn = FakeEvalConn(
+        session=_session(state="streaming"),
+        snapshot=_snapshot(age_seconds=5, storage_key="acct/cam/d/k.jpg"),
+        observation_at=datetime.now(tz=UTC) - timedelta(seconds=5),
+        processor_status=_processor_status(age_seconds=5),
+    )
+    _run(conn, account, camera)
+    dark_key = f"camera:{camera}:{_DARK_KEY_SUFFIX}"
+    assert all(u["dedupe_key"] != dark_key for u in conn.upserts)
+    assert all(dark_key not in r["dedupe_keys"] for r in conn.resolves)
+
+
+def test_scene_too_dark_skipped_when_no_snapshot(monkeypatch: Any) -> None:
+    account, camera = uuid4(), uuid4()
+    calls = _install_brightness(monkeypatch, ImageBrightness(mean=10.0, width=1, height=1))
+    conn = FakeEvalConn(
+        session=_session(state="streaming"),
+        snapshot=None,
+        observation_at=datetime.now(tz=UTC) - timedelta(seconds=5),
+        processor_status=_processor_status(age_seconds=5),
+    )
+    _run(conn, account, camera)
+    dark_key = f"camera:{camera}:{_DARK_KEY_SUFFIX}"
+    assert all(u["dedupe_key"] != dark_key for u in conn.upserts)
+    # Loader never even called.
+    assert calls["calls"] == 0
+
+
+def test_scene_too_dark_skipped_when_snapshot_missing_storage_key(
+    monkeypatch: Any,
+) -> None:
+    """Defensive: a snapshot row missing storage_key (unusual in prod, common
+    in legacy test stubs) must not crash the evaluator or invoke the
+    loader."""
+    account, camera = uuid4(), uuid4()
+    calls = _install_brightness(monkeypatch, ImageBrightness(mean=10.0, width=1, height=1))
+    conn = FakeEvalConn(
+        session=_session(state="streaming"),
+        snapshot=_snapshot(age_seconds=5, storage_key=None),
+        observation_at=datetime.now(tz=UTC) - timedelta(seconds=5),
+        processor_status=_processor_status(age_seconds=5),
+    )
+    _run(conn, account, camera)
+    dark_key = f"camera:{camera}:{_DARK_KEY_SUFFIX}"
+    assert all(u["dedupe_key"] != dark_key for u in conn.upserts)
+    assert calls["calls"] == 0
+
+
+def test_scene_too_dark_dedupes_via_refresh_path(monkeypatch: Any) -> None:
+    """An existing open dark-scene finding under the same dedupe_key must be
+    refreshed (UPDATE), not duplicated. Same invariant the partial unique
+    index enforces."""
+    account, camera = uuid4(), uuid4()
+    _install_brightness(monkeypatch, ImageBrightness(mean=15.0, width=640, height=480))
+    dark_key = f"camera:{camera}:{_DARK_KEY_SUFFIX}"
+    existing_id = uuid4()
+    conn = FakeEvalConn(
+        session=_session(state="streaming"),
+        snapshot=_snapshot(age_seconds=5, storage_key="acct/cam/d/k.jpg"),
+        observation_at=datetime.now(tz=UTC) - timedelta(seconds=5),
+        processor_status=_processor_status(age_seconds=5),
+        preopen_finding_ids={dark_key: existing_id},
+    )
+    _run(conn, account, camera)
+    assert all(u["dedupe_key"] != dark_key for u in conn.upserts)
+    assert any(u["id"] == existing_id for u in conn.updates)
+
+
+def test_scene_too_dark_detector_version_bumped_to_v0_2() -> None:
+    """M1 ships the brightness rule for real; the detector version stamp must
+    bump so historical rows stay attributable to the right rule set."""
+    assert DETECTOR_VERSION == "reliability.v0.2"

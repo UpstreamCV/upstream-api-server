@@ -29,7 +29,7 @@ from upstream_api.schemas.reliability import (
     ReliabilityFindingsResponse,
     ReliabilitySummaryResponse,
 )
-from upstream_api.security.deps import CurrentCaller, PoolDep
+from upstream_api.security.deps import CurrentCaller, PoolDep, SettingsDep
 from upstream_api.services.reliability_service import (
     get_findings_for_camera,
     get_summary_for_camera,
@@ -51,6 +51,7 @@ async def get_reliability_summary(
     camera_id: UUID,
     caller: CurrentCaller,
     pool: PoolDep,
+    settings: SettingsDep,
     account_id: Annotated[UUID | None, Query()] = None,
 ) -> ReliabilitySummaryResponse:
     """Categorical reliability verdict for one camera, evaluated on read.
@@ -70,6 +71,7 @@ async def get_reliability_summary(
 
         return await get_summary_for_camera(
             conn,
+            settings=settings,
             account_id=scope_account,
             camera_id=camera_id,
         )
@@ -83,6 +85,7 @@ async def get_reliability_findings(
     camera_id: UUID,
     caller: CurrentCaller,
     pool: PoolDep,
+    settings: SettingsDep,
     account_id: Annotated[UUID | None, Query()] = None,
     limit: Annotated[int, Query(ge=1, le=_FINDINGS_MAX_LIMIT)] = _FINDINGS_DEFAULT_LIMIT,
 ) -> ReliabilityFindingsResponse:
@@ -103,6 +106,7 @@ async def get_reliability_findings(
 
         return await get_findings_for_camera(
             conn,
+            settings=settings,
             account_id=scope_account,
             camera_id=camera_id,
             limit=limit,

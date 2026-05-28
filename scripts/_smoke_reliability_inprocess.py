@@ -449,6 +449,143 @@ def main() -> None:
     assert r.status_code == 404, (r.status_code, r.text)
     ok("findings endpoint also 404s cross-account")
 
+    # ----- Test 8: scene_too_dark_for_reliable_detection (M1) -------------
+    print()
+    print("Test 8 — scene_too_dark_for_reliable_detection (M1)")
+
+    # The evaluator imports the brightness loader through this module alias;
+    # monkeypatching the attribute on that module is what the rule sees.
+    from upstream_api.services import snapshot_brightness as _sb_mod
+    from upstream_api.services.image_analysis import ImageBrightness
+
+    # 8a — dark snapshot → warning open with full evidence shape.
+    account, camera = uuid4(), uuid4()
+
+    async def _dark_loader(*, settings: Any, snapshot_id: Any, storage_key: str) -> Any:
+        return ImageBrightness(mean=22.0, width=1280, height=720)
+
+    original_loader = _sb_mod.get_brightness_for_snapshot
+    _sb_mod.get_brightness_for_snapshot = _dark_loader  # type: ignore[assignment]
+    try:
+        conn = FakeReliabilityConn(
+            camera_account_id=account,
+            session_row=session(state="streaming"),
+            snapshot_row={
+                **snapshot(age_seconds=5),
+                "storage_key": "acct/cam/d/k.jpg",
+                "width": 1280,
+                "height": 720,
+            },
+            observation_at=datetime.now(tz=UTC) - timedelta(seconds=5),
+            processor_status_row=processor_status(age_seconds=5),
+        )
+        client = client_for(conn, account_id=account)
+        summary = hit(client, "summary", camera)
+        assert summary["status"] == "needs_review", summary
+        assert summary["highest_severity"] == "warning", summary
+        top = summary["top_findings"][0]
+        assert top["finding_type"] == "scene_too_dark_for_reliable_detection", top
+        assert top["category"] == "scene_quality", top
+        assert top["likely_cause"] == "low_light", top
+        ev = top["evidence"]
+        assert ev["brightness_mean"] == 22.0, ev
+        assert ev["brightness_threshold"] == 45, ev
+        assert ev["image_width"] == 1280, ev
+        assert ev["image_height"] == 720, ev
+        assert ev["source"] == "latest_frame_snapshot", ev
+        # No secrets / URLs / storage keys leaked through evidence.
+        for leak in ("http", "supabase", "acct/cam", "service_role"):
+            assert leak not in str(ev).lower(), ev
+        ok("dark snapshot → needs_review", f"brightness={ev['brightness_mean']}")
+        ok("evidence carries threshold + dimensions, no secrets", "")
+
+        # 8b — bright snapshot resolves with brightness_above_threshold reason.
+        async def _bright_loader(
+            *, settings: Any, snapshot_id: Any, storage_key: str
+        ) -> Any:
+            return ImageBrightness(mean=180.0, width=1280, height=720)
+
+        _sb_mod.get_brightness_for_snapshot = _bright_loader  # type: ignore[assignment]
+        # Same camera + conn — heal in place. The summary must go back to
+        # healthy and the underlying row must be marked resolved.
+        summary = hit(client, "summary", camera)
+        assert summary["status"] == "healthy", summary
+        resolved = [
+            r for r in conn.open_findings.values()
+            if r["finding_type"] == "scene_too_dark_for_reliable_detection"
+            and r["status"] == "resolved"
+        ]
+        assert resolved, [r["status"] for r in conn.open_findings.values()]
+        assert resolved[0]["resolved_reason"] == "brightness_above_threshold", resolved[0]
+        ok("bright snapshot → resolved", "reason=brightness_above_threshold")
+
+        # 8c — stale frame: the brightness rule must defer to latest_frame_stale.
+        async def _never_loader(
+            *, settings: Any, snapshot_id: Any, storage_key: str
+        ) -> Any:
+            raise AssertionError(
+                "brightness loader must not be called on stale snapshots"
+            )
+
+        _sb_mod.get_brightness_for_snapshot = _never_loader  # type: ignore[assignment]
+        account2, camera2 = uuid4(), uuid4()
+        conn2 = FakeReliabilityConn(
+            camera_account_id=account2,
+            session_row=session(state="streaming"),
+            snapshot_row={
+                **snapshot(age_seconds=600),
+                "storage_key": "acct/cam/d/k.jpg",
+                "width": 1280,
+                "height": 720,
+            },
+            observation_at=datetime.now(tz=UTC) - timedelta(seconds=5),
+            processor_status_row=processor_status(age_seconds=5),
+        )
+        client2 = client_for(conn2, account_id=account2)
+        summary = hit(client2, "summary", camera2)
+        types = {f["finding_type"] for f in summary["top_findings"]}
+        assert "latest_frame_stale" in types, types
+        assert "scene_too_dark_for_reliable_detection" not in types, types
+        ok(
+            "stale frame → only latest_frame_stale (loader bypassed)",
+            "no dark warning from out-of-date evidence",
+        )
+
+        # 8d — loader returns None (download/decode fail) → no 500, no finding.
+        async def _none_loader(
+            *, settings: Any, snapshot_id: Any, storage_key: str
+        ) -> Any:
+            return None
+
+        _sb_mod.get_brightness_for_snapshot = _none_loader  # type: ignore[assignment]
+        account3, camera3 = uuid4(), uuid4()
+        conn3 = FakeReliabilityConn(
+            camera_account_id=account3,
+            session_row=session(state="streaming"),
+            snapshot_row={
+                **snapshot(age_seconds=5),
+                "storage_key": "acct/cam/d/k.jpg",
+                "width": 1, "height": 1,
+            },
+            observation_at=datetime.now(tz=UTC) - timedelta(seconds=5),
+            processor_status_row=processor_status(
+                age_seconds=5,
+                applied_geometry={
+                    "source": "operator_saved",
+                    "revision": 1,
+                    "line_count": 1,
+                    "roi_count": 1,
+                },
+            ),
+            has_saved_geometry=True,
+        )
+        client3 = client_for(conn3, account_id=account3)
+        summary = hit(client3, "summary", camera3)
+        assert summary["status"] == "healthy", summary
+        ok("loader returns None → healthy (no 500, no false dark)", "")
+    finally:
+        _sb_mod.get_brightness_for_snapshot = original_loader  # type: ignore[assignment]
+
     print()
     print(f"{GREEN}PASS{RESET} — reliability slice smoke complete")
 

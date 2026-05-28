@@ -242,13 +242,29 @@ def _session(*, state: str = "streaming", age_seconds: float = 5) -> dict[str, A
     }
 
 
-def _snapshot(*, age_seconds: float) -> dict[str, Any]:
+def _snapshot(
+    *,
+    age_seconds: float,
+    storage_key: str | None = None,
+    width: int | None = None,
+    height: int | None = None,
+) -> dict[str, Any]:
+    """Build a snapshot row.
+
+    ``storage_key`` is optional so the existing pre-M1 endpoint tests (which
+    don't care about brightness) still skip the brightness load entirely —
+    ``_maybe_load_brightness`` treats a falsy storage_key as "nothing to
+    evaluate". M1's dark-scene tests pass an explicit storage_key and stub
+    the loader."""
     now = datetime.now(tz=UTC)
     return {
         "id": uuid4(),
         "captured_at": now - timedelta(seconds=age_seconds),
         "created_at": now - timedelta(seconds=age_seconds),
         "session_id": None,
+        "storage_key": storage_key,
+        "width": width,
+        "height": height,
     }
 
 
@@ -534,3 +550,145 @@ def test_returning_to_healthy_resolves_open_findings() -> None:
     assert "latest_frame_stale" not in open_types
     # And we recorded the resolve call.
     assert any(any("latest_frame_stale" in k for k in r["keys"]) for r in conn.resolves)
+
+
+# ===========================================================================
+# scene_too_dark_for_reliable_detection (M1 — first production CV signal).
+# ===========================================================================
+
+
+_DARK_TYPE = "scene_too_dark_for_reliable_detection"
+
+
+def _install_brightness(monkeypatch: Any, reading: Any) -> dict[str, int]:
+    """Patch the brightness loader through the evaluator's import alias.
+
+    The evaluator imports the module as ``snapshot_brightness_module`` and
+    calls ``snapshot_brightness_module.get_brightness_for_snapshot(...)`` —
+    patching the attribute on that module is what the rule actually sees.
+    """
+    from upstream_api.services import (
+        snapshot_brightness as snapshot_brightness_module,
+    )
+
+    counter = {"calls": 0}
+
+    async def _stub(*, settings: Any, snapshot_id: Any, storage_key: str) -> Any:
+        counter["calls"] += 1
+        return reading
+
+    monkeypatch.setattr(snapshot_brightness_module, "get_brightness_for_snapshot", _stub)
+    return counter
+
+
+def test_dark_scene_summary_returns_needs_review(monkeypatch: Any) -> None:
+    """Dark snapshot → summary status=needs_review, top finding is dark-scene
+    with the full evidence shape."""
+    from upstream_api.services.image_analysis import ImageBrightness
+
+    account, camera = uuid4(), uuid4()
+    _install_brightness(monkeypatch, ImageBrightness(mean=22.0, width=1280, height=720))
+    conn = FakeReliabilityConn(
+        camera_account_id=account,
+        session_row=_session(state="streaming"),
+        snapshot_row=_snapshot(
+            age_seconds=5, storage_key="acct/cam/d/k.jpg", width=1280, height=720
+        ),
+        observation_at=datetime.now(tz=UTC) - timedelta(seconds=5),
+        processor_status_row=_processor_status(age_seconds=5),
+    )
+    r = _caller_client(conn, account_id=account).get(_SUMMARY_PATH.format(camera_id=camera))
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["status"] == "needs_review"
+    assert body["highest_severity"] == "warning"
+    top = body["top_findings"][0]
+    assert top["finding_type"] == _DARK_TYPE
+    assert top["category"] == "scene_quality"
+    assert top["likely_cause"] == "low_light"
+
+    ev = top["evidence"]
+    assert ev["brightness_mean"] == 22.0
+    assert ev["brightness_threshold"] == 45
+    assert ev["image_width"] == 1280
+    assert ev["image_height"] == 720
+    assert ev["source"] == "latest_frame_snapshot"
+
+    # Recommended next action mirrors the finding's recommendation.
+    assert body["recommended_next_action"] == top["recommended_action"]
+
+
+def test_stale_frame_short_circuits_dark_scene(monkeypatch: Any) -> None:
+    """When the latest frame is stale, only ``latest_frame_stale`` should open
+    — even if the brightness loader would have reported "dark". Otherwise
+    we'd be warning about scene quality from out-of-date evidence."""
+    from upstream_api.services.image_analysis import ImageBrightness
+
+    account, camera = uuid4(), uuid4()
+    calls = _install_brightness(monkeypatch, ImageBrightness(mean=5.0, width=1, height=1))
+    conn = FakeReliabilityConn(
+        camera_account_id=account,
+        session_row=_session(state="streaming"),
+        snapshot_row=_snapshot(
+            age_seconds=600, storage_key="acct/cam/d/k.jpg", width=640, height=480
+        ),
+        observation_at=datetime.now(tz=UTC) - timedelta(seconds=5),
+        processor_status_row=_processor_status(age_seconds=5),
+    )
+    r = _caller_client(conn, account_id=account).get(_SUMMARY_PATH.format(camera_id=camera))
+    assert r.status_code == 200, r.text
+    body = r.json()
+    types = {f["finding_type"] for f in body["top_findings"]}
+    assert "latest_frame_stale" in types
+    assert _DARK_TYPE not in types
+    # The brightness loader was never called — the precondition skipped it.
+    assert calls["calls"] == 0
+
+
+def test_brightness_loader_failure_does_not_crash_summary(monkeypatch: Any) -> None:
+    """Loader returns None (download/decode failure) → summary is healthy
+    instead of needs_review, no 500."""
+    account, camera = uuid4(), uuid4()
+    _install_brightness(monkeypatch, None)
+    conn = FakeReliabilityConn(
+        camera_account_id=account,
+        session_row=_session(state="streaming"),
+        snapshot_row=_snapshot(age_seconds=5, storage_key="acct/cam/d/k.jpg", width=1, height=1),
+        observation_at=datetime.now(tz=UTC) - timedelta(seconds=5),
+        processor_status_row=_processor_status(
+            age_seconds=5,
+            applied_geometry={
+                "source": "operator_saved",
+                "revision": 1,
+                "line_count": 1,
+                "roi_count": 1,
+            },
+        ),
+        has_saved_geometry=True,
+    )
+    r = _caller_client(conn, account_id=account).get(_SUMMARY_PATH.format(camera_id=camera))
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == "healthy"
+
+
+def test_dark_scene_findings_endpoint_lists_the_finding(monkeypatch: Any) -> None:
+    """Findings endpoint surfaces the dark-scene row with the full record
+    shape."""
+    from upstream_api.services.image_analysis import ImageBrightness
+
+    account, camera = uuid4(), uuid4()
+    _install_brightness(monkeypatch, ImageBrightness(mean=10.0, width=320, height=240))
+    conn = FakeReliabilityConn(
+        camera_account_id=account,
+        session_row=_session(state="streaming"),
+        snapshot_row=_snapshot(
+            age_seconds=5, storage_key="acct/cam/d/k.jpg", width=320, height=240
+        ),
+        observation_at=datetime.now(tz=UTC) - timedelta(seconds=5),
+        processor_status_row=_processor_status(age_seconds=5),
+    )
+    r = _caller_client(conn, account_id=account).get(_FINDINGS_PATH.format(camera_id=camera))
+    assert r.status_code == 200, r.text
+    body = r.json()
+    types = [f["finding_type"] for f in body["findings"]]
+    assert _DARK_TYPE in types
