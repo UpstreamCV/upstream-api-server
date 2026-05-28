@@ -57,6 +57,11 @@ class FakeEvalConn:
         observation_at: datetime | None = None,
         processor_status: dict[str, Any] | None = None,
         has_saved_geometry: bool = False,
+        # M2: latest_perception_snapshots row. The evaluator pulls confidence
+        # values out of perception["snapshot"]["objects"]. Tests use the real
+        # extractor end-to-end rather than monkeypatching it, so the fake
+        # just needs to return the row.
+        perception: dict[str, Any] | None = None,
         preopen_finding_ids: dict[str, UUID] | None = None,
     ) -> None:
         self.session = session
@@ -64,6 +69,7 @@ class FakeEvalConn:
         self.observation_at = observation_at
         self.processor_status = processor_status
         self.has_saved_geometry = has_saved_geometry
+        self.perception = perception
         # preopen_finding_ids maps dedupe_key -> UUID of a row that pretends to
         # already be open. Lets us pin "re-open refreshes instead of inserts".
         self.preopen_finding_ids = preopen_finding_ids or {}
@@ -86,6 +92,8 @@ class FakeEvalConn:
             return {"?column?": 1} if self.has_saved_geometry else None
         if "from processor_statuses" in query:
             return self.processor_status
+        if "from latest_perception_snapshots" in query:
+            return self.perception
         if "from reliability_findings" in query and "for update" in query:
             dedupe_key = args[2]
             existing = self.preopen_finding_ids.get(dedupe_key)
@@ -797,7 +805,269 @@ def test_scene_too_dark_dedupes_via_refresh_path(monkeypatch: Any) -> None:
     assert any(u["id"] == existing_id for u in conn.updates)
 
 
-def test_scene_too_dark_detector_version_bumped_to_v0_2() -> None:
-    """M1 ships the brightness rule for real; the detector version stamp must
-    bump so historical rows stay attributable to the right rule set."""
-    assert DETECTOR_VERSION == "reliability.v0.2"
+def test_detector_version_pins_to_current_milestone() -> None:
+    """Detector version bumps every time a shipped rule's behavior changes,
+    so historical rows stay attributable. v0.1 was M0 plumbing, v0.2 added
+    M1 brightness for real, v0.3 adds M2 unstable_detection_confidence."""
+    assert DETECTOR_VERSION == "reliability.v0.3"
+
+
+# ---------------------------------------------------------------------------
+# unstable_detection_confidence (M2 — first detection-quality signal).
+# ---------------------------------------------------------------------------
+
+
+_CONFIDENCE_KEY_SUFFIX = "detection:unstable_detection_confidence"
+
+
+def _perception(
+    *,
+    confidences: list[float],
+    age_seconds: float = 5,
+    snapshot_id: UUID | None = None,
+    stream_session_id: UUID | None = None,
+    snapshot_extras: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build a latest_perception_snapshots row.
+
+    ``confidences`` populates ``snapshot.objects[].confidence`` so the real
+    extractor + stats path runs end-to-end inside the evaluator. Per-detection
+    extras (track_id, class_id, label, bbox) are omitted to keep the test
+    payload tight — the extractor's anti-test in test_detection_confidence
+    already pins that those fields aren't mistaken for confidence.
+    """
+    now = datetime.now(tz=UTC)
+    payload: dict[str, Any] = {
+        "objects": [{"confidence": c} for c in confidences],
+    }
+    if snapshot_extras:
+        payload.update(snapshot_extras)
+    return {
+        "id": snapshot_id or uuid4(),
+        "camera_id": uuid4(),
+        "stream_session_id": stream_session_id or uuid4(),
+        "processor_id": "proc-1",
+        "package_id": "pkg",
+        "snapshot": payload,
+        "observed_at": now - timedelta(seconds=age_seconds),
+        "updated_at": now,
+    }
+
+
+def test_unstable_confidence_opens_on_low_avg() -> None:
+    """8 detections clustered at ~0.30 → avg below threshold → warning opens
+    with full evidence."""
+    account, camera = uuid4(), uuid4()
+    snapshot_id = uuid4()
+    session_id = uuid4()
+    conn = FakeEvalConn(
+        session=_session(state="streaming"),
+        snapshot=_snapshot(age_seconds=5),
+        observation_at=datetime.now(tz=UTC) - timedelta(seconds=5),
+        processor_status=_processor_status(age_seconds=5),
+        perception=_perception(
+            confidences=[0.30, 0.32, 0.28, 0.35, 0.31, 0.29, 0.33, 0.30],
+            snapshot_id=snapshot_id,
+            stream_session_id=session_id,
+        ),
+    )
+    _run(conn, account, camera)
+    upserts = _by_dedupe(conn.upserts)
+    key = f"camera:{camera}:{_CONFIDENCE_KEY_SUFFIX}"
+    assert key in upserts
+    u = upserts[key]
+    assert u["finding_type"] == "unstable_detection_confidence"
+    assert u["category"] == "detection"
+    assert u["severity"] == "warning"
+    assert u["likely_cause"] == "weak_or_unstable_model_confidence"
+    ev = u["evidence"]
+    assert ev["confidence_sample_count"] == 8
+    assert ev["avg_confidence"] < 0.45
+    assert ev["source"] == "latest_perception_snapshot"
+    assert ev["snapshot_id"] == str(snapshot_id)
+    assert ev["captured_at"] is not None
+    # M3 reserves these as null; the schema is stable.
+    assert ev["previous_avg_confidence"] is None
+    assert ev["drop_ratio"] is None
+    # No secrets leak.
+    serialized = json.dumps(ev).lower()
+    for leak in ("http", "supabase", "service_role", "bucket", "storage_key"):
+        assert leak not in serialized, ev
+
+
+def test_unstable_confidence_opens_on_high_stddev() -> None:
+    """Bimodal payload (some very high, some very low) trips the stddev
+    threshold even when avg sits near the middle."""
+    account, camera = uuid4(), uuid4()
+    conn = FakeEvalConn(
+        session=_session(state="streaming"),
+        snapshot=_snapshot(age_seconds=5),
+        observation_at=datetime.now(tz=UTC) - timedelta(seconds=5),
+        processor_status=_processor_status(age_seconds=5),
+        perception=_perception(
+            confidences=[0.95, 0.90, 0.10, 0.15, 0.92, 0.08, 0.94, 0.05],
+        ),
+    )
+    _run(conn, account, camera)
+    key = f"camera:{camera}:{_CONFIDENCE_KEY_SUFFIX}"
+    u = _by_dedupe(conn.upserts)[key]
+    assert u["evidence"]["confidence_stddev"] > 0.20
+
+
+def test_unstable_confidence_opens_on_high_low_ratio() -> None:
+    """More than half of samples below threshold trips the low-ratio path
+    even when avg sits near the boundary."""
+    account, camera = uuid4(), uuid4()
+    conn = FakeEvalConn(
+        session=_session(state="streaming"),
+        snapshot=_snapshot(age_seconds=5),
+        observation_at=datetime.now(tz=UTC) - timedelta(seconds=5),
+        processor_status=_processor_status(age_seconds=5),
+        perception=_perception(
+            # 5 below 0.45, 1 above -> low_ratio 5/6 ~= 0.83
+            confidences=[0.10, 0.20, 0.30, 0.40, 0.42, 0.85],
+        ),
+    )
+    _run(conn, account, camera)
+    key = f"camera:{camera}:{_CONFIDENCE_KEY_SUFFIX}"
+    u = _by_dedupe(conn.upserts)[key]
+    assert u["evidence"]["low_confidence_ratio"] > 0.50
+
+
+def test_unstable_confidence_resolves_when_healthy() -> None:
+    """8 detections at 0.75-0.95 → all three thresholds pass → resolve with
+    the rule-specific reason."""
+    account, camera = uuid4(), uuid4()
+    conn = FakeEvalConn(
+        session=_session(state="streaming"),
+        snapshot=_snapshot(age_seconds=5),
+        observation_at=datetime.now(tz=UTC) - timedelta(seconds=5),
+        processor_status=_processor_status(age_seconds=5),
+        perception=_perception(
+            confidences=[0.75, 0.80, 0.82, 0.85, 0.88, 0.90, 0.92, 0.95],
+        ),
+    )
+    _run(conn, account, camera)
+    key = f"camera:{camera}:{_CONFIDENCE_KEY_SUFFIX}"
+    assert all(u["dedupe_key"] != key for u in conn.upserts)
+    matching = [
+        r
+        for r in conn.resolves
+        if key in r["dedupe_keys"] and r["reason"] == "detection_confidence_stabilized"
+    ]
+    assert matching, conn.resolves
+
+
+def test_unstable_confidence_skipped_when_too_few_samples() -> None:
+    """Fewer than MIN_SAMPLE_COUNT detections → rule returns None.
+
+    Critical that this is NOT a resolve: a model that has stopped producing
+    detections should not silently close a previously-opened unstable-
+    confidence finding."""
+    account, camera = uuid4(), uuid4()
+    conn = FakeEvalConn(
+        session=_session(state="streaming"),
+        snapshot=_snapshot(age_seconds=5),
+        observation_at=datetime.now(tz=UTC) - timedelta(seconds=5),
+        processor_status=_processor_status(age_seconds=5),
+        perception=_perception(confidences=[0.1, 0.2, 0.3]),
+    )
+    _run(conn, account, camera)
+    key = f"camera:{camera}:{_CONFIDENCE_KEY_SUFFIX}"
+    assert all(u["dedupe_key"] != key for u in conn.upserts)
+    assert all(key not in r["dedupe_keys"] for r in conn.resolves)
+
+
+def test_unstable_confidence_skipped_when_no_perception() -> None:
+    account, camera = uuid4(), uuid4()
+    conn = FakeEvalConn(
+        session=_session(state="streaming"),
+        snapshot=_snapshot(age_seconds=5),
+        observation_at=datetime.now(tz=UTC) - timedelta(seconds=5),
+        processor_status=_processor_status(age_seconds=5),
+        perception=None,
+    )
+    _run(conn, account, camera)
+    key = f"camera:{camera}:{_CONFIDENCE_KEY_SUFFIX}"
+    assert all(u["dedupe_key"] != key for u in conn.upserts)
+    assert all(key not in r["dedupe_keys"] for r in conn.resolves)
+
+
+def test_unstable_confidence_skipped_when_perception_is_stale() -> None:
+    """Stale perception → fact gatherer bypasses stats compute → rule
+    returns None. The latest_frame_stale rule owns the staleness case."""
+    account, camera = uuid4(), uuid4()
+    conn = FakeEvalConn(
+        session=_session(state="streaming"),
+        snapshot=_snapshot(age_seconds=600),
+        observation_at=datetime.now(tz=UTC) - timedelta(seconds=5),
+        processor_status=_processor_status(age_seconds=5),
+        perception=_perception(
+            confidences=[0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1],
+            age_seconds=600,
+        ),
+    )
+    _run(conn, account, camera)
+    key = f"camera:{camera}:{_CONFIDENCE_KEY_SUFFIX}"
+    assert all(u["dedupe_key"] != key for u in conn.upserts)
+    assert all(key not in r["dedupe_keys"] for r in conn.resolves)
+
+
+def test_unstable_confidence_skipped_when_objects_empty() -> None:
+    """No detections in the frame → no confidence samples → rule returns
+    None. A camera that isn't seeing anything isn't a confidence problem."""
+    account, camera = uuid4(), uuid4()
+    conn = FakeEvalConn(
+        session=_session(state="streaming"),
+        snapshot=_snapshot(age_seconds=5),
+        observation_at=datetime.now(tz=UTC) - timedelta(seconds=5),
+        processor_status=_processor_status(age_seconds=5),
+        perception=_perception(confidences=[]),
+    )
+    _run(conn, account, camera)
+    key = f"camera:{camera}:{_CONFIDENCE_KEY_SUFFIX}"
+    assert all(u["dedupe_key"] != key for u in conn.upserts)
+    assert all(key not in r["dedupe_keys"] for r in conn.resolves)
+
+
+def test_unstable_confidence_coexists_with_dark_scene(monkeypatch: Any) -> None:
+    """A dark frame AND unstable confidence are two different signals worth
+    surfacing. The brief permits both opening; pin that they do."""
+    account, camera = uuid4(), uuid4()
+    _install_brightness(monkeypatch, ImageBrightness(mean=10.0, width=1280, height=720))
+    conn = FakeEvalConn(
+        session=_session(state="streaming"),
+        snapshot=_snapshot(age_seconds=5, storage_key="acct/cam/d/k.jpg"),
+        observation_at=datetime.now(tz=UTC) - timedelta(seconds=5),
+        processor_status=_processor_status(age_seconds=5),
+        perception=_perception(
+            confidences=[0.20, 0.25, 0.30, 0.22, 0.28, 0.24, 0.21, 0.26],
+        ),
+    )
+    _run(conn, account, camera)
+    keys = {u["dedupe_key"] for u in conn.upserts}
+    dark_key = f"camera:{camera}:scene_quality:scene_too_dark_for_reliable_detection"
+    conf_key = f"camera:{camera}:{_CONFIDENCE_KEY_SUFFIX}"
+    assert dark_key in keys
+    assert conf_key in keys
+
+
+def test_unstable_confidence_dedupe_refreshes_existing(monkeypatch: Any) -> None:
+    """A pre-existing open finding under the same dedupe_key must refresh
+    (UPDATE), not insert a second row."""
+    account, camera = uuid4(), uuid4()
+    key = f"camera:{camera}:{_CONFIDENCE_KEY_SUFFIX}"
+    existing_id = uuid4()
+    conn = FakeEvalConn(
+        session=_session(state="streaming"),
+        snapshot=_snapshot(age_seconds=5),
+        observation_at=datetime.now(tz=UTC) - timedelta(seconds=5),
+        processor_status=_processor_status(age_seconds=5),
+        perception=_perception(
+            confidences=[0.20, 0.25, 0.30, 0.22, 0.28, 0.24, 0.21, 0.26],
+        ),
+        preopen_finding_ids={key: existing_id},
+    )
+    _run(conn, account, camera)
+    assert all(u["dedupe_key"] != key for u in conn.upserts)
+    assert any(u["id"] == existing_id for u in conn.updates)

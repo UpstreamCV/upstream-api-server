@@ -71,6 +71,9 @@ class FakeReliabilityConn:
         observation_at: datetime | None = None,
         processor_status_row: dict[str, Any] | None = None,
         has_saved_geometry: bool = False,
+        # M2: latest_perception_snapshots row driving the
+        # unstable_detection_confidence rule.
+        perception_row: dict[str, Any] | None = None,
         # Initial open findings the evaluator will see + the list endpoint will
         # return after evaluation. The evaluator's upserts mutate this map by
         # dedupe_key so re-opens look like UPDATE not INSERT.
@@ -82,6 +85,7 @@ class FakeReliabilityConn:
         self.observation_at = observation_at
         self.processor_status_row = processor_status_row
         self.has_saved_geometry = has_saved_geometry
+        self.perception_row = perception_row
         # Indexed by dedupe_key so the evaluator's lookup-for-update returns
         # an existing id when one is present.
         self.open_findings: dict[str, dict[str, Any]] = {
@@ -110,6 +114,8 @@ class FakeReliabilityConn:
             return {"?column?": 1} if self.has_saved_geometry else None
         if "from processor_statuses" in query:
             return self.processor_status_row
+        if "from latest_perception_snapshots" in query:
+            return self.perception_row
 
         # Reliability repo: lookup-for-update.
         if "from reliability_findings" in query and "for update" in query:
@@ -700,3 +706,140 @@ def test_dark_scene_findings_endpoint_lists_the_finding(monkeypatch: Any) -> Non
     body = r.json()
     types = [f["finding_type"] for f in body["findings"]]
     assert _DARK_TYPE in types
+
+
+# ===========================================================================
+# unstable_detection_confidence (M2 — first detection-quality signal).
+# ===========================================================================
+
+
+_CONFIDENCE_TYPE = "unstable_detection_confidence"
+
+
+def _perception_row(
+    *,
+    confidences: list[float],
+    age_seconds: float = 5,
+) -> dict[str, Any]:
+    """latest_perception_snapshots row with ``objects[].confidence`` populated."""
+    now = datetime.now(tz=UTC)
+    return {
+        "id": uuid4(),
+        "camera_id": uuid4(),
+        "stream_session_id": uuid4(),
+        "processor_id": "proc-1",
+        "package_id": "pkg",
+        "snapshot": {"objects": [{"confidence": c} for c in confidences]},
+        "observed_at": now - timedelta(seconds=age_seconds),
+        "updated_at": now,
+    }
+
+
+def test_unstable_confidence_summary_returns_needs_review() -> None:
+    """8 detections at avg ~0.30 → summary rolls up to needs_review with the
+    confidence finding at the top and full evidence wired through coerce_jsonb."""
+    account, camera = uuid4(), uuid4()
+    conn = FakeReliabilityConn(
+        camera_account_id=account,
+        session_row=_session(state="streaming"),
+        snapshot_row=_snapshot(age_seconds=5),
+        observation_at=datetime.now(tz=UTC) - timedelta(seconds=5),
+        processor_status_row=_processor_status(age_seconds=5),
+        perception_row=_perception_row(
+            confidences=[0.30, 0.28, 0.32, 0.35, 0.31, 0.29, 0.33, 0.30],
+        ),
+    )
+    r = _caller_client(conn, account_id=account).get(_SUMMARY_PATH.format(camera_id=camera))
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["status"] == "needs_review"
+    assert body["highest_severity"] == "warning"
+    top = body["top_findings"][0]
+    assert top["finding_type"] == _CONFIDENCE_TYPE
+    assert top["category"] == "detection"
+    assert top["severity"] == "warning"
+    assert top["likely_cause"] == "weak_or_unstable_model_confidence"
+    ev = top["evidence"]
+    # Evidence must actually round-trip (the post-M1 coerce_jsonb fix).
+    assert ev["confidence_sample_count"] == 8
+    assert ev["avg_confidence"] < 0.45
+    assert ev["source"] == "latest_perception_snapshot"
+    assert "thresholds" in ev
+    assert ev["previous_avg_confidence"] is None
+    assert ev["drop_ratio"] is None
+
+
+def test_healthy_confidence_does_not_open_finding() -> None:
+    """All thresholds pass → no confidence finding opens; summary stays
+    healthy (no other findings active)."""
+    account, camera = uuid4(), uuid4()
+    conn = FakeReliabilityConn(
+        camera_account_id=account,
+        session_row=_session(state="streaming"),
+        snapshot_row=_snapshot(age_seconds=5),
+        observation_at=datetime.now(tz=UTC) - timedelta(seconds=5),
+        processor_status_row=_processor_status(
+            age_seconds=5,
+            applied_geometry={
+                "source": "operator_saved",
+                "revision": 1,
+                "line_count": 1,
+                "roi_count": 1,
+            },
+        ),
+        has_saved_geometry=True,
+        perception_row=_perception_row(
+            confidences=[0.75, 0.80, 0.85, 0.88, 0.90, 0.82, 0.87, 0.92],
+        ),
+    )
+    r = _caller_client(conn, account_id=account).get(_SUMMARY_PATH.format(camera_id=camera))
+    body = r.json()
+    assert body["status"] == "healthy"
+    assert body["open_findings_count"] == 0
+
+
+def test_critical_outranks_confidence_warning_in_summary() -> None:
+    """A critical stream finding still wins the highest_severity slot when
+    a warning-severity confidence finding is also open."""
+    account, camera = uuid4(), uuid4()
+    # Processor status stale -> stream_valid_processor_silent (critical),
+    # plus low-confidence detections -> unstable_detection_confidence
+    # (warning).
+    conn = FakeReliabilityConn(
+        camera_account_id=account,
+        session_row=_session(state="streaming"),
+        snapshot_row=_snapshot(age_seconds=5),
+        observation_at=None,
+        processor_status_row=_processor_status(age_seconds=600),
+        perception_row=_perception_row(
+            confidences=[0.20, 0.22, 0.25, 0.28, 0.30, 0.32, 0.26, 0.24],
+        ),
+    )
+    r = _caller_client(conn, account_id=account).get(_SUMMARY_PATH.format(camera_id=camera))
+    body = r.json()
+    assert body["status"] == "critical"
+    assert body["highest_severity"] == "critical"
+    # Both findings should be open in the underlying table.
+    open_types = {f["finding_type"] for f in conn.open_findings.values() if f["status"] == "open"}
+    assert "stream_valid_processor_silent" in open_types
+    assert _CONFIDENCE_TYPE in open_types
+    # And the critical wins the top slot.
+    assert body["top_findings"][0]["severity"] == "critical"
+
+
+def test_confidence_finding_appears_in_findings_endpoint() -> None:
+    account, camera = uuid4(), uuid4()
+    conn = FakeReliabilityConn(
+        camera_account_id=account,
+        session_row=_session(state="streaming"),
+        snapshot_row=_snapshot(age_seconds=5),
+        observation_at=datetime.now(tz=UTC) - timedelta(seconds=5),
+        processor_status_row=_processor_status(age_seconds=5),
+        perception_row=_perception_row(
+            confidences=[0.10, 0.20, 0.25, 0.30, 0.35, 0.40, 0.42, 0.45],
+        ),
+    )
+    r = _caller_client(conn, account_id=account).get(_FINDINGS_PATH.format(camera_id=camera))
+    assert r.status_code == 200, r.text
+    types = [f["finding_type"] for f in r.json()["findings"]]
+    assert _CONFIDENCE_TYPE in types

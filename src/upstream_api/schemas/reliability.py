@@ -26,7 +26,9 @@ from uuid import UUID
 
 from pydantic import BaseModel
 
-ReliabilityCategory = Literal["stream", "processor", "scene_quality", "geometry_config"]
+ReliabilityCategory = Literal[
+    "stream", "processor", "scene_quality", "geometry_config", "detection"
+]
 ReliabilitySeverity = Literal["info", "warning", "critical"]
 ReliabilityStatus = Literal["open", "resolved", "suppressed", "ignored"]
 
