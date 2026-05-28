@@ -404,7 +404,13 @@ def _evaluate_stream_valid_processor_silent(facts: _Facts) -> _RuleOutput:
     snapshot_fresh = snapshot_age is not None and snapshot_age < _LATEST_FRAME_STALE_THRESHOLD_S
 
     if not session_live and not snapshot_fresh:
-        return None
+        # The workflow that could have triggered this finding is no longer
+        # current: the session has ended or expired AND there's no fresh
+        # snapshot. A previously-open finding describes a past run and is
+        # not actionable any more -- resolve it. ``resolve_open_findings``
+        # is a no-op when no open row matches, so this is safe on cameras
+        # that have never had a finding.
+        return _RuleResolved(reason="stream_no_longer_live")
 
     status = facts.latest_processor_status
     status_age = _age_seconds(facts.now, status["updated_at"]) if status else None
@@ -458,8 +464,15 @@ def _evaluate_latest_frame_stale(facts: _Facts) -> _RuleOutput:
     snapshot = facts.latest_snapshot
     session = facts.latest_session
 
-    if snapshot is None or not _is_session_live(session, now=facts.now):
+    if snapshot is None:
+        # No snapshot at all -- we can't claim staleness; leave any
+        # previously-open finding alone (insufficient data).
         return None
+    if not _is_session_live(session, now=facts.now):
+        # The camera is intentionally idle (session ended / expired). A
+        # previously-open stale-frame finding describes a past run and is
+        # no longer actionable; resolve it.
+        return _RuleResolved(reason="stream_no_longer_live")
 
     age = _age_seconds(facts.now, snapshot["captured_at"])
     if age is None:

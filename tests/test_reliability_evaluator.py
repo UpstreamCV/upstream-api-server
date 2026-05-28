@@ -354,9 +354,13 @@ def test_stream_valid_processor_silent_resolves_when_processor_fresh() -> None:
     assert any(silent_key in r["dedupe_keys"] for r in conn.resolves)
 
 
-def test_stream_valid_processor_silent_skipped_when_no_session_and_no_recent_frame() -> None:
-    """No session AND no recent snapshot → insufficient data; rule does nothing
-    (neither open nor resolve). This is how the "unknown" verdict survives."""
+def test_stream_valid_processor_silent_resolves_when_no_session_and_no_recent_frame() -> None:
+    """No session AND no recent snapshot → the workflow this finding
+    describes is no longer current; resolve any previously-open row with
+    reason ``stream_no_longer_live``. ``resolve_open_findings`` is a no-op
+    when no open row matches, so this does not affect the "unknown"
+    verdict computation (which depends on the absence of open findings,
+    not the absence of resolve attempts)."""
     account, camera = uuid4(), uuid4()
     conn = FakeEvalConn(
         session=None,
@@ -367,7 +371,10 @@ def test_stream_valid_processor_silent_skipped_when_no_session_and_no_recent_fra
     _run(conn, account, camera)
     silent_key = f"camera:{camera}:stream:stream_valid_processor_silent"
     assert all(u["dedupe_key"] != silent_key for u in conn.upserts)
-    assert all(silent_key not in r["dedupe_keys"] for r in conn.resolves)
+    assert any(
+        silent_key in r["dedupe_keys"] and r["reason"] == "stream_no_longer_live"
+        for r in conn.resolves
+    )
 
 
 def test_stream_valid_processor_silent_skipped_when_session_expired() -> None:
@@ -399,7 +406,16 @@ def test_stream_valid_processor_silent_skipped_when_session_expired() -> None:
     )
     _run(conn, account, camera)
     silent_key = f"camera:{camera}:stream:stream_valid_processor_silent"
+    # Rule must not open a new finding.
     assert all(u["dedupe_key"] != silent_key for u in conn.upserts)
+    # And must resolve any previously-open finding under this dedupe key:
+    # the workflow that the finding described is no longer current. The
+    # resolve helper is a no-op when no open row matches, so this is safe
+    # even on a camera that has never had a finding.
+    assert any(
+        silent_key in r["dedupe_keys"] and r["reason"] == "stream_no_longer_live"
+        for r in conn.resolves
+    )
 
 
 def test_stream_valid_processor_silent_skipped_when_session_ended() -> None:
@@ -424,6 +440,12 @@ def test_stream_valid_processor_silent_skipped_when_session_ended() -> None:
     _run(conn, account, camera)
     silent_key = f"camera:{camera}:stream:stream_valid_processor_silent"
     assert all(u["dedupe_key"] != silent_key for u in conn.upserts)
+    # Also resolves a previously-open finding -- same reasoning as the
+    # expired-session case above.
+    assert any(
+        silent_key in r["dedupe_keys"] and r["reason"] == "stream_no_longer_live"
+        for r in conn.resolves
+    )
 
 
 def test_stream_valid_processor_silent_copy_does_not_say_stream_is_live() -> None:
@@ -503,9 +525,12 @@ def test_latest_frame_stale_skipped_without_snapshot() -> None:
     assert all(stale_key not in r["dedupe_keys"] for r in conn.resolves)
 
 
-def test_latest_frame_stale_skipped_when_session_not_live() -> None:
-    """Session is `ended` → the camera is intentionally idle; stale frames are
-    not a reliability problem in that state."""
+def test_latest_frame_stale_resolves_when_session_not_live() -> None:
+    """Session is `ended` → the camera is intentionally idle. Stale frames
+    are not a problem in that state, AND any previously-open stale-frame
+    finding describes a workflow that is no longer current; resolve it
+    with reason ``stream_no_longer_live`` so the dashboard stops showing
+    a finding tied to a past session."""
     account, camera = uuid4(), uuid4()
     conn = FakeEvalConn(
         session=_session(state="ended"),
@@ -515,7 +540,10 @@ def test_latest_frame_stale_skipped_when_session_not_live() -> None:
     _run(conn, account, camera)
     stale_key = f"camera:{camera}:stream:latest_frame_stale"
     assert all(u["dedupe_key"] != stale_key for u in conn.upserts)
-    assert all(stale_key not in r["dedupe_keys"] for r in conn.resolves)
+    assert any(
+        stale_key in r["dedupe_keys"] and r["reason"] == "stream_no_longer_live"
+        for r in conn.resolves
+    )
 
 
 # ---------------------------------------------------------------------------
