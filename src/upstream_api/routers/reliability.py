@@ -19,7 +19,7 @@ same way ``snapshots.camera_router`` is.
 
 from __future__ import annotations
 
-from typing import Annotated
+from typing import Annotated, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Query
@@ -88,12 +88,18 @@ async def get_reliability_findings(
     settings: SettingsDep,
     account_id: Annotated[UUID | None, Query()] = None,
     limit: Annotated[int, Query(ge=1, le=_FINDINGS_MAX_LIMIT)] = _FINDINGS_DEFAULT_LIMIT,
+    status: Annotated[Literal["open", "resolved", "suppressed", "ignored"], Query()] = "open",
 ) -> ReliabilityFindingsResponse:
-    """Open reliability findings for one camera, severity-desc then recency.
+    """Reliability findings for one camera filtered by ``status``.
+
+    Default ``status=open`` preserves the M0 contract: severity-first ordering,
+    same shape the Monitor card consumes. ``status=resolved`` drives the new
+    M4 Reliability tab's "Recently resolved" section -- newest-resolved first.
 
     Re-runs the evaluator on read so callers that hit findings/ without first
     hitting summary/ still see fresh state. Returns 404 ``camera_not_found``
-    when ownership doesn't match.
+    when ownership doesn't match. Pydantic ``Literal`` enforces the status
+    enum; a bogus value returns 422 automatically.
     """
     scope_account = caller.resolve_account(account_id)
     async with pool.acquire() as conn, conn.transaction():
@@ -107,6 +113,7 @@ async def get_reliability_findings(
         return await get_findings_for_camera(
             conn,
             settings=settings,
+            status=status,
             account_id=scope_account,
             camera_id=camera_id,
             limit=limit,

@@ -31,7 +31,10 @@ from upstream_api.services.reliability_evaluator import (
     evaluate_camera,
     has_recent_evaluable_signal,
 )
-from upstream_api.services.reliability_repo import list_open_findings_for_camera
+from upstream_api.services.reliability_repo import (
+    list_findings_for_camera,
+    list_open_findings_for_camera,
+)
 
 # How many findings the summary surfaces. The card only renders the highest-
 # severity one today; three leaves headroom for a "see all" affordance without
@@ -145,13 +148,20 @@ async def get_findings_for_camera(
     account_id: UUID,
     camera_id: UUID,
     limit: int,
+    status: str = "open",
     now: datetime | None = None,
 ) -> ReliabilityFindingsResponse:
-    """Evaluate, then return all open findings (severity-desc, last_seen_at-desc).
+    """Evaluate, then return findings filtered by ``status``.
 
-    Mirrors the summary call so the findings endpoint is also "evaluate on
-    read" — a dashboard that hits findings/ before summary/ still gets fresh
-    state without needing both calls.
+    Default ``status="open"`` preserves the M0 contract: a dashboard that
+    hits findings/ before summary/ still gets fresh state, severity-first.
+
+    Non-open statuses (resolved / suppressed / ignored) skip the canonical
+    ordering and use recency-first (newest-resolved at top) because that's
+    how operators read the history section of the Reliability tab.
+
+    Evaluator still runs on read so a resolve-on-read transition (e.g. the
+    M3 master-switch-off path) is reflected in the resolved list right away.
     """
     evaluated_at, _facts = await evaluate_camera(
         conn,
@@ -160,12 +170,21 @@ async def get_findings_for_camera(
         camera_id=camera_id,
         now=now,
     )
-    rows = await list_open_findings_for_camera(
-        conn,
-        account_id=account_id,
-        camera_id=camera_id,
-        limit=limit,
-    )
+    if status == "open":
+        rows = await list_open_findings_for_camera(
+            conn,
+            account_id=account_id,
+            camera_id=camera_id,
+            limit=limit,
+        )
+    else:
+        rows = await list_findings_for_camera(
+            conn,
+            account_id=account_id,
+            camera_id=camera_id,
+            status=status,
+            limit=limit,
+        )
     return ReliabilityFindingsResponse(
         findings=[_to_record(r) for r in rows],
         last_evaluated_at=evaluated_at,
