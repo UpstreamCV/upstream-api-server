@@ -192,6 +192,17 @@ Not yet implemented:
 
 See `docs/architecture.md` for the full phased delivery plan.
 
+## Project Tracking
+
+We use GitHub Issues as a lightweight tracker for meaningful bugs,
+features, follow-ups, and milestone work. Issues should include clear
+context and acceptance criteria, but should not become heavy process.
+Small fast-moving implementation details can stay in PRs, commit logs,
+or working notes.
+
+The cross-repo plan lives in `../docs/github-issues-plan.md`. A minimal
+issue template for this repo lives in `.github/ISSUE_TEMPLATE/task.md`.
+
 ## License
 
 Private. All rights reserved.

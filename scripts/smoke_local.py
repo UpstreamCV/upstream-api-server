@@ -116,7 +116,7 @@ def main() -> None:
         if r.status_code != 200:
             die(f"session stop: {r.status_code} {r.text}")
         assert r.json()["state"] == "ended", r.json()
-        print(f"  ok  session stopped")
+        print("  ok  session stopped")
 
     print("PASS")
 
