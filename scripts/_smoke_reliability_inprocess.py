@@ -586,6 +586,110 @@ def main() -> None:
     finally:
         _sb_mod.get_brightness_for_snapshot = original_loader  # type: ignore[assignment]
 
+    # ----- Test 9: unstable_detection_confidence (M2) ---------------------
+    print()
+    print("Test 9 — unstable_detection_confidence (M2)")
+
+    def _perception_row(
+        *, confidences: list[float], age_seconds: float = 5
+    ) -> Any:
+        n = datetime.now(tz=UTC)
+        return {
+            "id": uuid4(),
+            "camera_id": uuid4(),
+            "stream_session_id": uuid4(),
+            "processor_id": "smoke",
+            "package_id": "pkg",
+            "snapshot": {"objects": [{"confidence": c} for c in confidences]},
+            "observed_at": n - timedelta(seconds=age_seconds),
+            "updated_at": n,
+        }
+
+    # 9a -- low-confidence cluster opens warning, full evidence shape.
+    account, camera = uuid4(), uuid4()
+    conn = FakeReliabilityConn(
+        camera_account_id=account,
+        session_row=session(state="streaming"),
+        snapshot_row=snapshot(age_seconds=5),
+        observation_at=datetime.now(tz=UTC) - timedelta(seconds=5),
+        processor_status_row=processor_status(age_seconds=5),
+        perception_row=_perception_row(
+            confidences=[0.30, 0.28, 0.32, 0.35, 0.31, 0.29, 0.33, 0.30]
+        ),
+    )
+    client = client_for(conn, account_id=account)
+    summary = hit(client, "summary", camera)
+    assert summary["status"] == "needs_review", summary
+    top = summary["top_findings"][0]
+    assert top["finding_type"] == "unstable_detection_confidence", top
+    assert top["category"] == "detection", top
+    ev = top["evidence"]
+    assert ev["confidence_sample_count"] == 8, ev
+    assert ev["avg_confidence"] < 0.45, ev
+    assert ev["source"] == "latest_perception_snapshot", ev
+    assert ev["previous_avg_confidence"] is None, ev
+    assert ev["drop_ratio"] is None, ev
+    for leak in ("http", "supabase", "service_role", "bucket", "storage_key"):
+        assert leak not in str(ev).lower(), ev
+    ok(
+        "low-confidence cluster → needs_review",
+        f"avg={ev['avg_confidence']}, samples={ev['confidence_sample_count']}",
+    )
+    ok("evidence carries thresholds + null M3 placeholders, no secrets", "")
+
+    # 9b -- healthy confidence on same camera resolves the finding.
+    conn.perception_row = _perception_row(
+        confidences=[0.78, 0.82, 0.85, 0.88, 0.90, 0.84, 0.86, 0.91]
+    )
+    summary = hit(client, "summary", camera)
+    assert summary["status"] == "healthy", summary
+    resolved = [
+        r for r in conn.open_findings.values()
+        if r["finding_type"] == "unstable_detection_confidence"
+        and r["status"] == "resolved"
+    ]
+    assert resolved, [r["status"] for r in conn.open_findings.values()]
+    assert resolved[0]["resolved_reason"] == "detection_confidence_stabilized", resolved[0]
+    ok("healthy confidence → resolved", "reason=detection_confidence_stabilized")
+
+    # 9c -- too few samples does NOT auto-resolve (insufficient data path).
+    account, camera = uuid4(), uuid4()
+    conn = FakeReliabilityConn(
+        camera_account_id=account,
+        session_row=session(state="streaming"),
+        snapshot_row=snapshot(age_seconds=5),
+        observation_at=datetime.now(tz=UTC) - timedelta(seconds=5),
+        processor_status_row=processor_status(age_seconds=5),
+        perception_row=_perception_row(confidences=[0.10, 0.15, 0.20]),  # < 5
+    )
+    client = client_for(conn, account_id=account)
+    summary = hit(client, "summary", camera)
+    types = {f["finding_type"] for f in summary["top_findings"]}
+    assert "unstable_detection_confidence" not in types, summary
+    ok("too few samples → no finding (insufficient data)", "")
+
+    # 9d -- critical still outranks M2 warning in highest_severity.
+    account, camera = uuid4(), uuid4()
+    conn = FakeReliabilityConn(
+        camera_account_id=account,
+        session_row=session(state="streaming"),
+        snapshot_row=snapshot(age_seconds=5),
+        observation_at=None,
+        processor_status_row=processor_status(age_seconds=600),
+        perception_row=_perception_row(
+            confidences=[0.20, 0.25, 0.30, 0.22, 0.28, 0.24, 0.21, 0.26]
+        ),
+    )
+    client = client_for(conn, account_id=account)
+    summary = hit(client, "summary", camera)
+    assert summary["status"] == "critical", summary
+    open_types = {
+        f["finding_type"] for f in conn.open_findings.values() if f["status"] == "open"
+    }
+    assert "stream_valid_processor_silent" in open_types
+    assert "unstable_detection_confidence" in open_types
+    ok("M0 critical outranks M2 warning, both open in table", "")
+
     print()
     print(f"{GREEN}PASS{RESET} — reliability slice smoke complete")
 

@@ -5,7 +5,7 @@ api-server already persists (latest stream session, latest processor status,
 latest snapshot timestamp + image bytes, latest observation), runs each rule,
 and upserts/resolves findings via services/reliability_repo.
 
-Four rules ship today:
+Five rules ship today:
 
 - ``stream_valid_processor_silent``  (critical) -- stream appears live but the
   processor isn't producing observations.
@@ -18,6 +18,12 @@ Four rules ship today:
   rule on the platform that talks about scene quality rather than workflow
   plumbing. Brightness lookup happens during fact gathering through
   ``services/snapshot_brightness`` (cached) so the rule stays a pure function.
+- ``unstable_detection_confidence`` (warning, M2) -- avg / low_ratio / stddev
+  of the per-detection confidences in the latest perception snapshot crosses
+  any warning threshold. First rule that talks about model detection quality
+  rather than scene or plumbing. Stats are computed during fact gathering
+  through ``services/detection_confidence`` (pure functions) so the rule
+  stays a pure function.
 
 Each rule returns one of:
 
@@ -40,9 +46,22 @@ import asyncpg
 
 from upstream_api.config import Settings
 from upstream_api.services import snapshot_brightness as snapshot_brightness_module
+from upstream_api.services.detection_confidence import (
+    AVG_CONFIDENCE_WARNING_THRESHOLD,
+    CONFIDENCE_DROP_RATIO_WARNING_THRESHOLD,
+    CONFIDENCE_STDDEV_WARNING_THRESHOLD,
+    LOW_CONFIDENCE_RATIO_WARNING_THRESHOLD,
+    LOW_CONFIDENCE_THRESHOLD,
+    MIN_SAMPLE_COUNT,
+    RECENT_WINDOW_SECONDS,
+    DetectionConfidenceStats,
+    compute_detection_confidence_stats,
+    extract_detection_confidences,
+)
 from upstream_api.services.image_analysis import ImageBrightness
 from upstream_api.services.processor import (
     coerce_jsonb,
+    fetch_latest_perception_snapshot,
     fetch_latest_processor_status,
 )
 from upstream_api.services.reliability_repo import (
@@ -52,9 +71,11 @@ from upstream_api.services.reliability_repo import (
 
 # Bump when a rule's trigger logic or thresholds change. Stamped on every
 # finding row so historical entries stay attributable to the version of the
-# detector that wrote them. M1 bumps to v0.2 with the brightness rule shipping
-# for real (was reserved/no-op in v0.1).
-DETECTOR_VERSION = "reliability.v0.2"
+# detector that wrote them.
+#   v0.1 -- M0 plumbing (scene_too_dark reserved/no-op)
+#   v0.2 -- M1 ships scene_too_dark for real
+#   v0.3 -- M2 ships unstable_detection_confidence
+DETECTOR_VERSION = "reliability.v0.3"
 
 # Thresholds. Single source of truth for both the rule and the tests. Numbers
 # are intentionally conservative — better to flag a healthy session than to
@@ -78,6 +99,7 @@ _DEDUPE_STREAM_SILENT = "stream:stream_valid_processor_silent"
 _DEDUPE_FRAME_STALE = "stream:latest_frame_stale"
 _DEDUPE_SCENE_DARK = "scene_quality:scene_too_dark_for_reliable_detection"
 _DEDUPE_DEFAULT_GEOMETRY = "geometry:processor_using_default_geometry"
+_DEDUPE_DETECTION_CONFIDENCE = "detection:unstable_detection_confidence"
 
 
 def _dedupe_key(camera_id: UUID, suffix: str) -> str:
@@ -134,6 +156,14 @@ class _Facts:
     # means "skip the brightness rule" — either there's no snapshot, it's
     # stale (the stale-frame rule owns that case), or the decode failed.
     snapshot_brightness: ImageBrightness | None = None
+    # M2: latest perception snapshot row + summary stats over the per-detection
+    # confidences in its ``objects`` array. Populated only when the underlying
+    # snapshot row is recent (latest_perception_snapshots tracks "updated_at",
+    # not capture time, but it's the freshest signal we have). ``None`` means
+    # "skip the confidence rule" -- no row, stale, too few samples, or no
+    # confidences in the payload.
+    latest_perception_snapshot: dict[str, Any] | None = None
+    detection_confidence_stats: DetectionConfidenceStats | None = None
 
 
 # Minimal column set — we never need the full row, and dragging the whole row
@@ -190,11 +220,15 @@ async def _gather_facts(
     snapshot_row = await conn.fetchrow(_LATEST_SNAPSHOT_SQL, account_id, camera_id)
     obs_row = await conn.fetchrow(_LATEST_OBSERVATION_AT_SQL, account_id, camera_id)
     geom_row = await conn.fetchrow(_SAVED_GEOMETRY_EXISTS_SQL, account_id, camera_id)
+    perception_row = await fetch_latest_perception_snapshot(
+        conn, account_id=account_id, camera_id=camera_id
+    )
 
     snapshot = dict(snapshot_row) if snapshot_row is not None else None
     snapshot_brightness = await _maybe_load_brightness(
         settings=settings, snapshot=snapshot, now=now
     )
+    confidence_stats = _maybe_compute_confidence_stats(perception=perception_row, now=now)
 
     return _Facts(
         now=now,
@@ -204,6 +238,8 @@ async def _gather_facts(
         latest_observation_at=(obs_row["observed_at"] if obs_row is not None else None),
         has_saved_geometry=geom_row is not None,
         snapshot_brightness=snapshot_brightness,
+        latest_perception_snapshot=perception_row,
+        detection_confidence_stats=confidence_stats,
     )
 
 
@@ -244,6 +280,38 @@ async def _maybe_load_brightness(
         snapshot_id=snapshot_id,
         storage_key=storage_key,
     )
+
+
+def _maybe_compute_confidence_stats(
+    *,
+    perception: dict[str, Any] | None,
+    now: datetime,
+) -> DetectionConfidenceStats | None:
+    """Compute confidence stats from the latest perception snapshot, when worth it.
+
+    Skip when:
+      - no perception snapshot row
+      - the row is older than the stale-frame threshold (the stale-frame rule
+        owns that case; warning about detection confidence on out-of-date
+        evidence would be lying about current model behavior)
+      - the snapshot JSONB is missing or not a dict
+      - the extractor finds fewer than MIN_SAMPLE_COUNT confidences (handled
+        by ``compute_detection_confidence_stats`` returning ``None``)
+
+    The perception_row's ``observed_at`` is the freshness signal -- it's set
+    by the processor at frame time, not at UPSERT time.
+    """
+    if perception is None:
+        return None
+    observed_at = perception.get("observed_at")
+    age = _age_seconds(now, observed_at)
+    if age is None or age > _LATEST_FRAME_STALE_THRESHOLD_S:
+        return None
+    payload = coerce_jsonb(perception.get("snapshot"))
+    if not payload:
+        return None
+    values = extract_detection_confidences(payload)
+    return compute_detection_confidence_stats(values)
 
 
 # ---------------------------------------------------------------------------
@@ -548,6 +616,114 @@ def _evaluate_default_geometry(facts: _Facts) -> _RuleOutput:
     )
 
 
+def _evaluate_unstable_detection_confidence(facts: _Facts) -> _RuleOutput:
+    """The model is producing weak or unstable detections on the latest frame.
+
+    M2's first production-CV signal that talks about detection quality rather
+    than workflow plumbing or scene visibility. Per-frame, within-window stats
+    over ``snapshot.objects[].confidence`` -- avg, low_confidence_ratio,
+    stddev. A frame with 10 detections at mean confidence 0.25 is a real
+    reliability concern even when the stream and lighting are healthy.
+
+    Brightness lookup happens during fact gathering (see
+    ``_maybe_compute_confidence_stats``) so the rule stays a pure function.
+    The fact gatherer skips the compute on stale snapshots, so the
+    precondition here just checks "did we get stats".
+
+    Trigger (any one):
+        avg_confidence    <  _AVG_CONFIDENCE_WARNING_THRESHOLD
+        low_conf_ratio    >  _LOW_CONFIDENCE_RATIO_WARNING_THRESHOLD
+        stddev            >  _CONFIDENCE_STDDEV_WARNING_THRESHOLD
+
+    Resolve (all of):
+        avg_confidence    >= threshold
+        low_conf_ratio    <= threshold
+        stddev            <= threshold
+
+    Skip (no finding either way):
+        stats is None -- no perception snapshot, stale, too few samples, or
+        no confidence values in the payload. Critically, "too few samples"
+        does NOT auto-resolve: a model that suddenly stops producing
+        detections shouldn't silently close an open unstable-confidence
+        finding from when it WAS producing them.
+
+    Co-exists with scene_too_dark by design: a dark frame and weak detections
+    are two different signals worth surfacing. The dashboard ranks by
+    severity, so warnings stack in top_findings cleanly.
+
+    Previous-window drop comparison is M3: ``latest_perception_snapshots``
+    is UPSERT-keyed on camera_id (one row per camera, no history), so we
+    have no baseline to compare against today. Evidence reserves
+    ``previous_avg_confidence`` and ``drop_ratio`` as null so the contract
+    is stable when M3 wires history.
+    """
+    stats = facts.detection_confidence_stats
+    perception = facts.latest_perception_snapshot
+    if stats is None or perception is None:
+        return None
+
+    healthy = (
+        stats.avg_confidence >= AVG_CONFIDENCE_WARNING_THRESHOLD
+        and stats.low_confidence_ratio <= LOW_CONFIDENCE_RATIO_WARNING_THRESHOLD
+        and stats.confidence_stddev <= CONFIDENCE_STDDEV_WARNING_THRESHOLD
+    )
+    if healthy:
+        return _RuleResolved(reason="detection_confidence_stabilized")
+
+    captured_at = perception.get("observed_at")
+    evidence: dict[str, Any] = {
+        "window_seconds": RECENT_WINDOW_SECONDS,
+        # observation_count is reserved for an M3 over-time slice that pulls
+        # from per-event observations; today's source is one perception row.
+        "observation_count": None,
+        "confidence_sample_count": stats.sample_count,
+        "avg_confidence": round(stats.avg_confidence, 3),
+        "median_confidence": round(stats.median_confidence, 3),
+        "min_confidence": round(stats.min_confidence, 3),
+        "max_confidence": round(stats.max_confidence, 3),
+        "low_confidence_ratio": round(stats.low_confidence_ratio, 3),
+        "confidence_stddev": round(stats.confidence_stddev, 3),
+        # M3 will fill these when a baseline window is available. The keys
+        # stay in the schema so dashboards can render the same layout.
+        "previous_avg_confidence": None,
+        "drop_ratio": None,
+        "thresholds": {
+            "min_sample_count": MIN_SAMPLE_COUNT,
+            "low_confidence_threshold": LOW_CONFIDENCE_THRESHOLD,
+            "avg_confidence_warning_threshold": AVG_CONFIDENCE_WARNING_THRESHOLD,
+            "low_confidence_ratio_warning_threshold": (LOW_CONFIDENCE_RATIO_WARNING_THRESHOLD),
+            "confidence_stddev_warning_threshold": (CONFIDENCE_STDDEV_WARNING_THRESHOLD),
+            "confidence_drop_ratio_warning_threshold": (CONFIDENCE_DROP_RATIO_WARNING_THRESHOLD),
+        },
+        "snapshot_id": str(perception["id"]) if perception.get("id") else None,
+        "captured_at": (
+            captured_at.isoformat() if isinstance(captured_at, datetime) else captured_at
+        ),
+        "source": "latest_perception_snapshot",
+    }
+
+    return _RuleOpen(
+        finding_type="unstable_detection_confidence",
+        category="detection",
+        severity="warning",
+        title="Detection confidence is unstable",
+        message=(
+            "Recent detections on this camera have low or unstable confidence, "
+            "which may lead to missed events, false positives, or unstable "
+            "tracking."
+        ),
+        likely_cause="weak_or_unstable_model_confidence",
+        recommended_action=(
+            "Review recent frames for lighting, angle, occlusion, or "
+            "background clutter. Consider adjusting the confidence threshold, "
+            "using a different package, or collecting more examples for this "
+            "camera."
+        ),
+        evidence=evidence,
+        stream_session_id=perception.get("stream_session_id"),
+    )
+
+
 # Rule ordering doesn't affect correctness but matters for tests: the
 # summary's `top_findings` already re-orders by severity, so this list is
 # effectively rule-declaration order.
@@ -556,6 +732,7 @@ _RULES: tuple[tuple[str, Any], ...] = (
     (_DEDUPE_FRAME_STALE, _evaluate_latest_frame_stale),
     (_DEDUPE_SCENE_DARK, _evaluate_scene_too_dark),
     (_DEDUPE_DEFAULT_GEOMETRY, _evaluate_default_geometry),
+    (_DEDUPE_DETECTION_CONFIDENCE, _evaluate_unstable_detection_confidence),
 )
 
 
