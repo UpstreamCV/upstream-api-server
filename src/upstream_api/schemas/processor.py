@@ -159,6 +159,39 @@ class ProcessorStatusResponse(BaseModel):
     updated_at: datetime
 
 
+class ProcessorStatusRecord(BaseModel):
+    """One ``processor_statuses`` row, shaped for a read response (P6-D).
+
+    The full row (including ``payload``, ``fps_*``, ``error_*``, ``last_*``)
+    so dashboards / verification scripts can read the ``payload.applied_geometry``
+    lineage block stamped by the P6-C analytics worker. Distinct from
+    ``ProcessorStatusResponse`` — that is the write-ack shape and intentionally
+    omits the payload. ``account_id`` is intentionally omitted here too — the
+    caller is already account-scoped.
+    """
+
+    id: UUID
+    camera_id: UUID
+    stream_session_id: UUID
+    processor_id: str
+    runtime: str
+    package_id: str
+    status: ProcessorStatusValue
+    fps_input: float | None
+    fps_processed: float | None
+    last_frame_at: datetime | None
+    last_observation_at: datetime | None
+    error_code: str | None
+    error_message: str | None
+    payload: dict[str, Any]
+    created_at: datetime
+    updated_at: datetime
+
+
+class LatestProcessorStatusResponse(BaseModel):
+    status: ProcessorStatusRecord
+
+
 class ProcessorObservationRequest(BaseModel):
     stream_session_id: UUID
     type: ProcessorObservationType

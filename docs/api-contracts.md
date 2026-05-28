@@ -815,6 +815,61 @@ Response 200: `{ "snapshot": PerceptionSnapshotRecord }` where `PerceptionSnapsh
 
 Errors: `camera_not_found` (404 — unknown camera or a camera in another account); `perception_snapshot_not_found` (404 — the processor has not posted a snapshot for this camera yet; mirrors `latest-frame`'s missing-resource convention).
 
+### `GET /v1/cameras/{camera_id}/processor-status/latest`
+
+P6-D. The latest **processor status** row for one camera — the full
+``processor_statuses`` record including the ``payload`` JSONB where the P6-C
+analytics worker stamps the ``applied_geometry`` lineage block. The read
+counterpart that lets a dashboard chip or verification script confirm the
+processor actually picked up the operator's saved geometry on its current
+session, rather than falling back to probe defaults.
+
+Query: `account_id`, optional `stream_session_id` (narrow to a specific run
+when multiple processor restarts have stamped multiple rows for the same
+camera — common in dev/verification because the supervisor bounds DeepStream
+runs by a probe-timeout and cycles fresh workers).
+
+Response 200: `{ "status": ProcessorStatusRecord }` where `ProcessorStatusRecord` is:
+```json
+{
+  "id": "uuid",
+  "camera_id": "uuid",
+  "stream_session_id": "uuid",
+  "processor_id": "proc-1",
+  "runtime": "deepstream",
+  "package_id": "deepstream.analytics_probe.v0",
+  "status": "processing",
+  "fps_input": 30.0,
+  "fps_processed": 29.8,
+  "last_frame_at": "2026-05-27T15:30:10Z",
+  "last_observation_at": "2026-05-27T15:30:11Z",
+  "error_code": null,
+  "error_message": null,
+  "payload": {
+    "applied_geometry": {
+      "source": "operator_saved",
+      "revision": 9,
+      "line_count": 2,
+      "roi_count": 1
+    }
+  },
+  "created_at": "2026-05-27T15:24:59Z",
+  "updated_at": "2026-05-27T15:30:11Z"
+}
+```
+
+The contract for ``payload.applied_geometry``:
+- ``source`` ∈ ``{"operator_saved", "default", "fallback_default_on_error"}`` — what the processor actually applied.
+- ``revision`` matches the dashboard-saved revision when ``source = operator_saved``; ``null`` for ``default`` (no operator save yet); the operator's revision is preserved for ``fallback_default_on_error`` so a bad save can be correlated.
+- ``line_count`` / ``roi_count`` are the counts of enabled lines/ROIs the runtime is actually running with (probe-default contributes 1/1 on the ``default`` path).
+- ``error_reason`` (optional) is set only when ``source = fallback_default_on_error``.
+
+When operator-saved geometry parses but is invalid (e.g. all-disabled, wrong coordinate space), the processor degrades to the probe default and stamps ``error_code = "geometry_invalid"`` at the row level (alongside the ``fallback_default_on_error`` source). The camera stays up — the supervisor would otherwise thrash on a persistently-bad save.
+
+`account_id` is not echoed (caller is already account-scoped). `payload` is returned as stored (opaque JSON — the server does not deep-validate its shape).
+
+Errors: `camera_not_found` (404); `processor_status_not_found` (404 — no row matches; processor has never reported for this camera, or no row matches the supplied ``stream_session_id``).
+
 ### `GET /v1/cameras/{camera_id}/geometry-config`
 
 P6-A. The dashboard-authored ROI/line **geometry config** for one camera —

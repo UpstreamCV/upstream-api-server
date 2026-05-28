@@ -139,6 +139,27 @@ returning id, camera_id, stream_session_id, processor_id, package_id,
           snapshot, observed_at, updated_at
 """
 
+# P6-D read path for the latest processor_statuses row for a camera.
+# Double-scoped by account_id AND camera_id; the optional stream_session_id
+# narrows to a specific run (useful when multiple processor restarts have
+# stamped multiple rows for the same camera — common in dev/verification).
+# Ordering by updated_at desc + limit 1 picks the freshest row. The
+# (processor_id, stream_session_id) unique key on the table means at most
+# one row per (processor, session), so the narrow case returns the live row
+# for that session directly.
+_LATEST_PROCESSOR_STATUS_SQL = """
+select
+    id, camera_id, stream_session_id, processor_id, runtime, package_id,
+    status, fps_input, fps_processed, last_frame_at, last_observation_at,
+    error_code, error_message, payload, created_at, updated_at
+  from processor_statuses
+ where account_id = $1
+   and camera_id = $2
+   and ($3::uuid is null or stream_session_id = $3)
+ order by updated_at desc
+ limit 1
+"""
+
 # P5-C read path. Double-scoped by account_id AND camera_id — defense in
 # depth on top of the router's separate camera-ownership check. account_id
 # is NOT selected onto the response.
@@ -248,6 +269,22 @@ async def upsert_perception_snapshot(
     )
     assert row is not None  # INSERT ... RETURNING always yields a row.
     return dict(row)
+
+
+async def fetch_latest_processor_status(
+    conn: asyncpg.Connection,
+    *,
+    account_id: UUID,
+    camera_id: UUID,
+    stream_session_id: UUID | None,
+) -> dict[str, Any] | None:
+    row = await conn.fetchrow(
+        _LATEST_PROCESSOR_STATUS_SQL,
+        account_id,
+        camera_id,
+        stream_session_id,
+    )
+    return dict(row) if row is not None else None
 
 
 async def fetch_latest_perception_snapshot(
