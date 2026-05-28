@@ -55,6 +55,7 @@ select
     gc.config           as gc_config
   from stream_sessions ss
   join cameras c on c.id = ss.camera_id
+  join accounts a on a.id = ss.account_id
   join lateral (
          select passed, observed, expected, mismatch_fields, created_at
            from stream_validations
@@ -66,6 +67,12 @@ select
  where ss.state = 'streaming'
    and ss.expires_at > now()
    and v.passed = true
+   -- M3 account-level processing master switch. Absent key = treated as
+   -- true so every existing account continues to be processed exactly as
+   -- before. Operators flip ``processing_enabled=false`` via the dashboard
+   -- toggle (PATCH /v1/processing-config) to pause GPU work without taking
+   -- down streams.
+   and coalesce((a.metadata->>'processing_enabled')::boolean, true) = true
  order by ss.started_at desc nulls last
  limit $1
 """

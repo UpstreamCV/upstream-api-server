@@ -46,6 +46,11 @@ class _Candidate:
     # P6-A: the LEFT JOIN onto camera_geometry_configs. None = no saved row.
     geometry_revision: int | None = None
     geometry_config: dict[str, Any] | None = None
+    # M3: account-level processing master switch. ``None`` matches the
+    # production default (key absent in ``accounts.metadata`` -> coalesce
+    # to true). Explicit ``False`` drops the candidate, mirroring the new
+    # ``and coalesce(...) = true`` predicate in the SQL.
+    account_processing_enabled: bool | None = None
 
     def is_eligible(self) -> bool:
         if self.state != "streaming":
@@ -53,6 +58,8 @@ class _Candidate:
         if self.expires_in <= timedelta(0):  # expires_at > now()
             return False
         if not self.validations:  # inner lateral join drops it
+            return False
+        if self.account_processing_enabled is False:  # M3 master switch
             return False
         return self.validations[0] is True  # latest validation only
 
@@ -324,6 +331,21 @@ def test_mixed_set_returns_only_eligible() -> None:
     assert len(r.json()["sessions"]) == 2
 
 
+def test_account_processing_disabled_drops_session() -> None:
+    """M3 master switch off -> the SQL's ``coalesce(... 'processing_enabled' ...)``
+    predicate filters the row out. The dashboard toggle's only mechanism."""
+    conn = FakeEligibleConn(
+        [
+            _Candidate("streaming", _FUTURE, [True], account_processing_enabled=False),
+            _Candidate("streaming", _FUTURE, [True], account_processing_enabled=True),
+            _Candidate("streaming", _FUTURE, [True]),  # absent key = default true
+        ]
+    )
+    r = _client(conn).get("/v1/internal/processor/eligible-sessions", headers=_headers())
+    # Only the two sessions whose account flag is not False survive.
+    assert len(r.json()["sessions"]) == 2
+
+
 # ---------------------------------------------------------------------------
 # Eligibility response shaping + safe-field guarantees.
 # ---------------------------------------------------------------------------
@@ -417,6 +439,13 @@ def test_production_eligibility_sql_pins_every_predicate() -> None:
     assert "left join camera_geometry_configs gc on gc.camera_id = ss.camera_id" in sql
     # The SRT publish URL must never be selected onto a processor surface.
     assert "srt_url" not in sql
+    # M3: account-level processing master switch. Absent key (NULL JSONB
+    # path) coalesces to true, so existing accounts keep being processed.
+    # Explicit ``false`` drops every session under the account from the
+    # eligible list -- that's how the dashboard's "Processing: Off" toggle
+    # takes effect within one poll cycle without restarting any service.
+    assert "join accounts a on a.id = ss.account_id" in sql
+    assert "coalesce((a.metadata->>'processing_enabled')::boolean, true) = true" in sql
 
 
 # ---------------------------------------------------------------------------

@@ -61,6 +61,7 @@ from upstream_api.services.detection_confidence import (
     extract_detection_confidences,
 )
 from upstream_api.services.image_analysis import ImageBrightness
+from upstream_api.services.processing_config import get_processing_config
 from upstream_api.services.processor import (
     coerce_jsonb,
     fetch_latest_perception_snapshot,
@@ -79,7 +80,9 @@ from upstream_api.services.reliability_repo import (
 #   v0.3 -- M2 ships unstable_detection_confidence
 #   v0.4 -- M2.1 tightens _is_session_live (expires_at + ended_at) and
 #           rewords stream_valid_processor_silent away from "stream is live"
-DETECTOR_VERSION = "reliability.v0.4"
+#   v0.5 -- M3 account-level processing master switch (processing_enabled);
+#           three rules short-circuit/resolve when the master switch is off
+DETECTOR_VERSION = "reliability.v0.5"
 
 # Thresholds. Single source of truth for both the rule and the tests. Numbers
 # are intentionally conservative — better to flag a healthy session than to
@@ -168,6 +171,13 @@ class _Facts:
     # confidences in the payload.
     latest_perception_snapshot: dict[str, Any] | None = None
     detection_confidence_stats: DetectionConfidenceStats | None = None
+    # M3: account-level processing master switch. When ``False``, the
+    # processor is intentionally not consuming this account's sessions, so
+    # rules that depend on processor output (silent / dark / confidence)
+    # would otherwise misfire as "processor silent" within seconds of the
+    # operator flipping it off. Each such rule short-circuits or resolves
+    # when this is False with a dedicated reason.
+    account_processing_enabled: bool = True
 
 
 # Minimal column set — we never need the full row, and dragging the whole row
@@ -227,6 +237,12 @@ async def _gather_facts(
     perception_row = await fetch_latest_perception_snapshot(
         conn, account_id=account_id, camera_id=camera_id
     )
+    # M3: account-level processing master switch. ``None`` returned only
+    # when the account row is gone (which shouldn't happen mid-request --
+    # the caller is already account-scoped); default-true keeps the
+    # evaluator out of the way when something unexpected happens.
+    processing_cfg = await get_processing_config(conn, account_id=account_id)
+    account_processing_enabled = processing_cfg[0] if processing_cfg is not None else True
 
     snapshot = dict(snapshot_row) if snapshot_row is not None else None
     snapshot_brightness = await _maybe_load_brightness(
@@ -244,6 +260,7 @@ async def _gather_facts(
         snapshot_brightness=snapshot_brightness,
         latest_perception_snapshot=perception_row,
         detection_confidence_stats=confidence_stats,
+        account_processing_enabled=account_processing_enabled,
     )
 
 
@@ -397,6 +414,14 @@ def _evaluate_stream_valid_processor_silent(facts: _Facts) -> _RuleOutput:
     session row; ``processor_status.id`` is linked if a status row exists so
     operators can trace which run was silent.
     """
+    # M3: when the account's processing master switch is off, the processor
+    # intentionally isn't consuming this session -- so "processor silent"
+    # is the expected state, not a critical condition. Resolve any
+    # previously-open finding so the dashboard reflects the operator's
+    # explicit choice rather than a stuck red banner.
+    if not facts.account_processing_enabled:
+        return _RuleResolved(reason="processing_disabled_for_account")
+
     session = facts.latest_session
     snapshot = facts.latest_snapshot
     snapshot_age = _age_seconds(facts.now, snapshot["captured_at"]) if snapshot else None
@@ -530,6 +555,12 @@ def _evaluate_scene_too_dark(facts: _Facts) -> _RuleOutput:
     brightness = facts.snapshot_brightness
     snapshot = facts.latest_snapshot
     session = facts.latest_session
+
+    # M3: processing master switch off -> resolve, same posture as the
+    # silent rule. The operator turned processing off, so we shouldn't be
+    # warning about scene quality on a camera they intentionally idled.
+    if not facts.account_processing_enabled:
+        return _RuleResolved(reason="processing_disabled_for_account")
 
     # When the workflow is no longer current, any previously-open dark-scene
     # finding describes a past frame and is no longer actionable. Resolve so
@@ -709,6 +740,12 @@ def _evaluate_unstable_detection_confidence(facts: _Facts) -> _RuleOutput:
     """
     stats = facts.detection_confidence_stats
     perception = facts.latest_perception_snapshot
+
+    # M3: processing master switch off -> resolve. Same posture as the
+    # silent and dark rules. We're not going to claim model confidence
+    # is unstable when processing is intentionally paused.
+    if not facts.account_processing_enabled:
+        return _RuleResolved(reason="processing_disabled_for_account")
 
     # When the workflow is no longer current, any previously-open
     # confidence finding describes a past run. Resolve it so the

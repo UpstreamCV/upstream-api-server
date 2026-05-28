@@ -62,6 +62,10 @@ class FakeEvalConn:
         # extractor end-to-end rather than monkeypatching it, so the fake
         # just needs to return the row.
         perception: dict[str, Any] | None = None,
+        # M3: account row's metadata used to derive processing_enabled.
+        # ``None`` -> the fake returns no account row, the evaluator
+        # defaults to processing_enabled=True (existing behavior).
+        account_metadata: dict[str, Any] | None = None,
         preopen_finding_ids: dict[str, UUID] | None = None,
     ) -> None:
         self.session = session
@@ -70,6 +74,7 @@ class FakeEvalConn:
         self.processor_status = processor_status
         self.has_saved_geometry = has_saved_geometry
         self.perception = perception
+        self.account_metadata = account_metadata
         # preopen_finding_ids maps dedupe_key -> UUID of a row that pretends to
         # already be open. Lets us pin "re-open refreshes instead of inserts".
         self.preopen_finding_ids = preopen_finding_ids or {}
@@ -94,6 +99,14 @@ class FakeEvalConn:
             return self.processor_status
         if "from latest_perception_snapshots" in query:
             return self.perception
+        if "select metadata, updated_at from accounts" in query:
+            # Account flag read for M3. ``None`` is the default-true path.
+            if self.account_metadata is None:
+                return None
+            return {
+                "metadata": json.dumps(self.account_metadata),
+                "updated_at": datetime.now(tz=UTC),
+            }
         if "from reliability_findings" in query and "for update" in query:
             dedupe_key = args[2]
             existing = self.preopen_finding_ids.get(dedupe_key)
@@ -919,8 +932,9 @@ def test_detector_version_pins_to_current_milestone() -> None:
     so historical rows stay attributable. v0.1 was M0 plumbing, v0.2 added
     M1 brightness for real, v0.3 added M2 unstable_detection_confidence,
     v0.4 tightened _is_session_live + reworded stream_valid_processor_silent
-    away from misleading 'stream is live' language."""
-    assert DETECTOR_VERSION == "reliability.v0.4"
+    away from misleading 'stream is live' language, v0.5 adds the M3
+    account-level processing master switch + three-rule short-circuit."""
+    assert DETECTOR_VERSION == "reliability.v0.5"
 
 
 # ---------------------------------------------------------------------------
@@ -1247,3 +1261,123 @@ def test_unstable_confidence_resolves_when_session_no_longer_live() -> None:
     assert any(
         key in r["dedupe_keys"] and r["reason"] == "stream_no_longer_live" for r in conn.resolves
     )
+
+
+# ---------------------------------------------------------------------------
+# M3 account-level processing master switch -- three-rule short-circuit.
+# ---------------------------------------------------------------------------
+
+
+def test_silent_rule_resolves_when_account_processing_disabled() -> None:
+    """Master switch off + would-otherwise-fire silent condition (stream
+    live, processor stale, no recent observations) -> resolve, not open.
+    The operator paused processing on purpose; a critical card claiming
+    otherwise would be confusing."""
+    account, camera = uuid4(), uuid4()
+    conn = FakeEvalConn(
+        session=_session(state="streaming"),
+        snapshot=_snapshot(age_seconds=5),
+        observation_at=None,
+        processor_status=_processor_status(age_seconds=600),
+        account_metadata={"processing_enabled": False},
+    )
+    _run(conn, account, camera)
+    silent_key = f"camera:{camera}:stream:stream_valid_processor_silent"
+    assert all(u["dedupe_key"] != silent_key for u in conn.upserts)
+    assert any(
+        silent_key in r["dedupe_keys"] and r["reason"] == "processing_disabled_for_account"
+        for r in conn.resolves
+    )
+
+
+def test_silent_rule_fires_normally_when_account_processing_enabled() -> None:
+    """Sanity: explicit ``true`` doesn't break the existing trigger path."""
+    account, camera = uuid4(), uuid4()
+    conn = FakeEvalConn(
+        session=_session(state="streaming"),
+        snapshot=_snapshot(age_seconds=5),
+        observation_at=None,
+        processor_status=_processor_status(age_seconds=600),
+        account_metadata={"processing_enabled": True},
+    )
+    _run(conn, account, camera)
+    silent_key = f"camera:{camera}:stream:stream_valid_processor_silent"
+    assert any(u["dedupe_key"] == silent_key for u in conn.upserts)
+
+
+def test_dark_rule_resolves_when_account_processing_disabled(
+    monkeypatch: Any,
+) -> None:
+    """Same posture for the M1 brightness rule. Operator turned processing
+    off -> we shouldn't be warning about scene quality on what's now an
+    intentionally-idle camera."""
+    account, camera = uuid4(), uuid4()
+    _install_brightness(monkeypatch, ImageBrightness(mean=5.0, width=1, height=1))
+    conn = FakeEvalConn(
+        session=_session(state="streaming"),
+        snapshot=_snapshot(age_seconds=5, storage_key="acct/cam/d/k.jpg"),
+        observation_at=datetime.now(tz=UTC) - timedelta(seconds=5),
+        processor_status=_processor_status(age_seconds=5),
+        account_metadata={"processing_enabled": False},
+    )
+    _run(conn, account, camera)
+    dark_key = f"camera:{camera}:scene_quality:scene_too_dark_for_reliable_detection"
+    assert all(u["dedupe_key"] != dark_key for u in conn.upserts)
+    assert any(
+        dark_key in r["dedupe_keys"] and r["reason"] == "processing_disabled_for_account"
+        for r in conn.resolves
+    )
+
+
+def test_confidence_rule_resolves_when_account_processing_disabled() -> None:
+    """Same posture for the M2 confidence rule. No claims about model
+    detection quality when the model isn't running on purpose."""
+    account, camera = uuid4(), uuid4()
+    conn = FakeEvalConn(
+        session=_session(state="streaming"),
+        snapshot=_snapshot(age_seconds=5),
+        observation_at=datetime.now(tz=UTC) - timedelta(seconds=5),
+        processor_status=_processor_status(age_seconds=5),
+        perception=_perception(
+            confidences=[0.20, 0.25, 0.30, 0.22, 0.28, 0.24, 0.21, 0.26],
+        ),
+        account_metadata={"processing_enabled": False},
+    )
+    _run(conn, account, camera)
+    conf_key = f"camera:{camera}:detection:unstable_detection_confidence"
+    assert all(u["dedupe_key"] != conf_key for u in conn.upserts)
+    assert any(
+        conf_key in r["dedupe_keys"] and r["reason"] == "processing_disabled_for_account"
+        for r in conn.resolves
+    )
+
+
+def test_master_switch_off_resolves_all_three_rules_at_once() -> None:
+    """Flipping the dashboard toggle off should clear stuck findings across
+    every M0/M1/M2 rule on the next read. Pin the multi-rule sweep so
+    operators see an immediate, consistent dashboard state change rather
+    than one rule resolving and the rest hanging on."""
+    account, camera = uuid4(), uuid4()
+    conn = FakeEvalConn(
+        session=_session(state="streaming"),
+        snapshot=_snapshot(age_seconds=5),
+        observation_at=None,
+        processor_status=_processor_status(age_seconds=600),
+        perception=_perception(
+            confidences=[0.20, 0.25, 0.30, 0.22, 0.28, 0.24, 0.21, 0.26],
+        ),
+        account_metadata={"processing_enabled": False},
+    )
+    _run(conn, account, camera)
+    silent_key = f"camera:{camera}:stream:stream_valid_processor_silent"
+    dark_key = f"camera:{camera}:scene_quality:scene_too_dark_for_reliable_detection"
+    conf_key = f"camera:{camera}:detection:unstable_detection_confidence"
+    resolved_keys: set[str] = set()
+    for r in conn.resolves:
+        if r["reason"] == "processing_disabled_for_account":
+            resolved_keys.update(r["dedupe_keys"])
+    # All three reliability rules that depend on processor output must
+    # short-circuit under the same reason in one read.
+    assert silent_key in resolved_keys
+    assert dark_key in resolved_keys
+    assert conf_key in resolved_keys
