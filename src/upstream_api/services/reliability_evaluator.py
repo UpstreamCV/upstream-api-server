@@ -529,6 +529,16 @@ def _evaluate_scene_too_dark(facts: _Facts) -> _RuleOutput:
     """
     brightness = facts.snapshot_brightness
     snapshot = facts.latest_snapshot
+    session = facts.latest_session
+
+    # When the workflow is no longer current, any previously-open dark-scene
+    # finding describes a past frame and is no longer actionable. Resolve so
+    # the dashboard doesn't show "scene too dark" on a camera the operator
+    # has stopped streaming. ``resolve_open_findings`` is a no-op when no
+    # open row matches, so this is safe.
+    if not _is_session_live(session, now=facts.now):
+        return _RuleResolved(reason="stream_no_longer_live")
+
     if brightness is None or snapshot is None:
         return None
 
@@ -699,6 +709,14 @@ def _evaluate_unstable_detection_confidence(facts: _Facts) -> _RuleOutput:
     """
     stats = facts.detection_confidence_stats
     perception = facts.latest_perception_snapshot
+
+    # When the workflow is no longer current, any previously-open
+    # confidence finding describes a past run. Resolve it so the
+    # dashboard doesn't show "detection confidence is unstable" on a
+    # camera that has stopped streaming. Same posture as scene_too_dark.
+    if not _is_session_live(facts.latest_session, now=facts.now):
+        return _RuleResolved(reason="stream_no_longer_live")
+
     if stats is None or perception is None:
         return None
 
