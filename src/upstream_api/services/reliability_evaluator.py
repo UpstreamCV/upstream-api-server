@@ -1,33 +1,30 @@
-"""Reliability findings — rule-based evaluator.
+"""Reliability findings -- rule-based evaluator.
 
 One entry point, ``evaluate_camera``. It pulls a small set of facts the
 api-server already persists (latest stream session, latest processor status,
-latest snapshot timestamp, latest observation), runs each rule, and
-upserts/resolves findings via services/reliability_repo. Heavy lifting (image
-decoding, model inference) is explicitly out of scope here — that's M1+.
+latest snapshot timestamp + image bytes, latest observation), runs each rule,
+and upserts/resolves findings via services/reliability_repo.
 
-Three rules ship for real in this slice:
+Four rules ship today:
 
-- ``stream_valid_processor_silent``  (critical) — stream appears live but the
+- ``stream_valid_processor_silent``  (critical) -- stream appears live but the
   processor isn't producing observations.
-- ``latest_frame_stale``             (warning)  — the snapshot pipeline has
+- ``latest_frame_stale``             (warning)  -- the snapshot pipeline has
   fallen behind.
-- ``processor_using_default_geometry`` (info | warning) — the processor never
+- ``processor_using_default_geometry`` (info | warning) -- the processor never
   picked up operator-saved geometry, or fell back from it on error.
-
-One rule is stubbed:
-
-- ``scene_too_dark_for_reliable_detection`` (warning) — brightness eval is
-  deferred (see ``_evaluate_scene_too_dark`` for the explicit TODO). The
-  finding_type and dedupe_key are reserved so M1 can ship without an API or
-  dashboard contract change.
+- ``scene_too_dark_for_reliable_detection`` (warning, M1) -- mean grayscale
+  brightness of the latest frame is below ``_BRIGHTNESS_THRESHOLD``. First
+  rule on the platform that talks about scene quality rather than workflow
+  plumbing. Brightness lookup happens during fact gathering through
+  ``services/snapshot_brightness`` (cached) so the rule stays a pure function.
 
 Each rule returns one of:
 
-- ``_RuleOpen(...)``      — open or refresh a finding (drives an upsert)
-- ``_RuleResolved()``     — preconditions met but no problem; resolve any
-  existing open finding under this dedupe_key
-- ``None``                — insufficient data; do nothing (neither open nor
+- ``_RuleOpen(...)``      -- open or refresh a finding (drives an upsert)
+- ``_RuleResolved(reason=...)`` -- preconditions met but no problem; resolve any
+  existing open finding under this dedupe_key with the given reason
+- ``None``                -- insufficient data; do nothing (neither open nor
   resolve). This is how "we don't know yet" stays distinct from "healthy".
 """
 
@@ -41,6 +38,9 @@ from uuid import UUID
 
 import asyncpg
 
+from upstream_api.config import Settings
+from upstream_api.services import snapshot_brightness as snapshot_brightness_module
+from upstream_api.services.image_analysis import ImageBrightness
 from upstream_api.services.processor import (
     coerce_jsonb,
     fetch_latest_processor_status,
@@ -52,18 +52,24 @@ from upstream_api.services.reliability_repo import (
 
 # Bump when a rule's trigger logic or thresholds change. Stamped on every
 # finding row so historical entries stay attributable to the version of the
-# detector that wrote them.
-DETECTOR_VERSION = "reliability.v0.1"
+# detector that wrote them. M1 bumps to v0.2 with the brightness rule shipping
+# for real (was reserved/no-op in v0.1).
+DETECTOR_VERSION = "reliability.v0.2"
 
 # Thresholds. Single source of truth for both the rule and the tests. Numbers
-# are intentionally conservative for an M0 slice — better to flag a healthy
-# session than to silently miss a broken one. Tune in M1 with real telemetry.
+# are intentionally conservative — better to flag a healthy session than to
+# silently miss a broken one. Tune later with real telemetry.
 _LATEST_FRAME_STALE_THRESHOLD_S = 60
 _PROCESSOR_STATUS_STALE_THRESHOLD_S = 60
 _OBSERVATION_STALE_THRESHOLD_S = 90
 # How recently the stream / processor must have ticked for an "unknown" verdict
 # to flip into "healthy" instead. Aligns with the summary endpoint's contract.
 _UNKNOWN_DATA_WINDOW_S = 300
+
+# Mean grayscale brightness below which a scene is "too dark for reliable
+# detection". 0..255 scale. Heuristic only -- not a model-accuracy claim.
+# Picked below typical indoor / dusk lighting; tune with real telemetry in M2+.
+_BRIGHTNESS_THRESHOLD = 45
 
 # Dedupe keys are the persistent identity of a finding under one
 # (camera, finding_type) — kept as constants so the evaluator and the repo
@@ -99,7 +105,12 @@ class _RuleOpen:
 
 @dataclass(frozen=True)
 class _RuleResolved:
-    pass
+    # Optional rule-specific resolve reason — stamped onto resolved_reason on
+    # the row so history records why a finding closed. Defaults to "healthy"
+    # for rules that don't have a more specific story to tell. The brightness
+    # rule uses "brightness_above_threshold" to distinguish the recovered case
+    # from a fact-shape change.
+    reason: str = "healthy"
 
 
 _RuleOutput = _RuleOpen | _RuleResolved | None
@@ -118,6 +129,11 @@ class _Facts:
     latest_snapshot: dict[str, Any] | None
     latest_observation_at: datetime | None
     has_saved_geometry: bool
+    # M1: brightness of the latest snapshot. Populated only when the snapshot
+    # is recent enough to be worth evaluating (see _gather_facts). ``None``
+    # means "skip the brightness rule" — either there's no snapshot, it's
+    # stale (the stale-frame rule owns that case), or the decode failed.
+    snapshot_brightness: ImageBrightness | None = None
 
 
 # Minimal column set — we never need the full row, and dragging the whole row
@@ -132,7 +148,7 @@ select id, state, created_at, started_at, ended_at, expires_at
 """
 
 _LATEST_SNAPSHOT_SQL = """
-select id, captured_at, created_at, session_id
+select id, captured_at, created_at, session_id, storage_key, width, height
   from snapshots
  where account_id = $1
    and camera_id  = $2
@@ -159,6 +175,7 @@ select 1
 async def _gather_facts(
     conn: asyncpg.Connection,
     *,
+    settings: Settings,
     account_id: UUID,
     camera_id: UUID,
     now: datetime,
@@ -174,13 +191,58 @@ async def _gather_facts(
     obs_row = await conn.fetchrow(_LATEST_OBSERVATION_AT_SQL, account_id, camera_id)
     geom_row = await conn.fetchrow(_SAVED_GEOMETRY_EXISTS_SQL, account_id, camera_id)
 
+    snapshot = dict(snapshot_row) if snapshot_row is not None else None
+    snapshot_brightness = await _maybe_load_brightness(
+        settings=settings, snapshot=snapshot, now=now
+    )
+
     return _Facts(
         now=now,
         latest_session=dict(session_row) if session_row is not None else None,
         latest_processor_status=status_row,
-        latest_snapshot=dict(snapshot_row) if snapshot_row is not None else None,
+        latest_snapshot=snapshot,
         latest_observation_at=(obs_row["observed_at"] if obs_row is not None else None),
         has_saved_geometry=geom_row is not None,
+        snapshot_brightness=snapshot_brightness,
+    )
+
+
+async def _maybe_load_brightness(
+    *,
+    settings: Settings,
+    snapshot: dict[str, Any] | None,
+    now: datetime,
+) -> ImageBrightness | None:
+    """Load brightness only when it's worth paying for.
+
+    Skip when:
+      - there is no snapshot
+      - the snapshot is older than the stale-frame threshold (the stale-frame
+        rule already owns that case; warning about darkness on a stale image
+        would be lying about current scene state)
+      - the snapshot row is missing ``storage_key`` (defensive — shouldn't
+        happen in prod, but tests using minimal row stubs may omit it)
+
+    Otherwise the cached brightness loader runs and returns either a fresh
+    reading or ``None`` (download / decode failure). The caller stamps the
+    result on ``_Facts``; the rule does the comparison.
+    """
+    if snapshot is None:
+        return None
+    storage_key = snapshot.get("storage_key")
+    if not storage_key:
+        return None
+    captured_at = snapshot.get("captured_at")
+    age = _age_seconds(now, captured_at)
+    if age is None or age > _LATEST_FRAME_STALE_THRESHOLD_S:
+        return None
+    snapshot_id = snapshot.get("id")
+    if snapshot_id is None:
+        return None
+    return await snapshot_brightness_module.get_brightness_for_snapshot(
+        settings=settings,
+        snapshot_id=snapshot_id,
+        storage_key=storage_key,
     )
 
 
@@ -335,17 +397,66 @@ def _evaluate_latest_frame_stale(facts: _Facts) -> _RuleOutput:
 
 
 def _evaluate_scene_too_dark(facts: _Facts) -> _RuleOutput:
-    """Reserved finding type — brightness compute is deferred to M1.
+    """Mean grayscale brightness of the latest snapshot is below threshold.
 
-    TODO(reliability-m1): compute brightness from the latest frame image.
-    Requires adding Pillow + a Supabase Storage download helper to
-    services/storage.py and weighing the hot-path cost of an extra JPEG
-    fetch per summary read. The finding_type and dedupe_key are reserved
-    here so M1 can ship without an API or dashboard contract change — the
-    Pydantic schema already lists ``scene_quality`` in the category union.
+    This is the first **production CV** signal on the platform — every other
+    rule today talks about workflow plumbing (stream / processor / geometry).
+    A dark scene is a heuristic warning that detection confidence may be
+    unreliable, regardless of whether the rest of the stack is healthy.
+
+    Brightness lookup happens during fact gathering (see
+    ``_maybe_load_brightness``) so the rule itself stays a pure function. The
+    fact gatherer skips the brightness load entirely when the snapshot is
+    stale, so the precondition here just checks "did we get a reading".
+
+    Trigger:
+        snapshot_brightness.mean < _BRIGHTNESS_THRESHOLD
+
+    Resolve:
+        snapshot_brightness.mean >= _BRIGHTNESS_THRESHOLD
+
+    Skip (no finding either way):
+        snapshot_brightness is None — no snapshot, stale, or decode failed.
+        We don't lie about a dark scene from data we don't have.
     """
-    _ = facts  # facts intentionally unused while the rule is stubbed.
-    return None
+    brightness = facts.snapshot_brightness
+    snapshot = facts.latest_snapshot
+    if brightness is None or snapshot is None:
+        return None
+
+    if brightness.mean >= _BRIGHTNESS_THRESHOLD:
+        return _RuleResolved(reason="brightness_above_threshold")
+
+    return _RuleOpen(
+        finding_type="scene_too_dark_for_reliable_detection",
+        category="scene_quality",
+        severity="warning",
+        title="Scene may be too dark for reliable detection",
+        message=(
+            "This camera appears dark, which may reduce detection confidence "
+            "and make events less reliable."
+        ),
+        likely_cause="low_light",
+        recommended_action=(
+            "Improve lighting, move the camera, or test a low-light package for this camera."
+        ),
+        evidence={
+            # Round mean to one decimal — the precision in the underlying
+            # ImageStat mean is misleading for a 0-255 heuristic.
+            "brightness_mean": round(brightness.mean, 1),
+            "brightness_threshold": _BRIGHTNESS_THRESHOLD,
+            "snapshot_id": str(snapshot["id"]),
+            "captured_at": (
+                snapshot["captured_at"].isoformat()
+                if isinstance(snapshot["captured_at"], datetime)
+                else snapshot["captured_at"]
+            ),
+            "image_width": brightness.width,
+            "image_height": brightness.height,
+            "source": "latest_frame_snapshot",
+        },
+        stream_session_id=(snapshot.get("session_id") if isinstance(snapshot, dict) else None),
+    )
 
 
 # Map applied_geometry shape → (severity, title_suffix, evidence_subset). One
@@ -456,6 +567,7 @@ _RULES: tuple[tuple[str, Any], ...] = (
 async def evaluate_camera(
     conn: asyncpg.Connection,
     *,
+    settings: Settings,
     account_id: UUID,
     camera_id: UUID,
     now: datetime | None = None,
@@ -467,25 +579,33 @@ async def evaluate_camera(
     of truth (the table) for what the dashboard sees, even if a rule and a
     concurrent writer race.
 
-    Must be called inside a transaction so the upsert SELECT-FOR-UPDATE inside
-    ``upsert_open_finding`` holds its row lock until commit.
+    ``settings`` reaches the brightness loader through ``_gather_facts``; the
+    rules layer never touches it. Must be called inside a transaction so the
+    upsert SELECT-FOR-UPDATE inside ``upsert_open_finding`` holds its row lock
+    until commit.
     """
     evaluated_at = now or datetime.now(tz=UTC)
     facts = await _gather_facts(
         conn,
+        settings=settings,
         account_id=account_id,
         camera_id=camera_id,
         now=evaluated_at,
     )
 
-    resolve_keys: list[str] = []
+    # Group resolves by reason so each call carries a meaningful resolved_reason
+    # rather than a single bulk "healthy" stamp. Most rules default to "healthy"
+    # (workflow recovered); the brightness rule uses
+    # "brightness_above_threshold" so post-mortem history can tell the two
+    # apart without re-deriving from evidence.
+    resolves_by_reason: dict[str, list[str]] = {}
     for dedupe_suffix, rule in _RULES:
         verdict = rule(facts)
         if verdict is None:
             continue
         dedupe_key = _dedupe_key(camera_id, dedupe_suffix)
         if isinstance(verdict, _RuleResolved):
-            resolve_keys.append(dedupe_key)
+            resolves_by_reason.setdefault(verdict.reason, []).append(dedupe_key)
             continue
         await upsert_open_finding(
             conn,
@@ -505,13 +625,13 @@ async def evaluate_camera(
             processor_status_id=verdict.processor_status_id,
         )
 
-    if resolve_keys:
+    for reason, keys in resolves_by_reason.items():
         await resolve_open_findings(
             conn,
             account_id=account_id,
             camera_id=camera_id,
-            dedupe_keys=resolve_keys,
-            reason="healthy",
+            dedupe_keys=keys,
+            reason=reason,
         )
 
     return evaluated_at, facts

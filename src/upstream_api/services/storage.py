@@ -71,6 +71,40 @@ async def upload_bytes(
         raise
 
 
+async def download_bytes(
+    *,
+    settings: Settings,
+    bucket: str,
+    storage_key: str,
+) -> bytes:
+    """Download ``bucket/storage_key`` and return the raw object bytes.
+
+    Mirrors ``upload_bytes`` — sync supabase-py client wrapped in
+    ``asyncio.to_thread`` so a slow read doesn't block the event loop. Used
+    by the reliability brightness evaluator to read latest-frame snapshots.
+
+    Logs a non-secret structured warning on failure (``bucket`` and
+    ``storage_key`` already appear in upload logs) and re-raises so the
+    caller can decide between "skip the check" (reliability evaluator) and
+    "return 5xx" (would-be future callers). The brightness service treats
+    any exception as ``None`` so the summary endpoint never 500s.
+    """
+    client = _client_for(settings)
+    try:
+        return await asyncio.to_thread(
+            client.storage.from_(bucket).download,
+            storage_key,
+        )
+    except Exception as exc:
+        _logger.warning(
+            "storage_download_failed",
+            bucket=bucket,
+            storage_key=storage_key,
+            error=type(exc).__name__,
+        )
+        raise
+
+
 async def create_signed_url(
     *,
     settings: Settings,

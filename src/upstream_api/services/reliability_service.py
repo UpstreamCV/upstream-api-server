@@ -19,6 +19,7 @@ from uuid import UUID
 
 import asyncpg
 
+from upstream_api.config import Settings
 from upstream_api.schemas.reliability import (
     ReliabilityFindingRecord,
     ReliabilityFindingsResponse,
@@ -87,6 +88,7 @@ def _to_record(row: dict[str, Any]) -> ReliabilityFindingRecord:
 async def get_summary_for_camera(
     conn: asyncpg.Connection,
     *,
+    settings: Settings,
     account_id: UUID,
     camera_id: UUID,
     now: datetime | None = None,
@@ -94,9 +96,12 @@ async def get_summary_for_camera(
     """Evaluate the camera and return the summary shape the dashboard expects.
 
     Must run inside a transaction — the evaluator's upserts take row locks.
+    ``settings`` is threaded down so the brightness rule can hit Supabase
+    Storage; the rest of the service has no use for it.
     """
     evaluated_at, facts = await evaluate_camera(
         conn,
+        settings=settings,
         account_id=account_id,
         camera_id=camera_id,
         now=now,
@@ -129,6 +134,7 @@ async def get_summary_for_camera(
 async def get_findings_for_camera(
     conn: asyncpg.Connection,
     *,
+    settings: Settings,
     account_id: UUID,
     camera_id: UUID,
     limit: int,
@@ -142,6 +148,7 @@ async def get_findings_for_camera(
     """
     evaluated_at, _facts = await evaluate_camera(
         conn,
+        settings=settings,
         account_id=account_id,
         camera_id=camera_id,
         now=now,
