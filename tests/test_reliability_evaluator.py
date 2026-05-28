@@ -370,6 +370,87 @@ def test_stream_valid_processor_silent_skipped_when_no_session_and_no_recent_fra
     assert all(silent_key not in r["dedupe_keys"] for r in conn.resolves)
 
 
+def test_stream_valid_processor_silent_skipped_when_session_expired() -> None:
+    """A session whose ``expires_at`` is in the past does NOT count as live,
+    even if ``state`` column still says "streaming". This is the M2.1 fix --
+    state cleanup is best-effort and can lag the eligibility-gate by hours
+    in practice; the reliability rule must not produce a critical finding
+    for a workflow that has actually been over since yesterday."""
+    account, camera = uuid4(), uuid4()
+    now = datetime.now(tz=UTC)
+    expired_session = {
+        "id": uuid4(),
+        "state": "streaming",
+        "created_at": now - timedelta(hours=24),
+        "started_at": now - timedelta(hours=24),
+        "ended_at": None,
+        # Expired hours ago.
+        "expires_at": now - timedelta(hours=12),
+    }
+    conn = FakeEvalConn(
+        session=expired_session,
+        # Even a fresh-looking snapshot from the previous run would have
+        # triggered the rule under the old logic via the snapshot_fresh
+        # fallback; pin that we still fire on snapshot_fresh, but NOT on
+        # state alone for an expired session.
+        snapshot=None,
+        observation_at=None,
+        processor_status=None,
+    )
+    _run(conn, account, camera)
+    silent_key = f"camera:{camera}:stream:stream_valid_processor_silent"
+    assert all(u["dedupe_key"] != silent_key for u in conn.upserts)
+
+
+def test_stream_valid_processor_silent_skipped_when_session_ended() -> None:
+    """``ended_at`` set means the session is over -- not live -- regardless
+    of what the ``state`` column says."""
+    account, camera = uuid4(), uuid4()
+    now = datetime.now(tz=UTC)
+    ended_session = {
+        "id": uuid4(),
+        "state": "streaming",  # stale state column
+        "created_at": now - timedelta(hours=2),
+        "started_at": now - timedelta(hours=2),
+        "ended_at": now - timedelta(minutes=15),  # ended 15 min ago
+        "expires_at": now + timedelta(hours=1),
+    }
+    conn = FakeEvalConn(
+        session=ended_session,
+        snapshot=None,
+        observation_at=None,
+        processor_status=None,
+    )
+    _run(conn, account, camera)
+    silent_key = f"camera:{camera}:stream:stream_valid_processor_silent"
+    assert all(u["dedupe_key"] != silent_key for u in conn.upserts)
+
+
+def test_stream_valid_processor_silent_copy_does_not_say_stream_is_live() -> None:
+    """The rule's title/message must not imply a "live video player" --
+    operators read "Stream is live" as "I should see live video" and get
+    confused when their WebRTC viewer is empty. The actual claim is about
+    upload activity, not WebRTC playability."""
+    account, camera = uuid4(), uuid4()
+    conn = FakeEvalConn(
+        session=_session(state="streaming"),
+        snapshot=_snapshot(age_seconds=10),
+        observation_at=None,
+        processor_status=None,
+    )
+    _run(conn, account, camera)
+    silent_key = f"camera:{camera}:stream:stream_valid_processor_silent"
+    upsert = _by_dedupe(conn.upserts)[silent_key]
+    title_lc = upsert["title"].lower()
+    message_lc = upsert["message"].lower()
+    # Negative assertions: no "stream is live", no "stream appears live".
+    assert "stream is live" not in title_lc
+    assert "stream is live" not in message_lc
+    assert "stream appears live" not in message_lc
+    # Positive assertions: copy talks about frame upload, not playability.
+    assert "sending frames" in title_lc or "uploading frames" in message_lc
+
+
 # ---------------------------------------------------------------------------
 # latest_frame_stale.
 # ---------------------------------------------------------------------------
@@ -808,8 +889,10 @@ def test_scene_too_dark_dedupes_via_refresh_path(monkeypatch: Any) -> None:
 def test_detector_version_pins_to_current_milestone() -> None:
     """Detector version bumps every time a shipped rule's behavior changes,
     so historical rows stay attributable. v0.1 was M0 plumbing, v0.2 added
-    M1 brightness for real, v0.3 adds M2 unstable_detection_confidence."""
-    assert DETECTOR_VERSION == "reliability.v0.3"
+    M1 brightness for real, v0.3 added M2 unstable_detection_confidence,
+    v0.4 tightened _is_session_live + reworded stream_valid_processor_silent
+    away from misleading 'stream is live' language."""
+    assert DETECTOR_VERSION == "reliability.v0.4"
 
 
 # ---------------------------------------------------------------------------

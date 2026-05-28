@@ -7,8 +7,10 @@ and upserts/resolves findings via services/reliability_repo.
 
 Five rules ship today:
 
-- ``stream_valid_processor_silent``  (critical) -- stream appears live but the
-  processor isn't producing observations.
+- ``stream_valid_processor_silent``  (critical) -- camera is sending frames
+  but the processor isn't producing observations. "Live" here means an
+  un-ended, un-expired session in {streaming, approved} OR a fresh snapshot
+  -- not "the WebRTC player is showing video", which is a client-side concern.
 - ``latest_frame_stale``             (warning)  -- the snapshot pipeline has
   fallen behind.
 - ``processor_using_default_geometry`` (info | warning) -- the processor never
@@ -75,7 +77,9 @@ from upstream_api.services.reliability_repo import (
 #   v0.1 -- M0 plumbing (scene_too_dark reserved/no-op)
 #   v0.2 -- M1 ships scene_too_dark for real
 #   v0.3 -- M2 ships unstable_detection_confidence
-DETECTOR_VERSION = "reliability.v0.3"
+#   v0.4 -- M2.1 tightens _is_session_live (expires_at + ended_at) and
+#           rewords stream_valid_processor_silent away from "stream is live"
+DETECTOR_VERSION = "reliability.v0.4"
 
 # Thresholds. Single source of truth for both the rule and the tests. Numbers
 # are intentionally conservative — better to flag a healthy session than to
@@ -328,12 +332,35 @@ def _age_seconds(now: datetime, value: datetime | None) -> float | None:
     return (now - value).total_seconds()
 
 
-def _is_session_live(session: dict[str, Any] | None) -> bool:
-    """A session counts as live for reliability purposes when it is currently
-    streaming or has just been approved (waiting on the agent to start)."""
+def _is_session_live(session: dict[str, Any] | None, *, now: datetime | None = None) -> bool:
+    """A session counts as live for reliability purposes when:
+
+      - state is ``streaming`` or ``approved`` (waiting on the agent to start),
+      - ``ended_at`` is unset (an ended session is not live regardless of state),
+      - ``expires_at`` is in the future when set (a session past its expiry is
+        not live -- the cleanup is best-effort and the state column can lag
+        the eligibility-gate SQL by minutes or hours in practice).
+
+    The ``state`` + ``expires_at`` combination mirrors the eligibility-gate
+    in ``services/processor._ELIGIBLE_SESSIONS_SQL`` so the reliability rule
+    and the processor's own "is this session worth working on" check agree.
+    Without these guards an expired-but-not-cleaned session looks live to
+    the rule, producing a false "stream is live but processor silent"
+    finding for a workflow that has actually been over for hours.
+    """
     if session is None:
         return False
-    return session.get("state") in {"streaming", "approved"}
+    if session.get("state") not in {"streaming", "approved"}:
+        return False
+    if session.get("ended_at") is not None:
+        return False
+    expires_at = session.get("expires_at")
+    if expires_at is not None and now is not None:
+        # _age_seconds returns positive when now > expires_at, i.e. expired.
+        age = _age_seconds(now, expires_at)
+        if age is not None and age >= 0:
+            return False
+    return True
 
 
 def _coerce_payload(value: Any) -> dict[str, Any]:
@@ -373,7 +400,7 @@ def _evaluate_stream_valid_processor_silent(facts: _Facts) -> _RuleOutput:
     session = facts.latest_session
     snapshot = facts.latest_snapshot
     snapshot_age = _age_seconds(facts.now, snapshot["captured_at"]) if snapshot else None
-    session_live = _is_session_live(session)
+    session_live = _is_session_live(session, now=facts.now)
     snapshot_fresh = snapshot_age is not None and snapshot_age < _LATEST_FRAME_STALE_THRESHOLD_S
 
     if not session_live and not snapshot_fresh:
@@ -403,9 +430,9 @@ def _evaluate_stream_valid_processor_silent(facts: _Facts) -> _RuleOutput:
         finding_type="stream_valid_processor_silent",
         category="stream",
         severity="critical",
-        title="Stream is live but processor is not producing observations",
+        title="Camera is sending frames but processor is silent",
         message=(
-            "The camera stream appears live, but the processor is not "
+            "The camera is uploading frames, but the processor is not "
             "producing recent observations. This workflow should not be "
             "trusted until processor output resumes."
         ),
@@ -431,7 +458,7 @@ def _evaluate_latest_frame_stale(facts: _Facts) -> _RuleOutput:
     snapshot = facts.latest_snapshot
     session = facts.latest_session
 
-    if snapshot is None or not _is_session_live(session):
+    if snapshot is None or not _is_session_live(session, now=facts.now):
         return None
 
     age = _age_seconds(facts.now, snapshot["captured_at"])
