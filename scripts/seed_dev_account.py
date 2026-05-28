@@ -363,7 +363,7 @@ def _print_summary(
     print("=" * 72)
     print(" Dev account ready")
     print("=" * 72)
-    print(f" Dashboard:  http://localhost:3000")
+    print(" Dashboard:  http://localhost:3000")
     print(f" Email:      {DEV_EMAIL}")
     print(f" Password:   {DEV_PASSWORD}")
     print(f" Workspace:  {DEV_WORKSPACE}")
@@ -417,21 +417,23 @@ async def main_async(args: argparse.Namespace) -> int:
                 user_id,
             )
             if membership is None:
-                _eprint(
-                    "[warn] dev user exists but no membership — trigger may not have fired"
-                )
+                _eprint("[warn] dev user exists but no membership — trigger may not have fired")
                 return 2
             account_id = UUID(str(membership["account_id"]))
 
             if args.token_only:
                 _eprint("[info] --token-only: issuing fresh API token")
                 token_plaintext = await _issue_api_token(
-                    conn, account_id=account_id, name=f"dev-token-{int(datetime.now(tz=UTC).timestamp())}"
+                    conn,
+                    account_id=account_id,
+                    name=f"dev-token-{int(datetime.now(tz=UTC).timestamp())}",
                 )
                 fixtures = None
             else:
                 _eprint(f"[info] dev account already exists (account {account_id}); skipping")
-                _eprint("[info] use --reset to wipe + re-seed, or --token-only to mint a fresh token")
+                _eprint(
+                    "[info] use --reset to wipe + re-seed, or --token-only to mint a fresh token"
+                )
                 token_plaintext = None
                 fixtures = None
 
