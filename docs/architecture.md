@@ -172,3 +172,28 @@ Cameras carry `default_latency_mode` (`low | balanced | stable`); each session s
 | low | 80 ms | low end-to-end delay over a healthy link |
 | balanced (default) | 200 ms | typical web/dashboard viewing |
 | stable | 1500 ms | weak Wi-Fi / cellular; tolerates jitter and packet loss |
+
+## Supabase Realtime for dashboard push (RLS tables)
+
+The dashboard subscribes directly to Supabase Realtime `postgres_changes` for
+sub-second push (camera session state via `stream_sessions`; live detection
+overlay via `latest_perception_snapshots`) instead of polling. This is the one
+path where the dashboard reads Postgres **directly as the `authenticated` role**
+— everything else goes through this API on the **service role**, which is
+privileged and RLS-exempt. That difference is the source of a whole class of
+"Realtime is silent but the API works fine" bugs: a table can be perfectly
+readable via the API yet deliver zero Realtime events.
+
+**For a browser client to receive `postgres_changes` on an RLS table, ALL of
+these must hold** (we hit each one as a separate failure this took a while to
+untangle — see `commit-log.md` 2026-05-28/29):
+
+1. **Publication membership** — `alter publication supabase_realtime add table <t>;` (see `20260514120000_realtime_publication.sql`, `20260528180000_realtime_perception_snapshots.sql`).
+2. **`REPLICA IDENTITY FULL`** — required for `UPDATE`/`DELETE` events to be delivered AND for a server-side `filter:` on a non-primary-key column to match on UPDATEs. With the default identity (PK only) the old tuple carries just the PK, so UPDATE events are dropped / unfilterable. Our snapshot/session tables are UPSERTed (one row per camera/session) → after the first INSERT *everything is an UPDATE*, so this is mandatory (`20260529120000_replica_identity_full_realtime.sql`).
+3. **`GRANT SELECT ON <t> TO authenticated`** — hosted Supabase does **not** auto-grant table-level SELECT to `authenticated` for tables created via migration (the local CLI does, which masks it in dev). Without it Postgres rejects with `permission denied (42501)` **before RLS even runs**, so Realtime (evaluating as `authenticated`) delivers nothing — silently, with no 401. This is invisible to the API (service role), so polling/reads keep working. This was the actual root cause of the perception overlay never receiving events. See the header of `20260513150000_dashboard_grants.sql` and `20260529130000_grant_authenticated_realtime_tables.sql`.
+4. **A member-select RLS policy** whose subquery the `authenticated` role can resolve — ours is `account_id in (select account_id from account_members where user_id = auth.uid())`. `account_members` is itself granted to `authenticated` and has `account_members_self_select` (`user_id = auth.uid()`), so the subquery resolves.
+5. **Authed socket (client side)** — the browser must put the user JWT on the Realtime socket via `realtime.setAuth(token)` *before* `.subscribe()`; an expired token yields per-record `Error 401`. (Dashboard responsibility — see `upstream-dashboard/docs/dashboard-next.md`.)
+
+> **Rule for new realtime/dashboard tables:** add `grant select on public.<table> to authenticated;` **and** `alter table <table> replica identity full;` (if UPDATE events matter) **in the same migration that creates the table**, and add it to the `supabase_realtime` publication. Otherwise it will read fine via the API and be silent over Realtime.
+
+Symptom → cause cheat-sheet (full version in `troubleshooting.md`): SUBSCRIBED + `401` per record → token expired / not set on the socket; SUBSCRIBED + no 401 + no events → missing GRANT, or the RLS policy returns false; events arrive but empty (`camera_id` undefined / `keys=[]`) → payload stripped (auth-rejected record or oversized).
