@@ -18,11 +18,17 @@ import math
 
 from upstream_api.services.detection_confidence import (
     AVG_CONFIDENCE_WARNING_THRESHOLD,
+    BASELINE_EXCLUSION_SECONDS,
+    CONFIDENCE_DROP_RATIO_WARNING_THRESHOLD,
     CONFIDENCE_STDDEV_WARNING_THRESHOLD,
     LOW_CONFIDENCE_RATIO_WARNING_THRESHOLD,
+    MIN_BASELINE_SAMPLE_COUNT,
     MIN_SAMPLE_COUNT,
+    PREVIOUS_WINDOW_SECONDS,
+    RECENT_WINDOW_SECONDS,
     DetectionConfidenceStats,
     compute_detection_confidence_stats,
+    count_detection_objects,
     extract_detection_confidences,
 )
 
@@ -297,3 +303,49 @@ def test_stats_high_low_ratio_would_warn() -> None:
     out = compute_detection_confidence_stats(values)
     assert out is not None
     assert out.low_confidence_ratio > LOW_CONFIDENCE_RATIO_WARNING_THRESHOLD
+
+
+# ---------------------------------------------------------------------------
+# count_detection_objects (M5).
+# ---------------------------------------------------------------------------
+
+
+def test_count_objects_counts_array_mappings() -> None:
+    payload = {"objects": [{"confidence": 0.5}, {"track_id": "t-1"}, {"confidence": 0.7}]}
+    # All three are detection entries, even the one without a confidence.
+    assert count_detection_objects(payload) == 3
+
+
+def test_count_objects_sums_across_array_keys() -> None:
+    payload = {
+        "objects": [{"confidence": 0.5}],
+        "detections": [{"score": 0.4}, {"score": 0.6}],
+        "tracks": [{"confidence": 0.9}],
+    }
+    assert count_detection_objects(payload) == 4
+
+
+def test_count_objects_can_exceed_confidence_sample_count() -> None:
+    """Objects missing a confidence still count as detections — so object_count
+    can exceed the number of usable confidence samples."""
+    payload = {"objects": [{"confidence": 0.5}, {"label": "car"}, {"bbox": {}}]}
+    assert count_detection_objects(payload) == 3
+    assert len(extract_detection_confidences(payload)) == 1
+
+
+def test_count_objects_skips_non_mappings_and_handles_empty() -> None:
+    assert count_detection_objects({"objects": [None, 5, "x", {"confidence": 0.5}]}) == 1
+    assert count_detection_objects({"objects": []}) == 0
+    assert count_detection_objects({}) == 0
+    assert count_detection_objects("not a mapping") == 0
+    assert count_detection_objects(None) == 0
+
+
+def test_m5_baseline_constants_have_expected_values() -> None:
+    """Pin the M5 window/threshold constants the evaluator + metrics writer
+    share, so a drift between them is caught here."""
+    assert RECENT_WINDOW_SECONDS == 600
+    assert PREVIOUS_WINDOW_SECONDS == 1800
+    assert BASELINE_EXCLUSION_SECONDS == 120
+    assert MIN_BASELINE_SAMPLE_COUNT == 10
+    assert CONFIDENCE_DROP_RATIO_WARNING_THRESHOLD == 0.30

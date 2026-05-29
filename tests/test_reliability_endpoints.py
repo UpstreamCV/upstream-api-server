@@ -74,6 +74,10 @@ class FakeReliabilityConn:
         # M2: latest_perception_snapshots row driving the
         # unstable_detection_confidence rule.
         perception_row: dict[str, Any] | None = None,
+        # M5: aggregate baseline row for the snapshot_detection_metrics query
+        # (weighted_sum / total_samples / metric_count). ``None`` -> no baseline,
+        # so the drop comparison is skipped (existing behavior).
+        baseline_row: dict[str, Any] | None = None,
         # Initial open findings the evaluator will see + the list endpoint will
         # return after evaluation. The evaluator's upserts mutate this map by
         # dedupe_key so re-opens look like UPDATE not INSERT.
@@ -86,6 +90,7 @@ class FakeReliabilityConn:
         self.processor_status_row = processor_status_row
         self.has_saved_geometry = has_saved_geometry
         self.perception_row = perception_row
+        self.baseline_row = baseline_row
         # Indexed by dedupe_key so the evaluator's lookup-for-update returns
         # an existing id when one is present.
         self.open_findings: dict[str, dict[str, Any]] = {
@@ -116,6 +121,8 @@ class FakeReliabilityConn:
             return self.processor_status_row
         if "from latest_perception_snapshots" in query:
             return self.perception_row
+        if "from snapshot_detection_metrics" in query:
+            return self.baseline_row
 
         # Reliability repo: lookup-for-update.
         if "from reliability_findings" in query and "for update" in query:

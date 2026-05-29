@@ -12,7 +12,9 @@ contract that M8.1 (mock processor) and M8.2 (DeepStream POC) consume.
 from __future__ import annotations
 
 from typing import Annotated
+from uuid import UUID
 
+import asyncpg
 from fastapi import APIRouter, Query
 
 from upstream_api.errors import NotFoundError
@@ -34,6 +36,9 @@ from upstream_api.schemas.processor import (
 )
 from upstream_api.security.deps import CurrentProcessor, PoolDep, SettingsDep
 from upstream_api.security.streamid import extract_stream_key
+from upstream_api.services.detection_metrics import (
+    write_detection_metrics_for_perception_snapshot,
+)
 from upstream_api.services.processor import (
     coerce_jsonb,
     fetch_eligible_sessions,
@@ -42,7 +47,7 @@ from upstream_api.services.processor import (
     upsert_perception_snapshot,
     upsert_processor_status,
 )
-from upstream_api.services.stream_validation import load_session_state
+from upstream_api.services.stream_validation import SessionStateRow, load_session_state
 
 _logger = get_logger("processor")
 
@@ -204,6 +209,43 @@ async def post_observation(
     return ProcessorObservationResponse(id=new_id, count=1)
 
 
+async def _write_detection_metrics_safe(
+    conn: asyncpg.Connection,
+    *,
+    session: SessionStateRow,
+    body: PerceptionSnapshotIngestRequest,
+    perception_snapshot_id: UUID,
+) -> None:
+    """Persist a compact detection-confidence summary for the snapshot (M5).
+
+    Best-effort reliability analytics: this must NEVER fail the snapshot
+    ingest. It runs in its own savepoint so any failure — including the M5
+    ``snapshot_detection_metrics`` table not existing yet (before the migration
+    applies) — rolls back only the metric write and leaves the snapshot upsert
+    that already ran in the parent transaction intact. We log the failure with
+    scalar ids only (never the snapshot payload or any secret).
+    """
+    try:
+        async with conn.transaction():
+            await write_detection_metrics_for_perception_snapshot(
+                conn,
+                account_id=session.account_id,
+                camera_id=session.camera_id,
+                stream_session_id=body.stream_session_id,
+                perception_snapshot_id=perception_snapshot_id,
+                processor_id=body.processor_id,
+                package_id=body.package_id,
+                observed_at=body.observed_at,
+                snapshot=body.snapshot,
+            )
+    except Exception as exc:
+        _logger.warning(
+            "detection_metric_write_failed",
+            camera_id=str(session.camera_id),
+            error=type(exc).__name__,
+        )
+
+
 @router.post(
     "/perception-snapshots",
     response_model=LatestPerceptionSnapshotResponse,
@@ -229,6 +271,15 @@ async def post_perception_snapshot(
             account_id=session.account_id,
             camera_id=session.camera_id,
             req=body,
+        )
+        # Reliability M5: persist a compact confidence summary for drift
+        # detection. Best-effort — isolated in a savepoint so it can never
+        # break snapshot ingest.
+        await _write_detection_metrics_safe(
+            conn,
+            session=session,
+            body=body,
+            perception_snapshot_id=row["id"],
         )
 
     return LatestPerceptionSnapshotResponse(

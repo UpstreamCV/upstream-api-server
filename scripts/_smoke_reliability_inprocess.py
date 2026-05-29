@@ -635,7 +635,8 @@ def main() -> None:
         "low-confidence cluster → needs_review",
         f"avg={ev['avg_confidence']}, samples={ev['confidence_sample_count']}",
     )
-    ok("evidence carries thresholds + null M3 placeholders, no secrets", "")
+    assert ev["trigger_reasons"], ev  # at least one static signal fired
+    ok("evidence carries thresholds + null baseline fields (no history), no secrets", "")
 
     # 9b -- healthy confidence on same camera resolves the finding.
     conn.perception_row = _perception_row(
@@ -689,6 +690,64 @@ def main() -> None:
     assert "stream_valid_processor_silent" in open_types
     assert "unstable_detection_confidence" in open_types
     ok("M0 critical outranks M2 warning, both open in table", "")
+
+    # ----- Test 10: drop-vs-recent-baseline (M5) --------------------------
+    print()
+    print("Test 10 — unstable_detection_confidence drop-vs-baseline (M5)")
+
+    def _baseline_row(*, avg: float, sample_count: int, metric_count: int = 8) -> Any:
+        return {
+            "weighted_sum": avg * sample_count,
+            "total_samples": sample_count,
+            "metric_count": metric_count,
+        }
+
+    # 10a -- static stats are healthy (avg 0.60), but the camera's recent
+    # baseline averaged 0.90: a 33% drop opens the finding on drift alone.
+    account, camera = uuid4(), uuid4()
+    conn = FakeReliabilityConn(
+        camera_account_id=account,
+        session_row=session(state="streaming"),
+        snapshot_row=snapshot(age_seconds=5),
+        observation_at=datetime.now(tz=UTC) - timedelta(seconds=5),
+        processor_status_row=processor_status(age_seconds=5),
+        perception_row=_perception_row(confidences=[0.60] * 8),
+        baseline_row=_baseline_row(avg=0.90, sample_count=40),
+    )
+    client = client_for(conn, account_id=account)
+    summary = hit(client, "summary", camera)
+    assert summary["status"] == "needs_review", summary
+    top = summary["top_findings"][0]
+    assert top["finding_type"] == "unstable_detection_confidence", top
+    ev = top["evidence"]
+    assert ev["avg_confidence"] == 0.6, ev  # statically healthy
+    assert ev["trigger_reasons"] == ["drop_vs_recent_baseline"], ev
+    assert ev["previous_avg_confidence"] == 0.9, ev
+    assert ev["drop_ratio"] > 0.30, ev
+    assert ev["baseline_window_seconds"] == 1800, ev
+    assert ev["baseline_confidence_sample_count"] == 40, ev
+    assert ev["source"] == "latest_perception_snapshot_with_history", ev
+    for leak in ("http", "supabase", "service_role", "bucket", "storage_key"):
+        assert leak not in str(ev).lower(), ev
+    ok(
+        "healthy current stats but >30% drop vs baseline → needs_review",
+        f"avg={ev['avg_confidence']}, prev={ev['previous_avg_confidence']}, drop={ev['drop_ratio']}",
+    )
+
+    # 10b -- confidence recovers (and history no longer shows a drop) → the
+    # finding resolves; a missing baseline does not block resolution.
+    conn.perception_row = _perception_row(confidences=[0.88] * 8)
+    conn.baseline_row = None
+    summary = hit(client, "summary", camera)
+    assert summary["status"] == "healthy", summary
+    resolved = [
+        r
+        for r in conn.open_findings.values()
+        if r["finding_type"] == "unstable_detection_confidence" and r["status"] == "resolved"
+    ]
+    assert resolved, [r["status"] for r in conn.open_findings.values()]
+    assert resolved[0]["resolved_reason"] == "detection_confidence_stabilized", resolved[0]
+    ok("confidence recovers → resolved (missing baseline doesn't block)", "")
 
     print()
     print(f"{GREEN}PASS{RESET} — reliability slice smoke complete")

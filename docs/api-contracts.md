@@ -1069,6 +1069,16 @@ the session row, never trusted from the body. Body:
 deep-validated server-side). Returns `{snapshot: PerceptionSnapshotRecord}`.
 Read it back via `GET /v1/cameras/{camera_id}/perception/latest`.
 
+Reliability M5 side-effect: on a successful upsert the API also writes one
+compact detection-confidence summary row to `snapshot_detection_metrics`
+(numeric stats only — never the raw snapshot). This is best-effort — isolated
+in a savepoint so a failure (or the table not existing yet) never fails the
+ingest. That history backs the `unstable_detection_confidence` reliability
+finding's drop-vs-recent-baseline trigger; the finding's `evidence` then
+carries `previous_avg_confidence`, `drop_ratio`, `baseline_window_seconds`,
+`baseline_confidence_sample_count`, `baseline_metric_count`, and
+`trigger_reasons` (null/absent until enough history accumulates).
+
 ### Intentionally deferred (not in M8.0)
 
 - `upstream-processor` repo, DeepStream runtime, YOLO/person detection, Triton

@@ -60,14 +60,25 @@ AVG_CONFIDENCE_WARNING_THRESHOLD: float = 0.45
 LOW_CONFIDENCE_RATIO_WARNING_THRESHOLD: float = 0.50
 CONFIDENCE_STDDEV_WARNING_THRESHOLD: float = 0.20
 
-# Drop-vs-previous-window thresholds and window sizes are named here so M3 can
-# wire them up without a contract change. M2 doesn't use them yet -- there's
-# no perception-snapshot history table, so previous-window comparison is a
-# TODO. The evidence schema reserves the corresponding ``previous_*`` /
-# ``drop_ratio`` fields as ``null``.
+# Drop-vs-recent-baseline thresholds and window sizes (reliability M5). The
+# evaluator compares the current snapshot's average confidence against a
+# weighted baseline computed from `snapshot_detection_metrics` history and
+# opens the finding when confidence has dropped by more than the threshold.
+#
+# - RECENT_WINDOW_SECONDS: how recent the "current" metric history is (the
+#   evidence reports this as the current window; the live comparison uses the
+#   latest snapshot's stats).
+# - PREVIOUS_WINDOW_SECONDS: how far back the baseline reaches.
+# - BASELINE_EXCLUSION_SECONDS: the most-recent slice excluded from the
+#   baseline so the current snapshot isn't compared against itself.
+# - MIN_BASELINE_SAMPLE_COUNT: minimum total confidence samples across the
+#   baseline window before the baseline is trusted (too little history -> no
+#   drop comparison, and missing baseline never blocks resolution).
 CONFIDENCE_DROP_RATIO_WARNING_THRESHOLD: float = 0.30
 RECENT_WINDOW_SECONDS: int = 600
-PREVIOUS_WINDOW_SECONDS: int = 600
+PREVIOUS_WINDOW_SECONDS: int = 1800
+BASELINE_EXCLUSION_SECONDS: int = 120
+MIN_BASELINE_SAMPLE_COUNT: int = 10
 
 
 @dataclass(frozen=True)
@@ -155,6 +166,26 @@ def extract_detection_confidences(payload: Any) -> list[float]:
                 values.append(picked)
 
     return values
+
+
+def count_detection_objects(payload: Any) -> int:
+    """Count detection entries in ``payload`` (objects / detections / tracks).
+
+    The number of detections on a frame, independent of whether each carried a
+    usable confidence value -- so it can exceed ``len(extract_detection_confidences(payload))``
+    when some objects lack a confidence field. Walks the same closed set of
+    array keys as the confidence extractor; non-mapping items are skipped.
+    Returns ``0`` for a non-mapping payload.
+    """
+    if not isinstance(payload, Mapping):
+        return 0
+    count = 0
+    for array_key in _ARRAY_KEYS:
+        array = payload.get(array_key)
+        if not isinstance(array, Sequence) or isinstance(array, (str, bytes)):
+            continue
+        count += sum(1 for item in array if isinstance(item, Mapping))
+    return count
 
 
 def compute_detection_confidence_stats(
