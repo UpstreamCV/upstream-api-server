@@ -4,6 +4,22 @@ Reverse chronological. Newest at top. Every meaningful commit gets an entry foll
 
 ---
 
+## 2026-05-29 - docs: Supabase Realtime requirements + "SUBSCRIBED but no events" troubleshooting
+
+### Summary
+Captured the reusable lessons from the multi-day Realtime debugging arc as
+durable reference docs (the change history was only in commit-log entries).
+`architecture.md` gains a "Supabase Realtime for dashboard push (RLS tables)"
+section: the full requirement set (publication membership, `REPLICA IDENTITY
+FULL`, `GRANT SELECT ... TO authenticated`, member-select RLS, client-side
+`setAuth`-before-subscribe) and the rule that new realtime/dashboard tables must
+include the grant (+ replica identity) in their creating migration — because the
+API reads via the service role (RLS-exempt) so a missing grant is invisible to
+the API yet makes Realtime silently deliver nothing. `troubleshooting.md` gains
+a "Realtime channel SUBSCRIBED but no events" decision tree (401 → token;
+no-events → missing grant / RLS false; UPDATEs dropped → replica identity) with
+the SQL checks. Docs only.
+
 ## 2026-05-29 - GRANT SELECT to authenticated on realtime/dashboard tables created after the original backfill (the actual cause of "Realtime delivers no events")
 
 ### Summary

@@ -103,3 +103,22 @@ lsof -i :4000 -P -n | grep LISTEN | awk '{print $2}' | xargs kill
 
 ### Tests fail with the same `ConnectionRefusedError` as the server
 A test is using `with TestClient(app) as client:` which triggers the lifespan and opens the DB pool. Switch to `client = TestClient(app)` (no context manager) — the lifespan won't run and `/healthz` still responds.
+
+## Realtime (dashboard push)
+
+### A Realtime channel is `SUBSCRIBED` but no `postgres_changes` events arrive (the dashboard overlay "works" via polling but never via push)
+This was a multi-day debugging arc; it has several distinct causes that present almost identically. The API reading the table fine tells you **nothing** — the API uses the service role (RLS-exempt), while Realtime evaluates as the `authenticated` role. See `architecture.md` → "Supabase Realtime for dashboard push" for the full requirements. Work the decision tree in order:
+
+1. **Per-record `Error 401: Unauthorized` in the payload (and `keys=[]`)** → the Realtime *socket* isn't presenting a valid user JWT. The browser must call `realtime.setAuth(access_token)` **before** `.subscribe()`, and the token must not be expired (a fresh login mints a new one). Client-side fix in the dashboard.
+2. **No 401, but no events at all** → almost always the table is **missing `GRANT SELECT ... TO authenticated`**. Postgres rejects with `42501` *before* RLS runs, so Realtime delivers nothing silently. Check + fix:
+   ```sql
+   select has_table_privilege('authenticated','public.<table>','select');  -- expect true
+   ```
+   If false, `grant select on public.<table> to authenticated;` (and follow the rule in architecture.md so new tables get it at creation).
+3. **Grant is present, still no events** → check the table is actually published and the RLS policy resolves:
+   ```sql
+   select * from pg_publication_tables where pubname='supabase_realtime' and tablename='<table>';
+   select policyname, cmd, qual from pg_policies where tablename='<table>';
+   ```
+   A member-select policy that subqueries `account_members` only works if `account_members` is itself granted + readable by `authenticated` (it is here, via `account_members_self_select`).
+4. **`UPDATE` events specifically don't arrive (INSERTs do), or a `camera_id` filter drops everything** → the table needs `alter table <table> replica identity full;`. With default identity the old tuple is PK-only, so UPDATE events are dropped / a non-PK `filter:` can't match. Our snapshot/session tables are UPSERTed → all UPDATEs, so this is required.
