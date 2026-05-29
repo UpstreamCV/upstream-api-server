@@ -4,6 +4,77 @@ Reverse chronological. Newest at top. Every meaningful commit gets an entry foll
 
 ---
 
+## 2026-05-29 - Reliability M5: detection confidence history + drift
+
+### Summary
+`unstable_detection_confidence` used to judge only the latest perception
+snapshot against static thresholds. M5 adds confidence **history** so it can
+also say "this camera's model confidence has dropped versus its own recent
+behaviour". A new append-only `snapshot_detection_metrics` table stores a
+compact numeric summary per accepted snapshot (computed at ingest time, reusing
+the M2 `detection_confidence` extractor/stats — never the raw snapshot JSON).
+The reliability evaluator reads a weighted recent **baseline** from that table
+during fact gathering and opens the finding when the current average confidence
+has dropped by more than `CONFIDENCE_DROP_RATIO_WARNING_THRESHOLD` (0.30) — even
+when the absolute numbers still clear the static thresholds. Static-threshold
+behaviour is unchanged; a missing/too-thin baseline only disables the drop
+comparison and never blocks resolution. Evidence now fills the previously-null
+`previous_avg_confidence` / `drop_ratio` plus `baseline_*` and a
+`trigger_reasons` list. The metric write is best-effort (savepoint-isolated) so
+it can never break snapshot ingest. No processor changes (it already emits
+per-object `confidence`).
+
+### Files touched
+- `supabase/migrations/20260529140000_snapshot_detection_metrics.sql` (new) —
+  `snapshot_detection_metrics` (compact summary columns, `unique(camera_id,
+  observed_at)` idempotency target — NOT `perception_snapshot_id`, which is
+  per-camera-stable; account/camera/session/observed_at indexes; RLS
+  member-select + `grant select ... to authenticated`; no jsonb, append-only).
+- `src/upstream_api/services/detection_metrics.py` (new) —
+  `write_detection_metrics_for_perception_snapshot` (idempotent
+  `on conflict do nothing` INSERT; writes a row even with too-few samples,
+  null stats then) + `fetch_detection_confidence_baseline` (weighted average
+  over the previous window, excluding the most recent slice; `None` when
+  history is too thin) + `DetectionMetricWriteResult` / `DetectionConfidenceBaseline`.
+- `src/upstream_api/services/detection_confidence.py` — repurposed the
+  reserved M3 window constants for M5 (`PREVIOUS_WINDOW_SECONDS` 600→1800),
+  added `BASELINE_EXCLUSION_SECONDS` (120) + `MIN_BASELINE_SAMPLE_COUNT` (10),
+  and `count_detection_objects`.
+- `src/upstream_api/routers/processor.py` — `post_perception_snapshot` calls
+  `_write_detection_metrics_safe` after the upsert, inside a savepoint +
+  try/except (logs scalar ids only on failure).
+- `src/upstream_api/services/reliability_evaluator.py` — `_gather_facts`
+  fetches the baseline; `_Facts` gains `detection_confidence_baseline`; the
+  rule folds a baseline-guarded drop term into the trigger/resolve predicates,
+  fills the baseline evidence + `trigger_reasons`, and switches `source` to
+  `latest_perception_snapshot_with_history` when a baseline exists.
+  `DETECTOR_VERSION` v0.5 → v0.6.
+- `tests/test_detection_metrics.py` (new, 16) — writer + baseline + SQL/migration
+  pins. `tests/test_detection_confidence.py` — `count_detection_objects` +
+  M5 constant pins. `tests/test_perception_snapshots.py` — ingest also writes a
+  metric; metric failure doesn't break the POST. `tests/test_reliability_evaluator.py`
+  — drop-opens / no-drop-resolves / thin-baseline / missing-baseline-still-resolves
+  / both-reasons; DETECTOR_VERSION pin → v0.6. `tests/test_reliability_endpoints.py`
+  — `FakeReliabilityConn` gains a `baseline_row`. `scripts/_smoke_reliability_inprocess.py`
+  — Test 10 (drop opens → recovery resolves).
+- `docs/api-contracts.md` — perception-snapshots M5 side-effect + evidence fields.
+
+### Testing/checks
+- `uv run pytest` — 500 passed. `ruff check` / `ruff format --check` clean.
+  `mypy src` clean (strict). `_smoke_reliability_inprocess.py` — PASS.
+- Dashboard: `tsc --noEmit` clean, `eslint` clean, vitest reliability suites pass.
+- No live DB verification: fake-pool unit tests + production-SQL / migration pins,
+  per repo convention.
+
+### Follow-up TODOs
+- `snapshot_detection_metrics` is append-only and unbounded (~1 row/sec/camera
+  at the processor's snapshot rate). A retention / downsampling policy is a
+  recommended next task before this runs long at scale.
+- A camera-level confidence trend chart (Reliability tab) is intentionally
+  deferred — M5 is text-only.
+
+---
+
 ## 2026-05-29 - docs: Supabase Realtime requirements + "SUBSCRIBED but no events" troubleshooting
 
 ### Summary

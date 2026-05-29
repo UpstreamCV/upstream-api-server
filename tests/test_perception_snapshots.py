@@ -70,9 +70,17 @@ class FakePool:
 
 
 class FakeSnapshotConn:
-    def __init__(self, session_row: dict[str, Any] | None) -> None:
+    def __init__(
+        self,
+        session_row: dict[str, Any] | None,
+        *,
+        fail_metric_insert: bool = False,
+    ) -> None:
         self._session_row = session_row
         self.snapshot_upserts: list[tuple[Any, ...]] = []
+        # M5: the detection-metric insert that fires on the same transaction.
+        self.metric_inserts: list[tuple[Any, ...]] = []
+        self._fail_metric_insert = fail_metric_insert
 
     def transaction(self) -> FakeTransaction:
         return FakeTransaction()
@@ -95,6 +103,11 @@ class FakeSnapshotConn:
                 "observed_at": args[6],
                 "updated_at": now,
             }
+        if "insert into snapshot_detection_metrics" in query:
+            if self._fail_metric_insert:
+                raise RuntimeError("simulated metric write failure")
+            self.metric_inserts.append(args)
+            return {"id": uuid4()}
         return None
 
 
@@ -231,6 +244,46 @@ def test_perception_snapshot_write_succeeds_and_derives_tenant() -> None:
     # $1 account_id, $2 camera_id derived from the session row, not the body.
     assert args[0] == account_id
     assert args[1] == camera_id
+
+
+def test_perception_snapshot_write_also_writes_detection_metric() -> None:
+    """Reliability M5: a successful snapshot ingest also persists a compact
+    detection-confidence metric row, with tenant derived from the session."""
+    session_id, account_id, camera_id = uuid4(), uuid4(), uuid4()
+    conn = FakeSnapshotConn(
+        _session_row(session_id=session_id, account_id=account_id, camera_id=camera_id)
+    )
+    snapshot = {"objects": [{"confidence": c} for c in [0.8, 0.7, 0.6, 0.9, 0.5]]}
+    r = _processor_client(conn).post(
+        _INGEST, json=_snapshot_body(session_id, snapshot=snapshot), headers=_headers()
+    )
+    assert r.status_code == 200, r.text
+    assert len(conn.snapshot_upserts) == 1
+    assert len(conn.metric_inserts) == 1
+    # Metric INSERT column order: $1 account_id, $2 camera_id, $3 session_id,
+    # $4 perception_snapshot_id, ... $8 object_count, $9 sample_count.
+    margs = conn.metric_inserts[0]
+    assert margs[0] == account_id  # tenant derived from session, not body
+    assert margs[1] == camera_id
+    assert margs[2] == session_id
+    assert margs[3] is not None  # perception_snapshot_id from the upsert row
+    assert margs[7] == 5  # object_count
+    assert margs[8] == 5  # confidence_sample_count
+
+
+def test_perception_snapshot_succeeds_even_if_metric_write_fails() -> None:
+    """The metric write is best-effort: a failure must NOT fail the snapshot
+    ingest. The snapshot upsert still commits and the endpoint returns 200."""
+    session_id, account_id, camera_id = uuid4(), uuid4(), uuid4()
+    conn = FakeSnapshotConn(
+        _session_row(session_id=session_id, account_id=account_id, camera_id=camera_id),
+        fail_metric_insert=True,
+    )
+    r = _processor_client(conn).post(_INGEST, json=_snapshot_body(session_id), headers=_headers())
+    assert r.status_code == 200, r.text
+    # Snapshot still written; the metric failure was swallowed.
+    assert len(conn.snapshot_upserts) == 1
+    assert len(conn.metric_inserts) == 0
 
 
 def test_perception_snapshot_response_shape() -> None:
