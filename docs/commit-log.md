@@ -4,6 +4,38 @@ Reverse chronological. Newest at top. Every meaningful commit gets an entry foll
 
 ---
 
+## 2026-05-29 - GRANT SELECT to authenticated on realtime/dashboard tables created after the original backfill (the actual cause of "Realtime delivers no events")
+
+### Summary
+The dashboard live perception overlay's Supabase Realtime subscription never
+delivered events: channel SUBSCRIBED, valid token (no 401), table in the
+`supabase_realtime` publication and `REPLICA IDENTITY FULL`, processor upserting
+~3/s — yet zero change events reached the client ("Fallback polling").
+
+Root cause: **`latest_perception_snapshots` was missing `GRANT SELECT ... TO
+authenticated`.** `20260513150000_dashboard_grants.sql` documents the trap —
+hosted Supabase doesn't auto-grant table SELECT to `authenticated` for tables
+created via migration, and "without these grants, RLS policies are unreachable:
+Postgres rejects with 42501 before RLS runs." That backfill covered tables
+existing on 2026-05-13; `latest_perception_snapshots` was created 2026-05-21 and
+slipped through. The api-server reads via the **service role** (privileged,
+RLS-exempt) so the gap was invisible to polling — but **Supabase Realtime
+evaluates RLS AS the `authenticated` role**, hits 42501 before the
+`member_select` policy runs, and silently delivers nothing.
+
+`20260529130000_grant_authenticated_realtime_tables.sql` grants SELECT to
+`authenticated` on `latest_perception_snapshots` (fixes the overlay) plus the
+other RLS-protected dashboard tables created after the original backfill
+(`camera_geometry_configs`, `reliability_findings`, `processor_statuses`,
+`observations`) to match the documented per-table pattern and prevent the
+identical bug. RLS still restricts rows, so the grant is safe. No app code
+change. Confirmed fixed when the overlay chip reads "Realtime connected".
+
+### Follow-up
+New tables intended for dashboard/Realtime reads MUST include
+`grant select on public.<table> to authenticated;` in their creating migration
+(see the header of `20260513150000_dashboard_grants.sql`).
+
 ## 2026-05-29 - REPLICA IDENTITY FULL on Realtime-published RLS tables (perception snapshots + stream sessions)
 
 ### Summary
