@@ -30,14 +30,19 @@ from uuid import UUID
 import asyncpg
 
 from upstream_api.services.detection_confidence import (
-    BASELINE_EXCLUSION_SECONDS,
     MIN_BASELINE_SAMPLE_COUNT,
-    MIN_SAMPLE_COUNT,
     PREVIOUS_WINDOW_SECONDS,
+    RECENT_WINDOW_SECONDS,
     compute_detection_confidence_stats,
     count_detection_objects,
     extract_detection_confidences,
 )
+
+# The metric writer summarises a row whenever a frame has at least one usable
+# confidence (not the per-frame static rule's MIN_SAMPLE_COUNT of 5): drift
+# aggregates these rows over a time window, so a quiet 1-3 object frame is
+# still worth recording. Frames with zero confidences keep null stats.
+_MIN_METRIC_SAMPLE_COUNT = 1
 
 # ---------------------------------------------------------------------------
 # Writer
@@ -99,16 +104,16 @@ async def write_detection_metrics_for_perception_snapshot(
 ) -> DetectionMetricWriteResult:
     """Compute and persist a compact confidence summary for one snapshot.
 
-    Always writes a row (even with zero/few detections) so the history records
-    that the camera had little to detect — the baseline query ignores rows
-    whose stats are null. Stats are summarised only when there are at least
-    ``MIN_SAMPLE_COUNT`` usable confidence values; below that the row carries
-    counts but null stats.
+    Always writes a row (even with zero detections) so the history records that
+    the camera had little to detect — the window query ignores rows whose stats
+    are null. Stats are summarised whenever there is at least one usable
+    confidence value (``_MIN_METRIC_SAMPLE_COUNT``); a frame with zero
+    confidences carries counts but null stats.
     """
     values = extract_detection_confidences(snapshot)
     object_count = count_detection_objects(snapshot)
     confidence_sample_count = len(values)
-    stats = compute_detection_confidence_stats(values)
+    stats = compute_detection_confidence_stats(values, min_sample_count=_MIN_METRIC_SAMPLE_COUNT)
 
     if stats is None:
         avg = median = min_c = max_c = low_ratio = stddev = None
@@ -151,16 +156,14 @@ async def write_detection_metrics_for_perception_snapshot(
 
 
 # ---------------------------------------------------------------------------
-# Recent baseline query
+# Rolling-window confidence query (drift)
 # ---------------------------------------------------------------------------
 
-# Weighted average confidence over the baseline window, weighting each metric
-# row by its confidence_sample_count. Excludes rows with null avg_confidence
-# and rows summarising fewer than MIN_SAMPLE_COUNT samples. The window reaches
-# back PREVIOUS_WINDOW_SECONDS and excludes the most recent
-# BASELINE_EXCLUSION_SECONDS so the current snapshot is never compared against
-# itself.
-_BASELINE_SQL = """
+# Weighted average confidence over a time window, weighting each metric row by
+# its confidence_sample_count. Rows with null avg_confidence (no usable
+# confidences that frame) are excluded; everything else aggregates, so a quiet
+# 1-3 object/frame scene still contributes plenty of samples over the window.
+_WINDOW_SQL = """
 select
     sum(avg_confidence * confidence_sample_count) as weighted_sum,
     sum(confidence_sample_count)                  as total_samples,
@@ -171,43 +174,41 @@ select
    and observed_at >= $3
    and observed_at <  $4
    and avg_confidence is not null
-   and confidence_sample_count >= $5
 """
 
 
 @dataclass(frozen=True)
-class DetectionConfidenceBaseline:
-    """A camera's recent confidence baseline, for drop-vs-history comparison."""
+class DetectionConfidenceWindow:
+    """Weighted confidence average over one time window."""
 
-    previous_avg_confidence: float
+    avg_confidence: float
     confidence_sample_count: int
     metric_count: int
     window_seconds: int
 
 
-async def fetch_detection_confidence_baseline(
+@dataclass(frozen=True)
+class DetectionConfidenceWindows:
+    """The current and prior windows used for drift comparison. Either may be
+    ``None`` when that window holds too little history to trust."""
+
+    current: DetectionConfidenceWindow | None
+    baseline: DetectionConfidenceWindow | None
+
+
+async def _fetch_window(
     conn: asyncpg.Connection,
     *,
     account_id: UUID,
     camera_id: UUID,
-    now: datetime,
-) -> DetectionConfidenceBaseline | None:
-    """Weighted recent baseline for a camera, or ``None`` when there is too
-    little history to trust (fewer than ``MIN_BASELINE_SAMPLE_COUNT`` total
-    confidence samples across the window). Returning ``None`` is the
-    "no baseline" signal — the evaluator must treat it as "skip the drop
-    comparison", never as "resolve" or "open".
-    """
-    window_start = now - timedelta(seconds=PREVIOUS_WINDOW_SECONDS)
-    window_end = now - timedelta(seconds=BASELINE_EXCLUSION_SECONDS)
-    row = await conn.fetchrow(
-        _BASELINE_SQL,
-        account_id,
-        camera_id,
-        window_start,
-        window_end,
-        MIN_SAMPLE_COUNT,
-    )
+    start: datetime,
+    end: datetime,
+    window_seconds: int,
+) -> DetectionConfidenceWindow | None:
+    """Weighted average over [start, end), or ``None`` when the window holds
+    fewer than ``MIN_BASELINE_SAMPLE_COUNT`` total confidence samples (too
+    little to trust) — the "no signal" marker the evaluator skips on."""
+    row = await conn.fetchrow(_WINDOW_SQL, account_id, camera_id, start, end)
     if row is None:
         return None
     total_samples = row["total_samples"]
@@ -216,12 +217,49 @@ async def fetch_detection_confidence_baseline(
         return None
     if total_samples < MIN_BASELINE_SAMPLE_COUNT:
         return None
-    previous_avg = weighted_sum / total_samples
-    if previous_avg <= 0:
+    avg = weighted_sum / total_samples
+    if avg <= 0:
         return None
-    return DetectionConfidenceBaseline(
-        previous_avg_confidence=previous_avg,
+    return DetectionConfidenceWindow(
+        avg_confidence=avg,
         confidence_sample_count=int(total_samples),
         metric_count=int(row["metric_count"]),
+        window_seconds=window_seconds,
+    )
+
+
+async def fetch_detection_confidence_windows(
+    conn: asyncpg.Connection,
+    *,
+    account_id: UUID,
+    camera_id: UUID,
+    now: datetime,
+) -> DetectionConfidenceWindows:
+    """The current vs. prior confidence windows for drift detection.
+
+    - current  = [now - RECENT_WINDOW_SECONDS, now)            (the last 10 min)
+    - baseline = [now - PREVIOUS_WINDOW_SECONDS, now - RECENT_WINDOW_SECONDS)
+      (10-30 min ago)
+
+    The windows are adjacent and non-overlapping, so the current window is never
+    compared against itself. Each is ``None`` when it lacks enough samples — a
+    missing window must never force-open a finding or block resolution.
+    """
+    recent = timedelta(seconds=RECENT_WINDOW_SECONDS)
+    current = await _fetch_window(
+        conn,
+        account_id=account_id,
+        camera_id=camera_id,
+        start=now - recent,
+        end=now,
+        window_seconds=RECENT_WINDOW_SECONDS,
+    )
+    baseline = await _fetch_window(
+        conn,
+        account_id=account_id,
+        camera_id=camera_id,
+        start=now - timedelta(seconds=PREVIOUS_WINDOW_SECONDS),
+        end=now - recent,
         window_seconds=PREVIOUS_WINDOW_SECONDS,
     )
+    return DetectionConfidenceWindows(current=current, baseline=baseline)

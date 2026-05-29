@@ -20,6 +20,7 @@ from uuid import UUID, uuid4
 
 from upstream_api.config import get_settings
 from upstream_api.services import snapshot_brightness as snapshot_brightness_module
+from upstream_api.services.detection_confidence import RECENT_WINDOW_SECONDS
 from upstream_api.services.image_analysis import ImageBrightness
 from upstream_api.services.reliability_evaluator import (
     DETECTOR_VERSION,
@@ -66,11 +67,12 @@ class FakeEvalConn:
         # ``None`` -> the fake returns no account row, the evaluator
         # defaults to processing_enabled=True (existing behavior).
         account_metadata: dict[str, Any] | None = None,
-        # M5: the aggregate baseline row returned for the
-        # snapshot_detection_metrics query. ``None`` -> the fake returns no
-        # row, so fetch_detection_confidence_baseline yields no baseline
-        # (existing behavior). Use ``_baseline(...)`` to build one.
-        baseline: dict[str, Any] | None = None,
+        # M5: aggregate rows returned for the rolling-window query. The current
+        # and baseline windows share SQL but differ by [start, end) span, so the
+        # fake routes by span. ``None`` -> no row for that window (no signal).
+        # Use ``_window(...)`` to build one.
+        current_window: dict[str, Any] | None = None,
+        baseline_window: dict[str, Any] | None = None,
         preopen_finding_ids: dict[str, UUID] | None = None,
     ) -> None:
         self.session = session
@@ -80,7 +82,8 @@ class FakeEvalConn:
         self.has_saved_geometry = has_saved_geometry
         self.perception = perception
         self.account_metadata = account_metadata
-        self.baseline = baseline
+        self.current_window = current_window
+        self.baseline_window = baseline_window
         # preopen_finding_ids maps dedupe_key -> UUID of a row that pretends to
         # already be open. Lets us pin "re-open refreshes instead of inserts".
         self.preopen_finding_ids = preopen_finding_ids or {}
@@ -106,7 +109,10 @@ class FakeEvalConn:
         if "from latest_perception_snapshots" in query:
             return self.perception
         if "from snapshot_detection_metrics" in query:
-            return self.baseline
+            span = round((args[3] - args[2]).total_seconds())
+            if span == RECENT_WINDOW_SECONDS:
+                return self.current_window
+            return self.baseline_window
         if "select metadata, updated_at from accounts" in query:
             # Account flag read for M3. ``None`` is the default-true path.
             if self.account_metadata is None:
@@ -988,13 +994,11 @@ def _perception(
     }
 
 
-def _baseline(*, avg: float, sample_count: int, metric_count: int = 6) -> dict[str, Any]:
-    """Build the aggregate baseline row the metrics query returns.
+def _window(*, avg: float, sample_count: int, metric_count: int = 6) -> dict[str, Any]:
+    """Build an aggregate window row whose weighted average equals ``avg``.
 
-    ``weighted_sum / total_samples == avg`` so the evaluator's previous-window
-    average comes out to ``avg``. ``sample_count`` below MIN_BASELINE_SAMPLE_COUNT
-    makes fetch_detection_confidence_baseline treat the history as too thin and
-    return no baseline.
+    ``sample_count`` below MIN_BASELINE_SAMPLE_COUNT makes the evaluator treat
+    that window as too thin (no signal).
     """
     return {
         "weighted_sum": avg * sample_count,
@@ -1121,19 +1125,21 @@ def test_unstable_confidence_resolves_when_healthy() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_unstable_confidence_opens_on_drop_vs_baseline() -> None:
-    """Static stats are perfectly healthy (avg 0.60, no low samples, no
-    spread), but the camera's recent baseline averaged 0.90 — a 33% drop, over
-    the 30% threshold. The drift trigger opens the finding and fills the
-    baseline evidence, even though no static threshold fired."""
+def test_unstable_confidence_opens_on_drop_vs_baseline_low_object_count() -> None:
+    """The headline M5 case for real cameras: the latest frame has only 2
+    detections (< MIN_SAMPLE_COUNT, so per-frame stats are null), yet the
+    rolling current window (0.60) has dropped 33% from the prior window (0.90).
+    Drift opens the finding from windowed history alone — exactly the scene
+    the per-frame 5-gate used to miss."""
     account, camera = uuid4(), uuid4()
     conn = FakeEvalConn(
         session=_session(state="streaming"),
         snapshot=_snapshot(age_seconds=5),
         observation_at=datetime.now(tz=UTC) - timedelta(seconds=5),
         processor_status=_processor_status(age_seconds=5),
-        perception=_perception(confidences=[0.60] * 8),
-        baseline=_baseline(avg=0.90, sample_count=40, metric_count=8),
+        perception=_perception(confidences=[0.62, 0.58]),  # 2 objects -> stats None
+        current_window=_window(avg=0.60, sample_count=40, metric_count=12),
+        baseline_window=_window(avg=0.90, sample_count=120, metric_count=20),
     )
     _run(conn, account, camera)
     key = f"camera:{camera}:{_CONFIDENCE_KEY_SUFFIX}"
@@ -1143,20 +1149,23 @@ def test_unstable_confidence_opens_on_drop_vs_baseline() -> None:
     # M5 never escalates severity — a confidence drop is still a warning.
     assert u["severity"] == "warning"
     ev = u["evidence"]
-    # Static stats were healthy; the drop alone opened it.
-    assert ev["avg_confidence"] == 0.6
+    # Per-frame stats are null (only 2 detections); the windowed drift drove it.
+    assert ev["avg_confidence"] is None
+    assert ev["confidence_sample_count"] is None
     assert ev["trigger_reasons"] == ["drop_vs_recent_baseline"]
+    assert ev["current_avg_confidence"] == 0.6
+    assert ev["current_confidence_sample_count"] == 40
+    assert ev["current_metric_count"] == 12
     assert ev["previous_avg_confidence"] == 0.9
     assert ev["drop_ratio"] > 0.30
     assert abs(ev["drop_ratio"] - 0.333) < 0.01
     assert ev["baseline_window_seconds"] == 1800
-    assert ev["baseline_confidence_sample_count"] == 40
-    assert ev["baseline_metric_count"] == 8
-    assert ev["source"] == "latest_perception_snapshot_with_history"
+    assert ev["baseline_confidence_sample_count"] == 120
+    assert ev["source"] == "recent_window_history"
 
 
 def test_unstable_confidence_opens_with_both_static_and_drop_reasons() -> None:
-    """Static signals AND a baseline drop fire together — trigger_reasons lists
+    """Static signals AND a windowed drop fire together — trigger_reasons lists
     every fired signal in declared order (static signals first, drop last)."""
     account, camera = uuid4(), uuid4()
     conn = FakeEvalConn(
@@ -1164,11 +1173,12 @@ def test_unstable_confidence_opens_with_both_static_and_drop_reasons() -> None:
         snapshot=_snapshot(age_seconds=5),
         observation_at=datetime.now(tz=UTC) - timedelta(seconds=5),
         processor_status=_processor_status(age_seconds=5),
-        # avg 0.30 — below the 0.45 avg threshold and all below the 0.45
-        # low-confidence threshold (low ratio 1.0) — AND a steep drop from a
-        # 0.85 baseline.
+        # Latest frame: avg 0.30 — below the 0.45 avg threshold and all below
+        # the 0.45 low-confidence threshold (low ratio 1.0).
         perception=_perception(confidences=[0.30] * 8),
-        baseline=_baseline(avg=0.85, sample_count=30),
+        # And the current window (0.30) has dropped steeply from a 0.85 prior.
+        current_window=_window(avg=0.30, sample_count=60),
+        baseline_window=_window(avg=0.85, sample_count=60),
     )
     _run(conn, account, camera)
     key = f"camera:{camera}:{_CONFIDENCE_KEY_SUFFIX}"
@@ -1180,9 +1190,9 @@ def test_unstable_confidence_opens_with_both_static_and_drop_reasons() -> None:
     ]
 
 
-def test_unstable_confidence_no_drop_when_static_healthy_resolves() -> None:
-    """Healthy static stats + a baseline only slightly above current (14% drop,
-    under threshold) → no trigger → resolves."""
+def test_unstable_confidence_no_drop_when_healthy_resolves() -> None:
+    """Healthy static stats + a current window only slightly below the prior
+    (14% drop, under threshold) → no trigger → resolves."""
     account, camera = uuid4(), uuid4()
     conn = FakeEvalConn(
         session=_session(state="streaming"),
@@ -1190,7 +1200,8 @@ def test_unstable_confidence_no_drop_when_static_healthy_resolves() -> None:
         observation_at=datetime.now(tz=UTC) - timedelta(seconds=5),
         processor_status=_processor_status(age_seconds=5),
         perception=_perception(confidences=[0.60] * 8),
-        baseline=_baseline(avg=0.70, sample_count=40),
+        current_window=_window(avg=0.60, sample_count=40),
+        baseline_window=_window(avg=0.70, sample_count=40),
     )
     _run(conn, account, camera)
     key = f"camera:{camera}:{_CONFIDENCE_KEY_SUFFIX}"
@@ -1201,10 +1212,11 @@ def test_unstable_confidence_no_drop_when_static_healthy_resolves() -> None:
     ), conn.resolves
 
 
-def test_unstable_confidence_baseline_too_thin_does_not_open_drop() -> None:
-    """A steep drop vs. a baseline of only 4 samples (< MIN_BASELINE_SAMPLE_COUNT)
-    is ignored: too little history to trust. With healthy static stats the rule
-    resolves rather than opening a spurious drift finding."""
+def test_unstable_confidence_thin_baseline_does_not_open_drop() -> None:
+    """A steep apparent drop vs. a baseline window of only 4 samples
+    (< MIN_BASELINE_SAMPLE_COUNT) is ignored: too little history to trust. With
+    healthy static stats the rule resolves rather than opening a spurious
+    drift finding."""
     account, camera = uuid4(), uuid4()
     conn = FakeEvalConn(
         session=_session(state="streaming"),
@@ -1212,7 +1224,8 @@ def test_unstable_confidence_baseline_too_thin_does_not_open_drop() -> None:
         observation_at=datetime.now(tz=UTC) - timedelta(seconds=5),
         processor_status=_processor_status(age_seconds=5),
         perception=_perception(confidences=[0.60] * 8),
-        baseline=_baseline(avg=0.95, sample_count=4),
+        current_window=_window(avg=0.60, sample_count=40),
+        baseline_window=_window(avg=0.95, sample_count=4),  # too thin -> ignored
     )
     _run(conn, account, camera)
     key = f"camera:{camera}:{_CONFIDENCE_KEY_SUFFIX}"
@@ -1223,10 +1236,10 @@ def test_unstable_confidence_baseline_too_thin_does_not_open_drop() -> None:
     ), conn.resolves
 
 
-def test_unstable_confidence_missing_baseline_does_not_block_resolution() -> None:
+def test_unstable_confidence_missing_windows_does_not_block_resolution() -> None:
     """Regression: a previously-open finding with healthy current stats and NO
-    baseline must still resolve. A missing baseline can never keep a recovered
-    camera flagged."""
+    window history must still resolve. Missing history can never keep a
+    recovered camera flagged."""
     account, camera = uuid4(), uuid4()
     key = f"camera:{camera}:{_CONFIDENCE_KEY_SUFFIX}"
     conn = FakeEvalConn(
@@ -1235,7 +1248,8 @@ def test_unstable_confidence_missing_baseline_does_not_block_resolution() -> Non
         observation_at=datetime.now(tz=UTC) - timedelta(seconds=5),
         processor_status=_processor_status(age_seconds=5),
         perception=_perception(confidences=[0.75, 0.80, 0.82, 0.85, 0.88, 0.90]),
-        baseline=None,
+        current_window=None,
+        baseline_window=None,
         preopen_finding_ids={key: uuid4()},
     )
     _run(conn, account, camera)
@@ -1244,6 +1258,27 @@ def test_unstable_confidence_missing_baseline_does_not_block_resolution() -> Non
         key in r["dedupe_keys"] and r["reason"] == "detection_confidence_stabilized"
         for r in conn.resolves
     ), conn.resolves
+
+
+def test_unstable_confidence_low_count_and_no_window_skips() -> None:
+    """No signal at all: the latest frame has < MIN_SAMPLE_COUNT detections
+    (per-frame stats null) AND there is no current window. The rule skips
+    (returns None) — it neither opens nor resolves, preserving any open
+    finding from when the camera was producing detections."""
+    account, camera = uuid4(), uuid4()
+    conn = FakeEvalConn(
+        session=_session(state="streaming"),
+        snapshot=_snapshot(age_seconds=5),
+        observation_at=datetime.now(tz=UTC) - timedelta(seconds=5),
+        processor_status=_processor_status(age_seconds=5),
+        perception=_perception(confidences=[0.55, 0.60]),  # 2 objects -> stats None
+        current_window=None,
+        baseline_window=None,
+    )
+    _run(conn, account, camera)
+    key = f"camera:{camera}:{_CONFIDENCE_KEY_SUFFIX}"
+    assert all(u["dedupe_key"] != key for u in conn.upserts)
+    assert all(key not in r["dedupe_keys"] for r in conn.resolves)
 
 
 def test_unstable_confidence_skipped_when_too_few_samples() -> None:
