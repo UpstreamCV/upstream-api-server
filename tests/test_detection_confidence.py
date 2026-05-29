@@ -18,7 +18,6 @@ import math
 
 from upstream_api.services.detection_confidence import (
     AVG_CONFIDENCE_WARNING_THRESHOLD,
-    BASELINE_EXCLUSION_SECONDS,
     CONFIDENCE_DROP_RATIO_WARNING_THRESHOLD,
     CONFIDENCE_STDDEV_WARNING_THRESHOLD,
     LOW_CONFIDENCE_RATIO_WARNING_THRESHOLD,
@@ -341,11 +340,26 @@ def test_count_objects_skips_non_mappings_and_handles_empty() -> None:
     assert count_detection_objects(None) == 0
 
 
-def test_m5_baseline_constants_have_expected_values() -> None:
+def test_m5_window_constants_have_expected_values() -> None:
     """Pin the M5 window/threshold constants the evaluator + metrics writer
     share, so a drift between them is caught here."""
     assert RECENT_WINDOW_SECONDS == 600
     assert PREVIOUS_WINDOW_SECONDS == 1800
-    assert BASELINE_EXCLUSION_SECONDS == 120
     assert MIN_BASELINE_SAMPLE_COUNT == 10
     assert CONFIDENCE_DROP_RATIO_WARNING_THRESHOLD == 0.30
+
+
+def test_min_sample_count_override_allows_low_sample_stats() -> None:
+    """The metrics writer overrides the per-frame gate to summarise a row from
+    as few as one confidence; the default (5) still returns None below 5."""
+    values = [0.8, 0.7]
+    assert compute_detection_confidence_stats(values) is None  # default gate (5)
+    out = compute_detection_confidence_stats(values, min_sample_count=1)
+    assert out is not None
+    assert out.sample_count == 2
+    assert abs(out.avg_confidence - 0.75) < 1e-9
+    # One sample is allowed too (pstdev of one value is 0.0).
+    one = compute_detection_confidence_stats([0.42], min_sample_count=1)
+    assert one is not None
+    assert one.sample_count == 1
+    assert one.confidence_stddev == 0.0

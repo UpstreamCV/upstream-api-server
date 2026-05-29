@@ -68,8 +68,8 @@ from upstream_api.services.detection_confidence import (
     extract_detection_confidences,
 )
 from upstream_api.services.detection_metrics import (
-    DetectionConfidenceBaseline,
-    fetch_detection_confidence_baseline,
+    DetectionConfidenceWindows,
+    fetch_detection_confidence_windows,
 )
 from upstream_api.services.image_analysis import ImageBrightness
 from upstream_api.services.processing_config import get_processing_config
@@ -193,12 +193,12 @@ class _Facts:
     # operator flipping it off. Each such rule short-circuits or resolves
     # when this is False with a dedicated reason.
     account_processing_enabled: bool = True
-    # M5: the camera's recent confidence baseline, a weighted average over
-    # ``snapshot_detection_metrics`` history (excluding the most recent slice).
-    # ``None`` means "not enough history to trust" -- the confidence rule then
-    # skips the drop-vs-baseline comparison entirely and behaves exactly as in
-    # M2. A missing baseline must never force-open or block resolution.
-    detection_confidence_baseline: DetectionConfidenceBaseline | None = None
+    # M5: rolling current vs. prior confidence windows over
+    # ``snapshot_detection_metrics`` history, for drop-vs-baseline drift.
+    # Either window is ``None`` when it holds too little history to trust; the
+    # rule then skips the drop comparison for that side. A missing window must
+    # never force-open a finding or block resolution.
+    detection_confidence_windows: DetectionConfidenceWindows | None = None
 
 
 # Minimal column set — we never need the full row, and dragging the whole row
@@ -270,11 +270,11 @@ async def _gather_facts(
         settings=settings, snapshot=snapshot, now=now
     )
     confidence_stats = _maybe_compute_confidence_stats(perception=perception_row, now=now)
-    # M5: recent confidence baseline from snapshot_detection_metrics history.
-    # ``None`` when there's too little history to trust (the rule then skips the
-    # drop comparison). This is the only place the evaluator touches the metrics
-    # table; the rule itself stays a pure function over the baseline.
-    confidence_baseline = await fetch_detection_confidence_baseline(
+    # M5: rolling current vs. prior confidence windows from
+    # snapshot_detection_metrics history (the drift signal). This is the only
+    # place the evaluator touches the metrics table; the rule stays a pure
+    # function over the windows.
+    confidence_windows = await fetch_detection_confidence_windows(
         conn, account_id=account_id, camera_id=camera_id, now=now
     )
 
@@ -289,7 +289,7 @@ async def _gather_facts(
         latest_perception_snapshot=perception_row,
         detection_confidence_stats=confidence_stats,
         account_processing_enabled=account_processing_enabled,
-        detection_confidence_baseline=confidence_baseline,
+        detection_confidence_windows=confidence_windows,
     )
 
 
@@ -736,36 +736,40 @@ def _evaluate_unstable_detection_confidence(facts: _Facts) -> _RuleOutput:
       ``snapshot.objects[].confidence`` in the latest perception snapshot. A
       frame with 10 detections at mean confidence 0.25 is a real concern even
       when the stream and lighting are healthy.
-    - M5 drift (vs. own history): the current average confidence has dropped
-      by more than ``CONFIDENCE_DROP_RATIO_WARNING_THRESHOLD`` versus the
-      camera's recent baseline -- a weighted average over
-      ``snapshot_detection_metrics`` (see ``fetch_detection_confidence_baseline``).
-      This catches "the workflow worked before, but production conditions
-      changed and confidence is now getting worse" even while the absolute
-      numbers still clear the static thresholds.
+    - M5 drift (vs. own history): the current confidence WINDOW (a weighted
+      average over the last ~10 min of ``snapshot_detection_metrics``) has
+      dropped by more than ``CONFIDENCE_DROP_RATIO_WARNING_THRESHOLD`` versus
+      the prior window (10-30 min ago). Because it aggregates over time rather
+      than per frame, it works at any per-frame object count -- a quiet 1-3
+      object scene still accumulates plenty of samples across the window. This
+      catches "the workflow worked before, but production conditions changed
+      and confidence is getting worse" even while the latest frame still clears
+      the static thresholds.
 
-    Both the stats and the baseline are computed during fact gathering so the
-    rule stays a pure function over ``facts``.
+    Both the per-frame stats and the windows are computed during fact gathering
+    so the rule stays a pure function over ``facts``. The two signals are
+    independent: the static thresholds judge the latest frame (and contribute
+    nothing when it has < MIN_SAMPLE_COUNT detections); drift judges the
+    windows (and contributes nothing when a window is too thin). Either can
+    open or resolve on its own.
 
     Trigger (any one):
-        avg_confidence    <  AVG_CONFIDENCE_WARNING_THRESHOLD
-        low_conf_ratio    >  LOW_CONFIDENCE_RATIO_WARNING_THRESHOLD
-        stddev            >  CONFIDENCE_STDDEV_WARNING_THRESHOLD
-        drop_ratio        >  CONFIDENCE_DROP_RATIO_WARNING_THRESHOLD  (only when
-                             a trustworthy baseline exists)
+        avg_confidence    <  AVG_CONFIDENCE_WARNING_THRESHOLD      (latest frame)
+        low_conf_ratio    >  LOW_CONFIDENCE_RATIO_WARNING_THRESHOLD (latest frame)
+        stddev            >  CONFIDENCE_STDDEV_WARNING_THRESHOLD     (latest frame)
+        drop_ratio        >  CONFIDENCE_DROP_RATIO_WARNING_THRESHOLD (current vs.
+                             prior window; only when BOTH windows exist)
 
-    Resolve (all of):
-        all three static stats healthy AND not a baseline drop. A missing or
-        too-thin baseline contributes no drop, so a recovered camera with no
-        history still resolves exactly as in M2 -- missing baseline never
-        blocks resolution.
+    Resolve:
+        every available signal healthy. A missing per-frame read (quiet/stale
+        frame) or a missing window (too little history) contributes no signal,
+        so it never blocks resolution and never force-opens.
 
     Skip (no finding either way):
-        stats is None -- no perception snapshot, stale, too few samples, or no
-        confidence values in the payload. "Too few samples" does NOT
-        auto-resolve: a model that suddenly stops producing detections
-        shouldn't silently close an open finding from when it WAS producing
-        them.
+        neither a per-frame read NOR a current window is available -- no current
+        confidence signal at all. This does NOT auto-resolve: a camera that has
+        gone quiet shouldn't silently close a finding opened while it was
+        producing detections.
 
     Co-exists with scene_too_dark by design: a dark frame and weak detections
     are two different signals worth surfacing. The dashboard ranks by severity,
@@ -773,7 +777,9 @@ def _evaluate_unstable_detection_confidence(facts: _Facts) -> _RuleOutput:
     """
     stats = facts.detection_confidence_stats
     perception = facts.latest_perception_snapshot
-    baseline = facts.detection_confidence_baseline
+    windows = facts.detection_confidence_windows
+    current = windows.current if windows is not None else None
+    baseline = windows.baseline if windows is not None else None
 
     # M3: processing master switch off -> resolve. Same posture as the
     # silent and dark rules. We're not going to claim model confidence
@@ -788,24 +794,36 @@ def _evaluate_unstable_detection_confidence(facts: _Facts) -> _RuleOutput:
     if not _is_session_live(facts.latest_session, now=facts.now):
         return _RuleResolved(reason="stream_no_longer_live")
 
-    if stats is None or perception is None:
+    # No current confidence signal at all (no fresh per-frame read AND no recent
+    # window) -> skip, preserving any open finding. We need a perception row to
+    # attribute the finding to a session.
+    if perception is None or (stats is None and current is None):
         return None
 
-    # M5 drop-vs-baseline. Only contributes when a trustworthy baseline exists;
-    # ``drop_ratio`` stays None and ``drop_unhealthy`` stays False otherwise, so
-    # a camera with no/too-little history behaves exactly as in M2.
-    previous_avg = baseline.previous_avg_confidence if baseline is not None else None
-    drop_ratio: float | None = None
-    if previous_avg is not None and previous_avg > 0:
-        drop_ratio = (previous_avg - stats.avg_confidence) / previous_avg
+    # Static per-frame signals. Only meaningful when the latest frame had enough
+    # detections to summarise; otherwise stats is None and these stay False,
+    # leaving drift to decide.
+    avg_unhealthy = stats is not None and stats.avg_confidence < AVG_CONFIDENCE_WARNING_THRESHOLD
+    ratio_unhealthy = (
+        stats is not None and stats.low_confidence_ratio > LOW_CONFIDENCE_RATIO_WARNING_THRESHOLD
+    )
+    stddev_unhealthy = (
+        stats is not None and stats.confidence_stddev > CONFIDENCE_STDDEV_WARNING_THRESHOLD
+    )
 
-    avg_unhealthy = stats.avg_confidence < AVG_CONFIDENCE_WARNING_THRESHOLD
-    ratio_unhealthy = stats.low_confidence_ratio > LOW_CONFIDENCE_RATIO_WARNING_THRESHOLD
-    stddev_unhealthy = stats.confidence_stddev > CONFIDENCE_STDDEV_WARNING_THRESHOLD
+    # M5 drift: current window vs. prior window. Only contributes when BOTH
+    # windows exist; otherwise drop_ratio stays None and drop_unhealthy stays
+    # False, so missing history never force-opens or blocks resolution.
+    current_avg = current.avg_confidence if current is not None else None
+    previous_avg = baseline.avg_confidence if baseline is not None else None
+    drop_ratio: float | None = None
+    if current_avg is not None and previous_avg is not None and previous_avg > 0:
+        drop_ratio = (previous_avg - current_avg) / previous_avg
     drop_unhealthy = drop_ratio is not None and drop_ratio > CONFIDENCE_DROP_RATIO_WARNING_THRESHOLD
 
-    # Resolve only when every signal is healthy. A missing baseline makes
-    # ``drop_unhealthy`` False, so it can never block resolution.
+    # Resolve only when every available signal is healthy. A missing per-frame
+    # read or a missing window contributes nothing, so it can never block
+    # resolution.
     if not (avg_unhealthy or ratio_unhealthy or stddev_unhealthy or drop_unhealthy):
         return _RuleResolved(reason="detection_confidence_stabilized")
 
@@ -824,17 +842,28 @@ def _evaluate_unstable_detection_confidence(facts: _Facts) -> _RuleOutput:
     evidence: dict[str, Any] = {
         "window_seconds": RECENT_WINDOW_SECONDS,
         # observation_count is reserved for a future over-time slice that pulls
-        # from per-event observations; today's current source is one perception row.
+        # from per-event observations.
         "observation_count": None,
-        "confidence_sample_count": stats.sample_count,
-        "avg_confidence": round(stats.avg_confidence, 3),
-        "median_confidence": round(stats.median_confidence, 3),
-        "min_confidence": round(stats.min_confidence, 3),
-        "max_confidence": round(stats.max_confidence, 3),
-        "low_confidence_ratio": round(stats.low_confidence_ratio, 3),
-        "confidence_stddev": round(stats.confidence_stddev, 3),
-        # M5: filled when a trustworthy baseline exists; null otherwise. The
-        # keys are always present so the dashboard renders a stable layout.
+        # Latest-frame per-frame stats. Null when the frame had fewer than
+        # MIN_SAMPLE_COUNT detections — the static rule then contributed nothing
+        # and the windowed drift drove this finding.
+        "confidence_sample_count": stats.sample_count if stats is not None else None,
+        "avg_confidence": round(stats.avg_confidence, 3) if stats is not None else None,
+        "median_confidence": round(stats.median_confidence, 3) if stats is not None else None,
+        "min_confidence": round(stats.min_confidence, 3) if stats is not None else None,
+        "max_confidence": round(stats.max_confidence, 3) if stats is not None else None,
+        "low_confidence_ratio": (
+            round(stats.low_confidence_ratio, 3) if stats is not None else None
+        ),
+        "confidence_stddev": round(stats.confidence_stddev, 3) if stats is not None else None,
+        # Rolling current window (the drift "current") and prior-window baseline.
+        # Filled when each window has enough samples; the keys are always present
+        # so the dashboard renders a stable layout.
+        "current_avg_confidence": (round(current_avg, 3) if current_avg is not None else None),
+        "current_confidence_sample_count": (
+            current.confidence_sample_count if current is not None else None
+        ),
+        "current_metric_count": (current.metric_count if current is not None else None),
         "previous_avg_confidence": (round(previous_avg, 3) if previous_avg is not None else None),
         "drop_ratio": (round(drop_ratio, 3) if drop_ratio is not None else None),
         "baseline_window_seconds": (baseline.window_seconds if baseline is not None else None),
@@ -857,9 +886,7 @@ def _evaluate_unstable_detection_confidence(facts: _Facts) -> _RuleOutput:
             captured_at.isoformat() if isinstance(captured_at, datetime) else captured_at
         ),
         "source": (
-            "latest_perception_snapshot_with_history"
-            if baseline is not None
-            else "latest_perception_snapshot"
+            "recent_window_history" if current is not None else "latest_perception_snapshot"
         ),
     }
 

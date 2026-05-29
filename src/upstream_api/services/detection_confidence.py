@@ -60,24 +60,26 @@ AVG_CONFIDENCE_WARNING_THRESHOLD: float = 0.45
 LOW_CONFIDENCE_RATIO_WARNING_THRESHOLD: float = 0.50
 CONFIDENCE_STDDEV_WARNING_THRESHOLD: float = 0.20
 
-# Drop-vs-recent-baseline thresholds and window sizes (reliability M5). The
-# evaluator compares the current snapshot's average confidence against a
-# weighted baseline computed from `snapshot_detection_metrics` history and
-# opens the finding when confidence has dropped by more than the threshold.
+# Drop-vs-recent-baseline thresholds and window sizes (reliability M5). Drift
+# is judged over ROLLING TIME WINDOWS of `snapshot_detection_metrics` history,
+# NOT per frame — so it works regardless of how many objects appear in any one
+# frame. The evaluator compares a weighted "current" window average against a
+# weighted "previous/baseline" window average and opens the finding when
+# confidence has dropped by more than the threshold.
 #
-# - RECENT_WINDOW_SECONDS: how recent the "current" metric history is (the
-#   evidence reports this as the current window; the live comparison uses the
-#   latest snapshot's stats).
-# - PREVIOUS_WINDOW_SECONDS: how far back the baseline reaches.
-# - BASELINE_EXCLUSION_SECONDS: the most-recent slice excluded from the
-#   baseline so the current snapshot isn't compared against itself.
-# - MIN_BASELINE_SAMPLE_COUNT: minimum total confidence samples across the
-#   baseline window before the baseline is trusted (too little history -> no
-#   drop comparison, and missing baseline never blocks resolution).
+# Two adjacent, non-overlapping windows:
+# - RECENT_WINDOW_SECONDS: the current window = the last 10 minutes.
+# - PREVIOUS_WINDOW_SECONDS: the baseline window reaches back this far; it is
+#   [now - PREVIOUS_WINDOW_SECONDS, now - RECENT_WINDOW_SECONDS) — i.e. 10-30
+#   minutes ago — so the current window is never compared against itself.
+# - MIN_BASELINE_SAMPLE_COUNT: minimum total confidence samples a window needs
+#   (current OR baseline) before its average is trusted. Robustness comes from
+#   aggregating many frames, so a quiet scene with 1-3 objects/frame still
+#   accumulates plenty of samples. Too little history -> no drop comparison,
+#   and a missing window never blocks resolution.
 CONFIDENCE_DROP_RATIO_WARNING_THRESHOLD: float = 0.30
 RECENT_WINDOW_SECONDS: int = 600
 PREVIOUS_WINDOW_SECONDS: int = 1800
-BASELINE_EXCLUSION_SECONDS: int = 120
 MIN_BASELINE_SAMPLE_COUNT: int = 10
 
 
@@ -192,6 +194,7 @@ def compute_detection_confidence_stats(
     values: Sequence[float],
     *,
     low_confidence_threshold: float = LOW_CONFIDENCE_THRESHOLD,
+    min_sample_count: int = MIN_SAMPLE_COUNT,
 ) -> DetectionConfidenceStats | None:
     """Summarize ``values``. Returns ``None`` when there are too few samples.
 
@@ -200,8 +203,14 @@ def compute_detection_confidence_stats(
     without rewiring this function. Single-sample ``pstdev`` is 0.0 (not an
     error) -- this is the population stddev definition; we don't have any
     inferential claim to make over one detection.
+
+    ``min_sample_count`` defaults to ``MIN_SAMPLE_COUNT`` (5) for the per-frame
+    static rule, where stats over 1-2 detections are statistically meaningless.
+    The detection-metrics writer overrides it to 1: a per-row summary is useful
+    even for a quiet frame, because drift aggregates those rows over a time
+    window where total sample count — not per-frame count — is what matters.
     """
-    if len(values) < MIN_SAMPLE_COUNT:
+    if len(values) < min_sample_count:
         return None
     avg = statistics.mean(values)
     median = statistics.median(values)

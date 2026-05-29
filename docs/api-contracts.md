@@ -1071,13 +1071,19 @@ Read it back via `GET /v1/cameras/{camera_id}/perception/latest`.
 
 Reliability M5 side-effect: on a successful upsert the API also writes one
 compact detection-confidence summary row to `snapshot_detection_metrics`
-(numeric stats only — never the raw snapshot). This is best-effort — isolated
-in a savepoint so a failure (or the table not existing yet) never fails the
-ingest. That history backs the `unstable_detection_confidence` reliability
-finding's drop-vs-recent-baseline trigger; the finding's `evidence` then
-carries `previous_avg_confidence`, `drop_ratio`, `baseline_window_seconds`,
+(numeric stats only — never the raw snapshot; a per-row average is summarised
+for any frame with ≥1 detection). This is best-effort — isolated in a savepoint
+so a failure (or the table not existing yet) never fails the ingest. That
+history backs the `unstable_detection_confidence` finding's drift trigger:
+confidence is aggregated over rolling time windows (current = last ~10 min vs.
+prior = 10–30 min ago, weighted by sample count), so drift fires when the
+current window drops > 30% from the prior window regardless of per-frame object
+count. The finding's `evidence` then carries `current_avg_confidence`,
+`previous_avg_confidence`, `drop_ratio`, `baseline_window_seconds`,
 `baseline_confidence_sample_count`, `baseline_metric_count`, and
-`trigger_reasons` (null/absent until enough history accumulates).
+`trigger_reasons` (null/absent until each window has enough samples). The
+per-frame static thresholds (avg/ratio/stddev over the latest snapshot) keep
+their original ≥5-detection gate and are unchanged.
 
 ### Intentionally deferred (not in M8.0)
 

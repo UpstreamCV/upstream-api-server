@@ -15,14 +15,14 @@ from typing import Any
 from uuid import uuid4
 
 from upstream_api.services.detection_confidence import (
-    BASELINE_EXCLUSION_SECONDS,
     MIN_BASELINE_SAMPLE_COUNT,
     PREVIOUS_WINDOW_SECONDS,
+    RECENT_WINDOW_SECONDS,
 )
 from upstream_api.services.detection_metrics import (
-    _BASELINE_SQL,
     _INSERT_DETECTION_METRIC_SQL,
-    fetch_detection_confidence_baseline,
+    _WINDOW_SQL,
+    fetch_detection_confidence_windows,
     write_detection_metrics_for_perception_snapshot,
 )
 
@@ -47,19 +47,45 @@ class FakeMetricWriteConn:
         return None
 
 
-class FakeBaselineConn:
-    """Returns one canned aggregate row for the baseline query and records the
-    args it was called with (so the window bounds can be asserted)."""
+class FakeWindowConn:
+    """Serves the rolling-window query. The current and baseline windows use
+    the same SQL with different [start, end) bounds, so we route by span:
+    the current window spans RECENT_WINDOW_SECONDS, the baseline window spans
+    (PREVIOUS_WINDOW_SECONDS - RECENT_WINDOW_SECONDS). Records every call so
+    the bounds can be asserted."""
 
-    def __init__(self, row: dict[str, Any] | None) -> None:
-        self.row = row
+    _CURRENT_SPAN = RECENT_WINDOW_SECONDS
+    _BASELINE_SPAN = PREVIOUS_WINDOW_SECONDS - RECENT_WINDOW_SECONDS
+
+    def __init__(
+        self,
+        *,
+        current: dict[str, Any] | None = None,
+        baseline: dict[str, Any] | None = None,
+    ) -> None:
+        self.current = current
+        self.baseline = baseline
         self.calls: list[tuple[Any, ...]] = []
 
     async def fetchrow(self, query: str, *args: Any) -> dict[str, Any] | None:
         if "from snapshot_detection_metrics" in query:
             self.calls.append(args)
-            return self.row
+            span = round((args[3] - args[2]).total_seconds())
+            if span == self._CURRENT_SPAN:
+                return self.current
+            if span == self._BASELINE_SPAN:
+                return self.baseline
+            raise AssertionError(f"unexpected window span {span}")
         return None
+
+
+def _window_row(*, avg: float, sample_count: int, metric_count: int = 6) -> dict[str, Any]:
+    """An aggregate window row whose weighted average equals ``avg``."""
+    return {
+        "weighted_sum": avg * sample_count,
+        "total_samples": sample_count,
+        "metric_count": metric_count,
+    }
 
 
 async def _write(conn: Any, **overrides: Any) -> Any:
@@ -107,25 +133,22 @@ async def test_writes_metric_for_normal_snapshot() -> None:
     assert result.avg_confidence == args[_AVG]
 
 
-async def test_writes_row_with_null_stats_when_too_few_samples() -> None:
-    """Below MIN_SAMPLE_COUNT (5) the row is still written to preserve history,
-    but the summary stats are null and avg comes back None."""
+async def test_writes_stats_for_low_sample_count() -> None:
+    """M5 fix: the writer summarises a row from as few as one confidence (the
+    per-frame 5-gate is the static rule's, not the history's) so quiet 1-3
+    object scenes still accumulate usable history for the rolling windows."""
     conn = FakeMetricWriteConn()
-    result = await _write(conn, snapshot={"objects": [{"confidence": 0.8}, {"confidence": 0.7}]})
+    result = await _write(conn, snapshot={"objects": [{"confidence": 0.8}, {"confidence": 0.6}]})
     assert result.written is True
     assert result.confidence_sample_count == 2
-    assert result.avg_confidence is None
+    assert result.avg_confidence is not None
+    assert abs(result.avg_confidence - 0.7) < 1e-9
     args = conn.inserts[0]
     assert args[_OBJECT_COUNT] == 2
     assert args[_SAMPLE_COUNT] == 2
-    assert args[_AVG] is None
-    assert args[_MEDIAN] is None
-    assert args[_MIN] is None
-    assert args[_MAX] is None
-    assert args[_LOW_RATIO] is None
-    assert args[_STDDEV] is None
-    # NOT-NULL columns still get a concrete value.
-    assert args[_LOW_COUNT] == 0
+    assert args[_AVG] is not None
+    assert args[_MIN] == 0.6
+    assert args[_MAX] == 0.8
 
 
 async def test_skips_invalid_confidence_values() -> None:
@@ -235,78 +258,82 @@ def test_insert_sql_pins_idempotency_target() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Recent baseline query.
+# Rolling-window query (drift).
 # ---------------------------------------------------------------------------
 
 
-async def test_baseline_weighted_average() -> None:
-    """Two windows worth of rows: (0.8 * 30) + (0.6 * 20) over 50 samples =
-    0.72 weighted average."""
-    conn = FakeBaselineConn(
-        {"weighted_sum": 0.8 * 30 + 0.6 * 20, "total_samples": 50, "metric_count": 9}
+async def test_windows_weighted_average() -> None:
+    """Current window weighted: (0.8*30)+(0.6*20) over 50 = 0.72; baseline 0.90."""
+    conn = FakeWindowConn(
+        current=_window_row(avg=0.72, sample_count=50, metric_count=9),
+        baseline=_window_row(avg=0.90, sample_count=120, metric_count=20),
     )
     now = datetime.now(tz=UTC)
-    baseline = await fetch_detection_confidence_baseline(
+    windows = await fetch_detection_confidence_windows(
         conn, account_id=uuid4(), camera_id=uuid4(), now=now
     )
-    assert baseline is not None
-    assert abs(baseline.previous_avg_confidence - 0.72) < 1e-9
-    assert baseline.confidence_sample_count == 50
-    assert baseline.metric_count == 9
-    assert baseline.window_seconds == PREVIOUS_WINDOW_SECONDS
+    assert windows.current is not None
+    assert abs(windows.current.avg_confidence - 0.72) < 1e-9
+    assert windows.current.confidence_sample_count == 50
+    assert windows.current.metric_count == 9
+    assert windows.current.window_seconds == RECENT_WINDOW_SECONDS
+    assert windows.baseline is not None
+    assert abs(windows.baseline.avg_confidence - 0.90) < 1e-9
+    assert windows.baseline.window_seconds == PREVIOUS_WINDOW_SECONDS
 
 
-async def test_baseline_none_when_too_few_samples() -> None:
-    conn = FakeBaselineConn(
-        {
-            "weighted_sum": 0.8 * (MIN_BASELINE_SAMPLE_COUNT - 1),
-            "total_samples": MIN_BASELINE_SAMPLE_COUNT - 1,
-            "metric_count": 2,
-        }
+async def test_window_none_when_too_few_samples() -> None:
+    """A window below MIN_BASELINE_SAMPLE_COUNT total samples is untrusted."""
+    conn = FakeWindowConn(
+        current=_window_row(avg=0.8, sample_count=MIN_BASELINE_SAMPLE_COUNT - 1),
+        baseline=_window_row(avg=0.9, sample_count=200),
     )
-    baseline = await fetch_detection_confidence_baseline(
+    windows = await fetch_detection_confidence_windows(
         conn, account_id=uuid4(), camera_id=uuid4(), now=datetime.now(tz=UTC)
     )
-    assert baseline is None
+    assert windows.current is None
+    assert windows.baseline is not None
 
 
-async def test_baseline_none_when_no_rows_match() -> None:
+async def test_window_none_when_no_rows_match() -> None:
     # Postgres returns one row of nulls when nothing matches the WHERE.
-    conn = FakeBaselineConn({"weighted_sum": None, "total_samples": None, "metric_count": 0})
-    baseline = await fetch_detection_confidence_baseline(
+    conn = FakeWindowConn(
+        current={"weighted_sum": None, "total_samples": None, "metric_count": 0},
+        baseline=None,
+    )
+    windows = await fetch_detection_confidence_windows(
         conn, account_id=uuid4(), camera_id=uuid4(), now=datetime.now(tz=UTC)
     )
-    assert baseline is None
+    assert windows.current is None
+    assert windows.baseline is None
 
 
-async def test_baseline_none_when_row_missing() -> None:
-    conn = FakeBaselineConn(None)
-    baseline = await fetch_detection_confidence_baseline(
-        conn, account_id=uuid4(), camera_id=uuid4(), now=datetime.now(tz=UTC)
+async def test_window_bounds_are_adjacent_and_non_overlapping() -> None:
+    """current = [now-RECENT, now); baseline = [now-PREVIOUS, now-RECENT). The
+    current window's start equals the baseline window's end — adjacent, so the
+    current data is never counted in its own baseline."""
+    conn = FakeWindowConn(
+        current=_window_row(avg=0.6, sample_count=40),
+        baseline=_window_row(avg=0.9, sample_count=80),
     )
-    assert baseline is None
-
-
-async def test_baseline_window_bounds_exclude_recent_slice() -> None:
-    """The query asks for [now - PREVIOUS_WINDOW, now - EXCLUSION) so the
-    current snapshot is never part of its own baseline."""
-    conn = FakeBaselineConn({"weighted_sum": 0.8 * 40, "total_samples": 40, "metric_count": 8})
     now = datetime(2026, 5, 29, 12, 0, 0, tzinfo=UTC)
-    await fetch_detection_confidence_baseline(conn, account_id=uuid4(), camera_id=uuid4(), now=now)
-    args = conn.calls[0]
-    window_start, window_end = args[2], args[3]
-    assert window_start == now - timedelta(seconds=PREVIOUS_WINDOW_SECONDS)
-    assert window_end == now - timedelta(seconds=BASELINE_EXCLUSION_SECONDS)
-    # Per-row minimum sample filter is bound too.
-    assert isinstance(args[4], int)
+    await fetch_detection_confidence_windows(conn, account_id=uuid4(), camera_id=uuid4(), now=now)
+    # Two calls: current then baseline.
+    cur_start, cur_end = conn.calls[0][2], conn.calls[0][3]
+    base_start, base_end = conn.calls[1][2], conn.calls[1][3]
+    assert cur_end == now
+    assert cur_start == now - timedelta(seconds=RECENT_WINDOW_SECONDS)
+    assert base_end == now - timedelta(seconds=RECENT_WINDOW_SECONDS)
+    assert base_start == now - timedelta(seconds=PREVIOUS_WINDOW_SECONDS)
+    assert base_end == cur_start  # adjacent, non-overlapping
 
 
-def test_baseline_sql_pins_predicates() -> None:
-    sql = _BASELINE_SQL.lower()
+def test_window_sql_pins_predicates() -> None:
+    sql = _WINDOW_SQL.lower()
     assert "from snapshot_detection_metrics" in sql
     assert "avg_confidence is not null" in sql
     assert "observed_at >=" in sql
-    assert "observed_at  <" in sql or "observed_at <" in sql
+    assert "observed_at <" in sql
     assert "sum(avg_confidence * confidence_sample_count)" in sql
 
 

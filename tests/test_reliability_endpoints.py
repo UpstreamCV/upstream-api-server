@@ -21,6 +21,7 @@ from fastapi.testclient import TestClient
 from upstream_api.app import create_app
 from upstream_api.db.pool import get_pool
 from upstream_api.security.deps import AgentAuth, CallerAuth, current_caller
+from upstream_api.services.detection_confidence import RECENT_WINDOW_SECONDS
 
 # ---------------------------------------------------------------------------
 # Fake pool plumbing.
@@ -74,10 +75,12 @@ class FakeReliabilityConn:
         # M2: latest_perception_snapshots row driving the
         # unstable_detection_confidence rule.
         perception_row: dict[str, Any] | None = None,
-        # M5: aggregate baseline row for the snapshot_detection_metrics query
-        # (weighted_sum / total_samples / metric_count). ``None`` -> no baseline,
-        # so the drop comparison is skipped (existing behavior).
-        baseline_row: dict[str, Any] | None = None,
+        # M5: aggregate rows for the rolling-window query (weighted_sum /
+        # total_samples / metric_count). The current and baseline windows share
+        # SQL but differ by [start, end) span, so the fake routes by span.
+        # ``None`` -> no row for that window (no signal).
+        current_window_row: dict[str, Any] | None = None,
+        baseline_window_row: dict[str, Any] | None = None,
         # Initial open findings the evaluator will see + the list endpoint will
         # return after evaluation. The evaluator's upserts mutate this map by
         # dedupe_key so re-opens look like UPDATE not INSERT.
@@ -90,7 +93,8 @@ class FakeReliabilityConn:
         self.processor_status_row = processor_status_row
         self.has_saved_geometry = has_saved_geometry
         self.perception_row = perception_row
-        self.baseline_row = baseline_row
+        self.current_window_row = current_window_row
+        self.baseline_window_row = baseline_window_row
         # Indexed by dedupe_key so the evaluator's lookup-for-update returns
         # an existing id when one is present.
         self.open_findings: dict[str, dict[str, Any]] = {
@@ -122,7 +126,10 @@ class FakeReliabilityConn:
         if "from latest_perception_snapshots" in query:
             return self.perception_row
         if "from snapshot_detection_metrics" in query:
-            return self.baseline_row
+            span = round((args[3] - args[2]).total_seconds())
+            if span == RECENT_WINDOW_SECONDS:
+                return self.current_window_row
+            return self.baseline_window_row
 
         # Reliability repo: lookup-for-update.
         if "from reliability_findings" in query and "for update" in query:

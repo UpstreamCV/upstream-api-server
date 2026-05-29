@@ -4,6 +4,56 @@ Reverse chronological. Newest at top. Every meaningful commit gets an entry foll
 
 ---
 
+## 2026-05-29 - Reliability M5 fix: window-aggregate confidence drift (works at low object counts)
+
+### Summary
+Field finding: on real cameras (1-3 objects/frame) the M5 drift finding never
+fired and `snapshot_detection_metrics.avg_confidence` was always null, because
+both the metric writer and the drift comparison reused M2's per-frame
+`MIN_SAMPLE_COUNT = 5` gate — meaningful for judging a single frame, wrong for
+a trend over time. This decouples them: the writer now summarises a per-row
+average for any frame with ≥1 detection, and drift is judged over rolling,
+weighted TIME WINDOWS (current = last 10 min vs. prior = 10-30 min ago, adjacent
+and non-overlapping) instead of the latest single frame. Robustness now comes
+from total samples per window (`MIN_BASELINE_SAMPLE_COUNT`), so a quiet scene
+still accumulates plenty of signal. The M2 per-frame static rule (avg / ratio /
+stddev over the latest snapshot) keeps its ≥5 gate and is unchanged. No
+migration change — the table is identical; rows simply start carrying
+`avg_confidence` for low-count frames, and the windows self-populate from new
+rows (no backfill).
+
+### Files touched
+- `services/detection_confidence.py` — `compute_detection_confidence_stats`
+  gains a `min_sample_count` param (writer passes 1; default stays 5); dropped
+  `BASELINE_EXCLUSION_SECONDS` (windows are adjacent now).
+- `services/detection_metrics.py` — writer summarises for ≥1 sample
+  (`_MIN_METRIC_SAMPLE_COUNT`); `fetch_detection_confidence_baseline` →
+  `fetch_detection_confidence_windows` returning current + prior
+  `DetectionConfidenceWindow`s (`_WINDOW_SQL`, no per-row min filter).
+- `services/reliability_evaluator.py` — `_Facts.detection_confidence_windows`;
+  rule restructured so the per-frame static signal (null at low count) and the
+  windowed drift signal are independent — either can open or resolve; drift
+  uses `current` vs `baseline` window averages. Evidence gains
+  `current_avg_confidence` / `current_confidence_sample_count` /
+  `current_metric_count`; `source` = `recent_window_history` when windowed.
+- Tests updated across `test_detection_confidence.py`, `test_detection_metrics.py`,
+  `test_reliability_evaluator.py` (window-routing fake by span; headline
+  low-object-count drift test), `test_reliability_endpoints.py`, and the
+  smoke `scripts/_smoke_reliability_inprocess.py` (Test 10 now low-count).
+- `docs/api-contracts.md` — windowed drift + new evidence fields.
+
+### Testing/checks
+- `uv run pytest` — 501 passed. ruff + ruff format + mypy(strict) clean.
+  Reliability smoke PASS. Dashboard: tsc / eslint / vitest clean (adds a
+  "Recent avg confidence" row for `current_avg_confidence`).
+
+### Follow-up TODOs
+- Retention/downsampling of `snapshot_detection_metrics` (unchanged from M5).
+- The current/prior window sizes + drop threshold are still fixed constants;
+  per-camera or learned sensitivity is a later milestone.
+
+---
+
 ## 2026-05-29 - Reliability M5: detection confidence history + drift
 
 ### Summary

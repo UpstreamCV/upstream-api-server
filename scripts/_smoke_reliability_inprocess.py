@@ -211,21 +211,15 @@ def main() -> None:
     ok("evidence carries age + threshold + session, no secrets", str(ev))
 
     # ----- Test 3b: dedupe (repeated evaluation) --------------------------
-    open_count_before = sum(
-        1 for f in conn.open_findings.values() if f["status"] == "open"
-    )
+    open_count_before = sum(1 for f in conn.open_findings.values() if f["status"] == "open")
     hit(client, "summary", camera)
     hit(client, "summary", camera)
-    open_count_after = sum(
-        1 for f in conn.open_findings.values() if f["status"] == "open"
-    )
+    open_count_after = sum(1 for f in conn.open_findings.values() if f["status"] == "open")
     assert open_count_after == open_count_before, (
         open_count_before,
         open_count_after,
     )
-    keys = [
-        f["dedupe_key"] for f in conn.open_findings.values() if f["status"] == "open"
-    ]
+    keys = [f["dedupe_key"] for f in conn.open_findings.values() if f["status"] == "open"]
     assert len(keys) == len(set(keys)), keys
     ok("dedupe stable across repeated reads", f"open={open_count_after}, unique keys")
 
@@ -374,11 +368,15 @@ def main() -> None:
     client = client_for(conn, account_id=account)
     summary = hit(client, "summary", camera)
     geom_types = [
-        f["finding_type"] for f in summary["top_findings"]
+        f["finding_type"]
+        for f in summary["top_findings"]
         if f["finding_type"] == "processor_using_default_geometry"
     ]
     assert not geom_types, summary
-    ok("missing applied_geometry block → no finding", "matches 'missing_applied_geometry' panel state")
+    ok(
+        "missing applied_geometry block → no finding",
+        "matches 'missing_applied_geometry' panel state",
+    )
 
     # ----- Test 6: Resolution ---------------------------------------------
     print()
@@ -393,9 +391,7 @@ def main() -> None:
     )
     client = client_for(conn, account_id=account)
     summary = hit(client, "summary", camera)
-    assert any(
-        f["finding_type"] == "latest_frame_stale" for f in summary["top_findings"]
-    )
+    assert any(f["finding_type"] == "latest_frame_stale" for f in summary["top_findings"])
     ok("warning opened (latest_frame_stale)", "open_count=%d" % summary["open_findings_count"])
 
     # Heal the snapshot and re-evaluate.
@@ -405,9 +401,9 @@ def main() -> None:
     assert summary["open_findings_count"] == 0, summary
     # And the underlying row is now status=resolved with a reason stamp.
     resolved_rows = [
-        f for f in conn.open_findings.values()
-        if f["finding_type"] == "latest_frame_stale"
-        and f["status"] == "resolved"
+        f
+        for f in conn.open_findings.values()
+        if f["finding_type"] == "latest_frame_stale" and f["status"] == "resolved"
     ]
     assert resolved_rows, [r["status"] for r in conn.open_findings.values()]
     assert resolved_rows[0]["resolved_at"] is not None, resolved_rows[0]
@@ -500,9 +496,7 @@ def main() -> None:
         ok("evidence carries threshold + dimensions, no secrets", "")
 
         # 8b — bright snapshot resolves with brightness_above_threshold reason.
-        async def _bright_loader(
-            *, settings: Any, snapshot_id: Any, storage_key: str
-        ) -> Any:
+        async def _bright_loader(*, settings: Any, snapshot_id: Any, storage_key: str) -> Any:
             return ImageBrightness(mean=180.0, width=1280, height=720)
 
         _sb_mod.get_brightness_for_snapshot = _bright_loader  # type: ignore[assignment]
@@ -511,7 +505,8 @@ def main() -> None:
         summary = hit(client, "summary", camera)
         assert summary["status"] == "healthy", summary
         resolved = [
-            r for r in conn.open_findings.values()
+            r
+            for r in conn.open_findings.values()
             if r["finding_type"] == "scene_too_dark_for_reliable_detection"
             and r["status"] == "resolved"
         ]
@@ -520,12 +515,8 @@ def main() -> None:
         ok("bright snapshot → resolved", "reason=brightness_above_threshold")
 
         # 8c — stale frame: the brightness rule must defer to latest_frame_stale.
-        async def _never_loader(
-            *, settings: Any, snapshot_id: Any, storage_key: str
-        ) -> Any:
-            raise AssertionError(
-                "brightness loader must not be called on stale snapshots"
-            )
+        async def _never_loader(*, settings: Any, snapshot_id: Any, storage_key: str) -> Any:
+            raise AssertionError("brightness loader must not be called on stale snapshots")
 
         _sb_mod.get_brightness_for_snapshot = _never_loader  # type: ignore[assignment]
         account2, camera2 = uuid4(), uuid4()
@@ -552,9 +543,7 @@ def main() -> None:
         )
 
         # 8d — loader returns None (download/decode fail) → no 500, no finding.
-        async def _none_loader(
-            *, settings: Any, snapshot_id: Any, storage_key: str
-        ) -> Any:
+        async def _none_loader(*, settings: Any, snapshot_id: Any, storage_key: str) -> Any:
             return None
 
         _sb_mod.get_brightness_for_snapshot = _none_loader  # type: ignore[assignment]
@@ -565,7 +554,8 @@ def main() -> None:
             snapshot_row={
                 **snapshot(age_seconds=5),
                 "storage_key": "acct/cam/d/k.jpg",
-                "width": 1, "height": 1,
+                "width": 1,
+                "height": 1,
             },
             observation_at=datetime.now(tz=UTC) - timedelta(seconds=5),
             processor_status_row=processor_status(
@@ -590,9 +580,7 @@ def main() -> None:
     print()
     print("Test 9 — unstable_detection_confidence (M2)")
 
-    def _perception_row(
-        *, confidences: list[float], age_seconds: float = 5
-    ) -> Any:
+    def _perception_row(*, confidences: list[float], age_seconds: float = 5) -> Any:
         n = datetime.now(tz=UTC)
         return {
             "id": uuid4(),
@@ -645,9 +633,9 @@ def main() -> None:
     summary = hit(client, "summary", camera)
     assert summary["status"] == "healthy", summary
     resolved = [
-        r for r in conn.open_findings.values()
-        if r["finding_type"] == "unstable_detection_confidence"
-        and r["status"] == "resolved"
+        r
+        for r in conn.open_findings.values()
+        if r["finding_type"] == "unstable_detection_confidence" and r["status"] == "resolved"
     ]
     assert resolved, [r["status"] for r in conn.open_findings.values()]
     assert resolved[0]["resolved_reason"] == "detection_confidence_stabilized", resolved[0]
@@ -684,26 +672,25 @@ def main() -> None:
     client = client_for(conn, account_id=account)
     summary = hit(client, "summary", camera)
     assert summary["status"] == "critical", summary
-    open_types = {
-        f["finding_type"] for f in conn.open_findings.values() if f["status"] == "open"
-    }
+    open_types = {f["finding_type"] for f in conn.open_findings.values() if f["status"] == "open"}
     assert "stream_valid_processor_silent" in open_types
     assert "unstable_detection_confidence" in open_types
     ok("M0 critical outranks M2 warning, both open in table", "")
 
-    # ----- Test 10: drop-vs-recent-baseline (M5) --------------------------
+    # ----- Test 10: drop-vs-recent-window drift (M5) ----------------------
     print()
-    print("Test 10 — unstable_detection_confidence drop-vs-baseline (M5)")
+    print("Test 10 — unstable_detection_confidence drift vs recent window (M5)")
 
-    def _baseline_row(*, avg: float, sample_count: int, metric_count: int = 8) -> Any:
+    def _window_row(*, avg: float, sample_count: int, metric_count: int = 12) -> Any:
         return {
             "weighted_sum": avg * sample_count,
             "total_samples": sample_count,
             "metric_count": metric_count,
         }
 
-    # 10a -- static stats are healthy (avg 0.60), but the camera's recent
-    # baseline averaged 0.90: a 33% drop opens the finding on drift alone.
+    # 10a -- the realistic scene: the latest frame has only 2 detections (so
+    # per-frame stats are null), but the rolling current window (0.60) has
+    # dropped 33% from the prior window (0.90). Drift opens on windowed history.
     account, camera = uuid4(), uuid4()
     conn = FakeReliabilityConn(
         camera_account_id=account,
@@ -711,8 +698,9 @@ def main() -> None:
         snapshot_row=snapshot(age_seconds=5),
         observation_at=datetime.now(tz=UTC) - timedelta(seconds=5),
         processor_status_row=processor_status(age_seconds=5),
-        perception_row=_perception_row(confidences=[0.60] * 8),
-        baseline_row=_baseline_row(avg=0.90, sample_count=40),
+        perception_row=_perception_row(confidences=[0.62, 0.58]),  # 2 objects
+        current_window_row=_window_row(avg=0.60, sample_count=40),
+        baseline_window_row=_window_row(avg=0.90, sample_count=120),
     )
     client = client_for(conn, account_id=account)
     summary = hit(client, "summary", camera)
@@ -720,24 +708,26 @@ def main() -> None:
     top = summary["top_findings"][0]
     assert top["finding_type"] == "unstable_detection_confidence", top
     ev = top["evidence"]
-    assert ev["avg_confidence"] == 0.6, ev  # statically healthy
+    assert ev["avg_confidence"] is None, ev  # per-frame null (only 2 detections)
     assert ev["trigger_reasons"] == ["drop_vs_recent_baseline"], ev
+    assert ev["current_avg_confidence"] == 0.6, ev
     assert ev["previous_avg_confidence"] == 0.9, ev
     assert ev["drop_ratio"] > 0.30, ev
     assert ev["baseline_window_seconds"] == 1800, ev
-    assert ev["baseline_confidence_sample_count"] == 40, ev
-    assert ev["source"] == "latest_perception_snapshot_with_history", ev
+    assert ev["source"] == "recent_window_history", ev
     for leak in ("http", "supabase", "service_role", "bucket", "storage_key"):
         assert leak not in str(ev).lower(), ev
     ok(
-        "healthy current stats but >30% drop vs baseline → needs_review",
-        f"avg={ev['avg_confidence']}, prev={ev['previous_avg_confidence']}, drop={ev['drop_ratio']}",
+        "low object count, >30% drop vs recent window → needs_review",
+        f"current={ev['current_avg_confidence']} prev={ev['previous_avg_confidence']} "
+        f"drop={ev['drop_ratio']}",
     )
 
-    # 10b -- confidence recovers (and history no longer shows a drop) → the
-    # finding resolves; a missing baseline does not block resolution.
+    # 10b -- confidence recovers and the windows no longer show a drop → the
+    # finding resolves; missing window history does not block resolution.
     conn.perception_row = _perception_row(confidences=[0.88] * 8)
-    conn.baseline_row = None
+    conn.current_window_row = None
+    conn.baseline_window_row = None
     summary = hit(client, "summary", camera)
     assert summary["status"] == "healthy", summary
     resolved = [
@@ -747,7 +737,7 @@ def main() -> None:
     ]
     assert resolved, [r["status"] for r in conn.open_findings.values()]
     assert resolved[0]["resolved_reason"] == "detection_confidence_stabilized", resolved[0]
-    ok("confidence recovers → resolved (missing baseline doesn't block)", "")
+    ok("confidence recovers → resolved (missing window doesn't block)", "")
 
     print()
     print(f"{GREEN}PASS{RESET} — reliability slice smoke complete")
