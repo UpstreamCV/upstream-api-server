@@ -4,6 +4,34 @@ Reverse chronological. Newest at top. Every meaningful commit gets an entry foll
 
 ---
 
+## 2026-05-29 - REPLICA IDENTITY FULL on Realtime-published RLS tables (perception snapshots + stream sessions)
+
+### Summary
+The dashboard live detection overlay's Supabase Realtime subscription was
+`SUBSCRIBED` but received **zero** `postgres_changes` events ("Fallback polling"
+forever), despite the table being on the `supabase_realtime` publication and the
+processor actively upserting rows.
+
+Root cause: **Supabase Realtime does not deliver `UPDATE`/`DELETE` events for an
+RLS-protected table unless the table is `REPLICA IDENTITY FULL`.** It authorizes
+each change by evaluating the table's RLS policy against the record, but with the
+default replica identity the WAL only carries the PRIMARY KEY for the old tuple,
+so a policy referencing other columns (`account_id`, in
+`latest_perception_snapshots_member_select` / `stream_sessions_member_select`)
+can't be evaluated → the event is dropped. `latest_perception_snapshots` is
+UPSERTed (one row per camera) so after the first INSERT every write is an UPDATE
+→ everything was dropped. `stream_sessions` has the same shape (state-transition
+UPDATEs the camera-detail Realtime listener depends on).
+
+Migration `20260529120000_replica_identity_full_realtime.sql` sets
+`REPLICA IDENTITY FULL` on both tables. Idempotent; negligible extra WAL for
+these small one-row-per-camera / per-session tables. No app code change here;
+the dashboard already filters to the viewed camera client-side.
+
+**Status:** the fix is confirmed only once the dashboard overlay chip reads
+"Realtime connected" (temporary console diagnostics added on the dashboard side
+to verify end-to-end this round).
+
 ## 2026-05-22 - P6-A: Geometry config API
 
 ### Summary
