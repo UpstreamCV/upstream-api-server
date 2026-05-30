@@ -4,6 +4,57 @@ Reverse chronological. Newest at top. Every meaningful commit gets an entry foll
 
 ---
 
+## 2026-05-30 - Reliability M7: confidence-trend read API (backs the Reliability tab chart)
+
+### Summary
+M6 created and scheduled the hourly `detection_confidence_hourly_rollups`; that
+history was invisible to users. M7 adds the read side: a camera-scoped endpoint
+that serves hourly detection-confidence history for the dashboard's new
+"Detection confidence trend" chart. The rollup table holds one row per
+(camera, hour, package); the read **aggregates across packages to one
+camera-level point per hour**, re-weighting the per-package weighted means by
+`confidence_sample_count` per-field (byte-for-byte the M6 weighting), over a
+both-edges hour-aligned window of completed hours. Internal weighted column
+names are renamed to clean public names and no tenant/internal columns are
+exposed. Pure read — the evaluator and M5 drift are untouched (drift still reads
+raw `snapshot_detection_metrics`). No migration (the M6 table + its
+`(account_id, camera_id, bucket_start desc)` index already exist).
+
+### Files touched
+- `services/reliability_trends.py` (new) — `_CONFIDENCE_TREND_SQL` (per-package
+  weighted aggregation, hour-aligned `[now-range, now)` window), `_RANGES`
+  (`24h`/`7d`), `get_confidence_trend_for_camera()`, pure `summarize_confidence_trend()`.
+- `schemas/reliability.py` — `ConfidenceTrendRange`/`Point`/`Summary`/`Response`.
+- `routers/reliability.py` — `GET /v1/cameras/{camera_id}/reliability/confidence-trend?range=`
+  (reuses the exact ownership/scoping idiom; `Literal` range → 422).
+- `tests/test_reliability_endpoints.py` (+`FakeReliabilityConn` trend branch and
+  endpoint cases), `tests/test_reliability_trends.py` (new — SQL pins + summary math).
+- `docs/api-contracts.md`, `docs/module-map.md`.
+
+### System interaction notes
+`GET …/reliability/confidence-trend → CurrentCaller.resolve_account → camera
+ownership check (404 camera_not_found) → get_confidence_trend_for_camera →
+_CONFIDENCE_TREND_SQL over detection_confidence_hourly_rollups → ConfidenceTrendResponse`.
+The dashboard fetches it resiliently (any failure → "unavailable" card, never
+breaking the Reliability tab).
+
+### Testing/checks
+- `uv run pytest -q` → 543 passed (19 new M7 + M5/M6 regression). ruff + `mypy src`
+  strict clean. SQL sqlglot-validated (Postgres dialect, 6 FILTER clauses).
+- Designed + reviewed via multi-agent workflows. The adversarial review caught a
+  latent off-by-one: the read window had no upper bound, so `order by asc limit`
+  could (in a clock-skew/backfill edge) drop the newest point. Fixed by adding an
+  explicit hour-aligned upper bound `bucket_start < date_trunc('hour', now)` so
+  the window admits exactly `lookback_hours` completed hours — self-bounding,
+  independent of the M6 writer's current-hour exclusion.
+- No live DB locally; SQL pinned by substring + sqlglot.
+
+### Follow-up TODOs
+- 30d range; optional daily buckets; a second plotted series (low-confidence
+  ratio is tooltip-only in v1); per-package breakdown.
+
+---
+
 ## 2026-05-29 - Reliability M6: detection metrics retention + hourly rollup
 
 ### Summary

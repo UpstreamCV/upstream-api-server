@@ -81,3 +81,55 @@ class ReliabilitySummaryResponse(BaseModel):
     top_findings: list[ReliabilityFindingRecord]
     recommended_next_action: str | None
     last_evaluated_at: datetime
+
+
+# ---------------------------------------------------------------------------
+# Confidence trend (reliability M7) — hourly detection-confidence history for
+# the camera Reliability tab's trend chart. Backed by the M6
+# ``detection_confidence_hourly_rollups`` table; the read API aggregates across
+# packages to ONE camera-level point per hour and renames the internal weighted
+# columns to clean public names (avg_confidence_weighted -> avg_confidence,
+# etc.). NO internal/tenant columns (account_id, stream_session_id, package_id,
+# source) are exposed — same account-scoped posture as ReliabilityFindingRecord.
+# ---------------------------------------------------------------------------
+
+# Closed for M7. 30d (and finer/daily buckets) are a future milestone.
+ConfidenceTrendRange = Literal["24h", "7d"]
+
+
+class ConfidenceTrendPoint(BaseModel):
+    """One hourly point, aggregated across packages. Confidence stats are
+    ``None`` for an hour whose rollups carried no usable confidence (e.g.
+    empty-frame hours) — the dashboard renders those as gaps in the line."""
+
+    bucket_start: datetime
+    bucket_end: datetime
+    avg_confidence: float | None
+    min_confidence: float | None
+    max_confidence: float | None
+    low_confidence_ratio: float | None
+    confidence_stddev: float | None
+    metric_count: int
+    object_count_total: int
+    confidence_sample_count: int
+
+
+class ConfidenceTrendSummary(BaseModel):
+    """Headline stats over the returned points. ``latest_*`` read the most
+    recent point that actually has a confidence value, so a trailing empty hour
+    never blanks the headline while data exists."""
+
+    point_count: int
+    latest_avg_confidence: float | None
+    lowest_avg_confidence: float | None
+    highest_avg_confidence: float | None
+    total_confidence_samples: int
+    latest_bucket_start: datetime | None
+
+
+class ConfidenceTrendResponse(BaseModel):
+    camera_id: UUID
+    range: ConfidenceTrendRange
+    bucket_size: Literal["1h"]
+    points: list[ConfidenceTrendPoint]
+    summary: ConfidenceTrendSummary

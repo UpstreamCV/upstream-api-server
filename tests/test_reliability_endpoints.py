@@ -85,6 +85,10 @@ class FakeReliabilityConn:
         # return after evaluation. The evaluator's upserts mutate this map by
         # dedupe_key so re-opens look like UPDATE not INSERT.
         initial_open_findings: list[dict[str, Any]] | None = None,
+        # M7: canned aggregated rows the confidence-trend query (the only fetch
+        # that selects `from detection_confidence_hourly_rollups`) returns. Keys
+        # must match the SQL aliases (the API field names).
+        confidence_trend_rows: list[dict[str, Any]] | None = None,
     ) -> None:
         self.camera_account_id = camera_account_id
         self.session_row = session_row
@@ -101,6 +105,7 @@ class FakeReliabilityConn:
             f["dedupe_key"]: f for f in (initial_open_findings or [])
         }
         self.resolves: list[dict[str, Any]] = []
+        self.confidence_trend_rows = confidence_trend_rows or []
 
     def transaction(self) -> FakeTx:
         return FakeTx()
@@ -153,6 +158,10 @@ class FakeReliabilityConn:
         return None
 
     async def fetch(self, query: str, *args: Any) -> list[dict[str, Any]]:
+        # M7: confidence-trend read (the only fetch over the rollup table).
+        if "from detection_confidence_hourly_rollups" in query:
+            return list(self.confidence_trend_rows)
+
         # Repo: list open for camera (severity-first ordering).
         if "from reliability_findings" in query and "status     = 'open'" in query:
             limit = int(args[2])
@@ -969,3 +978,184 @@ def test_findings_status_resolved_is_empty_when_nothing_resolved() -> None:
     r = client.get(_FINDINGS_PATH.format(camera_id=camera) + "?status=resolved")
     assert r.status_code == 200
     assert r.json()["findings"] == []
+
+
+# ===========================================================================
+# confidence-trend (M7 — Reliability tab confidence trend chart).
+# ===========================================================================
+
+
+_TREND_PATH = "/v1/cameras/{camera_id}/reliability/confidence-trend"
+_BASE_HOUR = datetime(2026, 5, 30, 12, 0, 0, tzinfo=UTC)
+
+
+def _trend_row(
+    hour_offset: int,
+    *,
+    avg: float | None,
+    samples: int,
+    low_ratio: float | None = None,
+    stddev: float | None = None,
+    mn: float | None = None,
+    mx: float | None = None,
+    metric_count: int | None = None,
+    object_count_total: int | None = None,
+) -> dict[str, Any]:
+    """One already-aggregated trend point (keys = the SQL aliases / API names)."""
+    bucket_start = _BASE_HOUR + timedelta(hours=hour_offset)
+    return {
+        "bucket_start": bucket_start,
+        "bucket_end": bucket_start + timedelta(hours=1),
+        "avg_confidence": avg,
+        "min_confidence": mn,
+        "max_confidence": mx,
+        "low_confidence_ratio": low_ratio,
+        "confidence_stddev": stddev,
+        "metric_count": metric_count if metric_count is not None else samples,
+        "object_count_total": object_count_total if object_count_total is not None else samples * 2,
+        "confidence_sample_count": samples,
+    }
+
+
+def test_confidence_trend_unauthenticated_401() -> None:
+    conn = FakeReliabilityConn(camera_account_id=uuid4())
+    r = _caller_client_no_auth(conn).get(_TREND_PATH.format(camera_id=uuid4()))
+    assert r.status_code == 401
+
+
+def test_confidence_trend_cross_account_404() -> None:
+    caller_account, camera_owner = uuid4(), uuid4()
+    conn = FakeReliabilityConn(camera_account_id=camera_owner)
+    r = _caller_client(conn, account_id=caller_account).get(_TREND_PATH.format(camera_id=uuid4()))
+    assert r.status_code == 404
+    assert r.json()["error"]["code"] == "camera_not_found"
+
+
+def test_confidence_trend_unknown_camera_404() -> None:
+    account = uuid4()
+    conn = FakeReliabilityConn(camera_account_id=None)
+    r = _caller_client(conn, account_id=account).get(_TREND_PATH.format(camera_id=uuid4()))
+    assert r.status_code == 404
+    assert r.json()["error"]["code"] == "camera_not_found"
+
+
+def test_confidence_trend_invalid_range_422() -> None:
+    account = uuid4()
+    conn = FakeReliabilityConn(camera_account_id=account)
+    r = _caller_client(conn, account_id=account).get(
+        _TREND_PATH.format(camera_id=uuid4()) + "?range=banana"
+    )
+    assert r.status_code == 422
+
+
+def test_confidence_trend_default_range_is_24h() -> None:
+    account, camera = uuid4(), uuid4()
+    conn = FakeReliabilityConn(camera_account_id=account, confidence_trend_rows=[])
+    r = _caller_client(conn, account_id=account).get(_TREND_PATH.format(camera_id=camera))
+    assert r.status_code == 200, r.text
+    assert r.json()["range"] == "24h"
+    assert r.json()["bucket_size"] == "1h"
+
+
+def test_confidence_trend_7d_range_accepted() -> None:
+    account, camera = uuid4(), uuid4()
+    conn = FakeReliabilityConn(camera_account_id=account, confidence_trend_rows=[])
+    r = _caller_client(conn, account_id=account).get(
+        _TREND_PATH.format(camera_id=camera) + "?range=7d"
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["range"] == "7d"
+
+
+def test_confidence_trend_empty_points() -> None:
+    account, camera = uuid4(), uuid4()
+    conn = FakeReliabilityConn(camera_account_id=account, confidence_trend_rows=[])
+    r = _caller_client(conn, account_id=account).get(_TREND_PATH.format(camera_id=camera))
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["camera_id"] == str(camera)
+    assert body["points"] == []
+    s = body["summary"]
+    assert s["point_count"] == 0
+    assert s["latest_avg_confidence"] is None
+    assert s["lowest_avg_confidence"] is None
+    assert s["highest_avg_confidence"] is None
+    assert s["total_confidence_samples"] == 0
+    assert s["latest_bucket_start"] is None
+
+
+def test_confidence_trend_200_ok_returns_points_ascending() -> None:
+    account, camera = uuid4(), uuid4()
+    conn = FakeReliabilityConn(
+        camera_account_id=account,
+        confidence_trend_rows=[
+            _trend_row(0, avg=0.80, samples=100, low_ratio=0.10, stddev=0.05, mn=0.5, mx=0.95),
+            _trend_row(1, avg=0.60, samples=80, low_ratio=0.40, stddev=0.15, mn=0.4, mx=0.9),
+        ],
+    )
+    r = _caller_client(conn, account_id=account).get(_TREND_PATH.format(camera_id=camera))
+    assert r.status_code == 200, r.text
+    pts = r.json()["points"]
+    assert len(pts) == 2
+    # Order preserved (the SQL orders ascending; pinned in test_reliability_trends).
+    assert pts[0]["bucket_start"] < pts[1]["bucket_start"]
+    assert pts[0]["avg_confidence"] == 0.80
+    assert pts[0]["low_confidence_ratio"] == 0.10
+    assert pts[0]["confidence_stddev"] == 0.05
+    assert pts[0]["min_confidence"] == 0.5
+    assert pts[0]["max_confidence"] == 0.95
+    assert pts[0]["confidence_sample_count"] == 100
+
+
+def test_confidence_trend_maps_db_names_to_api_names() -> None:
+    """Response must use clean API names, never the internal weighted columns."""
+    account, camera = uuid4(), uuid4()
+    conn = FakeReliabilityConn(
+        camera_account_id=account,
+        confidence_trend_rows=[_trend_row(0, avg=0.7, samples=50, low_ratio=0.2, stddev=0.1)],
+    )
+    r = _caller_client(conn, account_id=account).get(_TREND_PATH.format(camera_id=camera))
+    raw = r.text
+    assert "avg_confidence" in raw and "low_confidence_ratio" in raw and "confidence_stddev" in raw
+    assert "avg_confidence_weighted" not in raw
+    assert "avg_low_confidence_ratio_weighted" not in raw
+    assert "avg_confidence_stddev_weighted" not in raw
+
+
+def test_confidence_trend_no_internal_fields_leak() -> None:
+    account, camera = uuid4(), uuid4()
+    conn = FakeReliabilityConn(
+        camera_account_id=account,
+        confidence_trend_rows=[_trend_row(0, avg=0.7, samples=50)],
+    )
+    r = _caller_client(conn, account_id=account).get(_TREND_PATH.format(camera_id=camera))
+    raw = r.text
+    for leaked in ("account_id", "stream_session_id", "package_id", '"source"'):
+        assert leaked not in raw
+
+
+def test_confidence_trend_summary_math() -> None:
+    """latest_* read the most recent RATED point (a trailing empty hour does not
+    blank the headline), latest_bucket_start is the last point regardless, and
+    total samples sum every point."""
+    account, camera = uuid4(), uuid4()
+    conn = FakeReliabilityConn(
+        camera_account_id=account,
+        confidence_trend_rows=[
+            _trend_row(0, avg=0.80, samples=100),
+            _trend_row(1, avg=0.60, samples=80),
+            _trend_row(2, avg=None, samples=20),  # trailing empty hour
+        ],
+    )
+    r = _caller_client(conn, account_id=account).get(_TREND_PATH.format(camera_id=camera))
+    assert r.status_code == 200, r.text
+    s = r.json()["summary"]
+    assert s["point_count"] == 3
+    assert s["latest_avg_confidence"] == 0.60  # last rated, not the null point
+    assert s["lowest_avg_confidence"] == 0.60
+    assert s["highest_avg_confidence"] == 0.80
+    assert s["total_confidence_samples"] == 200  # 100 + 80 + 20
+    # Format-agnostic: parse the serialized timestamp back and compare instants.
+    got = s["latest_bucket_start"]
+    assert got is not None
+    assert datetime.fromisoformat(got.replace("Z", "+00:00")) == _BASE_HOUR + timedelta(hours=2)

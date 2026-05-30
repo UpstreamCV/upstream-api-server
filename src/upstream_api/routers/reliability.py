@@ -26,6 +26,7 @@ from fastapi import APIRouter, Query
 
 from upstream_api.errors import NotFoundError
 from upstream_api.schemas.reliability import (
+    ConfidenceTrendResponse,
     ReliabilityFindingsResponse,
     ReliabilitySummaryResponse,
 )
@@ -34,6 +35,7 @@ from upstream_api.services.reliability_service import (
     get_findings_for_camera,
     get_summary_for_camera,
 )
+from upstream_api.services.reliability_trends import get_confidence_trend_for_camera
 
 router = APIRouter(tags=["reliability"])
 
@@ -117,4 +119,43 @@ async def get_reliability_findings(
             account_id=scope_account,
             camera_id=camera_id,
             limit=limit,
+        )
+
+
+@router.get(
+    "/v1/cameras/{camera_id}/reliability/confidence-trend",
+    response_model=ConfidenceTrendResponse,
+)
+async def get_reliability_confidence_trend(
+    camera_id: UUID,
+    caller: CurrentCaller,
+    pool: PoolDep,
+    settings: SettingsDep,
+    account_id: Annotated[UUID | None, Query()] = None,
+    range_: Annotated[Literal["24h", "7d"], Query(alias="range")] = "24h",
+) -> ConfidenceTrendResponse:
+    """Hourly detection-confidence history for one camera (reliability M7).
+
+    Reads the M6 ``detection_confidence_hourly_rollups`` table, aggregating
+    across packages to one camera-level point per hour, for the requested
+    ``range`` (``24h`` default, ``7d``). A bogus ``range`` returns 422 (Pydantic
+    ``Literal``). Returns 404 ``camera_not_found`` when ownership doesn't match.
+
+    Pure read — it does NOT run the evaluator and does NOT touch raw metrics or
+    M5 drift; these rollups are long-term chart history only.
+    """
+    scope_account = caller.resolve_account(account_id)
+    async with pool.acquire() as conn, conn.transaction():
+        owner_row = await conn.fetchrow(
+            "select account_id from cameras where id = $1",
+            camera_id,
+        )
+        if owner_row is None or owner_row["account_id"] != scope_account:
+            raise NotFoundError("Camera not found.", code="camera_not_found")
+
+        return await get_confidence_trend_for_camera(
+            conn,
+            account_id=scope_account,
+            camera_id=camera_id,
+            range_=range_,
         )
