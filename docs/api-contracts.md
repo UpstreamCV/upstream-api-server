@@ -1108,6 +1108,28 @@ input.** Constants (override per run): `RAW_METRIC_RETENTION_HOURS=72`,
 over retention is catch-up margin so a lapsed-then-resumed run still rolls up
 prunable hours before deleting their raw rows).
 
+`GET /v1/cameras/{camera_id}/reliability/confidence-trend?range=24h` (Reliability
+M7) — hourly detection-confidence history for the camera Reliability tab's trend
+chart. Same auth/scoping as the other reliability reads (`CurrentCaller` +
+camera-ownership → 404 `camera_not_found` on missing/cross-account; bad `range`
+→ 422). `range` is `24h` (default) or `7d`; `bucket_size` is always `1h`. It
+reads the M6 `detection_confidence_hourly_rollups` and **aggregates across
+packages to one camera-level point per hour**, re-weighting per-package weighted
+means by `confidence_sample_count` (mirrors M6's per-field weighting). Internal
+weighted column names are renamed to clean public names and no
+account/session/package/source columns are exposed. Response:
+`{camera_id, range, bucket_size:"1h", points:[{bucket_start, bucket_end,
+avg_confidence, min_confidence, max_confidence, low_confidence_ratio,
+confidence_stddev, metric_count, object_count_total, confidence_sample_count}],
+summary:{point_count, latest_avg_confidence, lowest_avg_confidence,
+highest_avg_confidence, total_confidence_samples, latest_bucket_start}}`. Points
+are oldest-first over the last `range` of **completed** whole hours (the current
+incomplete hour is excluded); confidence fields are `null` for an hour that
+carried no usable confidence (the dashboard renders those as gaps). Pure read —
+**does not run the evaluator and does not touch raw metrics or M5 drift**; these
+rollups are long-term chart history only. The dashboard fetches it resiliently
+(any failure degrades to an "unavailable" card, never breaking the tab).
+
 ### Intentionally deferred (not in M8.0)
 
 - `upstream-processor` repo, DeepStream runtime, YOLO/person detection, Triton
