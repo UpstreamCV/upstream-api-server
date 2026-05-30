@@ -50,8 +50,14 @@ def _eprint(*args: object) -> None:
 
 async def main_async(args: argparse.Namespace) -> int:
     settings = get_settings()
-    conn = await asyncpg.connect(settings.database_url.get_secret_value())
+    # The connect() is INSIDE the try so a connection failure (bad DSN, DB down,
+    # DNS) surfaces as the same clean one-line [error] as a rollup failure rather
+    # than an unhandled traceback — connection failure is the most common way a
+    # cron/maintenance run breaks. asyncpg exception messages do not contain the
+    # password, and we never print the DSN.
+    conn: asyncpg.Connection | None = None
     try:
+        conn = await asyncpg.connect(settings.database_url.get_secret_value())
         result = await run_detection_metrics_rollup(
             conn,
             lookback_hours=args.lookback_hours,
@@ -62,7 +68,8 @@ async def main_async(args: argparse.Namespace) -> int:
         _eprint(f"[error] detection metrics rollup failed: {type(exc).__name__}: {exc}")
         return 1
     finally:
-        await conn.close()
+        if conn is not None:
+            await conn.close()
 
     print(json.dumps(result.to_dict()))
     _eprint(
