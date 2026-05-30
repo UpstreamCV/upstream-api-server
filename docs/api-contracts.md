@@ -1085,6 +1085,29 @@ count. The finding's `evidence` then carries `current_avg_confidence`,
 per-frame static thresholds (avg/ratio/stddev over the latest snapshot) keep
 their original ≥5-detection gate and are unchanged.
 
+Reliability M6 retention + rollup: `snapshot_detection_metrics` is now treated as
+**raw, short-term** history (kept ~72h) and is rolled up into compact **hourly**
+summaries in a new `detection_confidence_hourly_rollups` table (kept ~90d) for
+future long-term confidence trend charts. There is **no new HTTP surface** — this
+is a maintenance operation, not an endpoint. A SQL-set-based rollup +
+coverage-guarded prune lives in `services/detection_metrics_rollup.py` and is run
+via `scripts/run_detection_metrics_rollup.py` (manual / future cron; no pg_cron in
+this project). One atomic pass: roll completed hours up (idempotent upsert),
+prune raw rows older than the hour-aligned 72h cutoff **only where an hourly
+bucket already covers them** (never delete un-rolled data), then age out 90d-old
+rollups. The rollup table stores per-(account, camera, hour, package) weighted
+summaries (`avg_confidence_weighted`, `min/max_confidence`,
+`avg_low_confidence_ratio_weighted`, `avg_confidence_stddev_weighted`,
+`metric_count`, `object_count_total`, `confidence_sample_count`) — numeric only,
+never the raw snapshot. RLS member-select + `grant select to authenticated`,
+same posture as the raw table. **The M5 drift evaluator is unchanged: it keeps
+reading raw `snapshot_detection_metrics` (its ~30-min window sits well inside the
+72h raw-retention horizon); hourly rollups are long-term history, not a drift
+input.** Constants (override per run): `RAW_METRIC_RETENTION_HOURS=72`,
+`HOURLY_ROLLUP_RETENTION_DAYS=90`, `ROLLUP_LOOKBACK_HOURS=96` (the 24h surplus
+over retention is catch-up margin so a lapsed-then-resumed run still rolls up
+prunable hours before deleting their raw rows).
+
 ### Intentionally deferred (not in M8.0)
 
 - `upstream-processor` repo, DeepStream runtime, YOLO/person detection, Triton

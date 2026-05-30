@@ -81,6 +81,8 @@ Notable design choices:
 - `session_lifecycle.py` — `start_session()`, `stop_session()`. Owns the state machine. `start_session` fetches the camera once, derives `agent_id`, checks busy + limits, mints the JWT, inserts the row, writes `usage_events`.
 - `usage.py` — `record_event()`. Wraps the insert in a `conn.transaction()` savepoint so a missing-`usage_events`-table error (until Phase 5) doesn't abort the parent transaction.
 - `processor.py` (M8.0) — `fetch_eligible_sessions()` (the eligibility WHERE clause is the single source of truth; inner `join lateral` picks the latest validation), `upsert_processor_status()` (upsert by `(processor_id, stream_session_id)`), `insert_observation()`, plus `coerce_jsonb` / `parse_iso_datetime` coercion helpers.
+- `detection_metrics.py` (reliability M5) — writes one compact confidence-summary row to `snapshot_detection_metrics` per accepted perception snapshot (`write_detection_metrics_for_perception_snapshot`) and reads rolling current-vs-baseline windows back for drift (`fetch_detection_confidence_windows`, `_WINDOW_SQL`). Numeric summaries only; never the raw snapshot.
+- `detection_metrics_rollup.py` (reliability M6) — retention + downsampling maintenance for `snapshot_detection_metrics`. `run_detection_metrics_rollup()` rolls completed hours into `detection_confidence_hourly_rollups` (`_ROLLUP_HOURLY_SQL`, idempotent upsert), then prunes raw rows past a 72h hour-aligned cutoff that a bucket already covers (`_PRUNE_RAW_SQL`, coverage join), then ages out 90d-old rollups (`_PRUNE_ROLLUPS_SQL`) — all in one transaction with a single captured `now`. Named retention constants + a pure-Python reference (`compute_hourly_rollup_buckets`) for the weighted math. Does NOT touch the M5 drift path.
 
 ### `routers/`
 
@@ -120,3 +122,4 @@ Pydantic v2 request/response models, one file per resource: `agents.py`, `camera
 
 - `seed_dev_token.py` — mints a real API token using `issue_token()` and prints SQL to insert it for the seeded local-dev account (`00000000-0000-0000-0000-000000000001`). The plaintext is echoed to stderr only.
 - `smoke_local.py` — end-to-end smoke test: register agent → register camera → start session → decode JWT claims → stop session. Reads `UPSTREAM_API_URL` and `UPSTREAM_DEV_TOKEN` from env.
+- `run_detection_metrics_rollup.py` (reliability M6) — manual maintenance runner. Connects with `UPSTREAM_DATABASE_URL` (service-role) and calls `run_detection_metrics_rollup()`, printing a JSON summary of counts (`rolled_up_buckets` / `raw_rows_pruned` / `hourly_rows_pruned`). Retention windows overridable via `--lookback-hours` / `--raw-retention-hours` / `--hourly-retention-days`. Not a public endpoint; no cron yet (run manually / future systemd timer).

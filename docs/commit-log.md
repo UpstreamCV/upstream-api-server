@@ -4,6 +4,91 @@ Reverse chronological. Newest at top. Every meaningful commit gets an entry foll
 
 ---
 
+## 2026-05-29 - Reliability M6: detection metrics retention + hourly rollup
+
+### Summary
+`snapshot_detection_metrics` (M5) is append-only and grows ~1 row/sec/camera, so
+it can't be kept at full resolution forever. M6 adds retention + downsampling:
+completed hours of raw metrics are rolled up into a new compact
+`detection_confidence_hourly_rollups` table (per account/camera/hour/package
+weighted confidence summaries, kept ~90d), raw rows past a 72h hour-aligned
+cutoff are pruned **only where an hourly bucket already covers them**, and very
+old hourly rows are aged out — all in one atomic maintenance pass driven by a
+manual script. No charts yet; this is the storage/retention foundation. The M5
+drift evaluator is deliberately untouched — it keeps reading raw metrics (its
+~30-min window is far inside the 72h raw-retention horizon); rollups are
+long-term history for future Reliability-tab trend charts, not a drift input.
+
+Safety design: both the rollup lookback lower bound and the prune cutoff are
+HOUR-ALIGNED, so the rollup only ever scans whole hours and the prune deletes
+whole buckets atomically — a bucket is never recomputed from, or pruned out of,
+a partial slice of its hour. `ROLLUP_LOOKBACK_HOURS=96 > RAW_METRIC_RETENTION_HOURS=72`
+on purpose: the 24h surplus is catch-up so a lapsed-then-resumed run still rolls
+up prunable hours before deleting their raw rows. The coverage join (not the age
+filter) is the load-bearing "never delete un-rolled data" guarantee.
+
+### Files touched
+- `supabase/migrations/20260529150000_detection_confidence_hourly_rollups.sql` —
+  new rollup table: per (account, camera, hour, package) weighted summaries,
+  unique EXPRESSION index on `(account_id, camera_id, bucket_start, coalesce(package_id, ''))`,
+  three trend-read indexes, `set_updated_at` trigger, RLS member-select + grant
+  to `authenticated`. Numeric only — no raw snapshot/JSON.
+- `src/upstream_api/services/detection_metrics_rollup.py` — new service. SQL
+  string constants `_ROLLUP_HOURLY_SQL` (idempotent `INSERT … ON CONFLICT DO
+  UPDATE`, weighted aggregates per-field FILTERed, hour-aligned window),
+  `_PRUNE_RAW_SQL` (DELETE…USING coverage join, hour-aligned cutoff),
+  `_PRUNE_ROLLUPS_SQL`; named retention constants; `run_detection_metrics_rollup()`
+  (one transaction, single captured `now`); `RollupRunResult` (+`to_dict`); a
+  pure-Python reference `compute_hourly_rollup_buckets()` (executable spec for the
+  weighted math).
+- `scripts/run_detection_metrics_rollup.py` — manual runner (service-role DSN,
+  argparse window overrides, prints JSON counts, no secrets logged).
+- `tests/test_detection_metrics_rollup.py` — 23 unit tests (SQL/migration pins,
+  service orchestration + transaction + error unwind, weighted math, hour-aligned
+  lookback boundary, NULL/'' package fold, per-field FILTER, prune coverage).
+- `docs/api-contracts.md`, `docs/module-map.md` — M6 notes.
+
+### Functions/classes changed
+- `run_detection_metrics_rollup(conn, *, now=None, lookback_hours, raw_retention_hours, rollup_retention_days)`
+  — rollup → prune-raw → prune-rollups in one `conn.transaction()`; returns a
+  `RollupRunResult` of counts parsed from the asyncpg command tags.
+- `compute_hourly_rollup_buckets(rows, *, now, lookback_hours)` — pure reference
+  mirroring `_ROLLUP_HOURLY_SQL` (hour-aligned windows, per-field weighted means,
+  NULL/'' package fold), used by the math tests.
+
+### System interaction notes
+`scripts/run_detection_metrics_rollup.py → get_settings() → asyncpg.connect(service-role DSN)
+→ run_detection_metrics_rollup → [rollup INSERT…ON CONFLICT, prune-raw DELETE…USING,
+prune-rollups DELETE] in one transaction → RollupRunResult → JSON to stdout`.
+No HTTP surface; reads/writes via the service role (RLS-exempt). M5 ingest +
+drift path is unchanged.
+
+### Testing/checks
+- `uv run pytest -q` → 524 passed (23 new M6 + full M5/reliability regression).
+- `ruff check` + `ruff format --check` clean; `mypy src` strict clean (69 files).
+- SQL syntactically validated with sqlglot (postgres dialect): the two DELETEs,
+  the rollup INSERT…SELECT body (FILTER / make_interval / weighted division), the
+  table DDL and the expression unique index all parse; the `ON CONFLICT
+  (coalesce(...))` expression target is valid Postgres (confirmed sqlglot-only
+  parser gap on expression conflict targets).
+- Designed + reviewed via multi-agent workflows; the adversarial review caught
+  and fixed (a) a non-hour-aligned rollup lower bound that could corrupt the
+  boundary bucket and delete never-rolled rows, and (b) a NULL-vs-empty-string
+  `package_id` ON CONFLICT collision that would abort the whole run.
+- No live DB available locally (no Docker/psql/supabase) — see manual verification.
+
+### Follow-up TODOs
+- Manual verify against hosted DB after migration applies (run the script, confirm
+  buckets + weighted values + coverage-guarded prune).
+- Future: schedule the script (systemd timer / cron) once a pattern exists;
+  daily rollups; the actual 24h/7d Reliability-tab trend charts that consume
+  `detection_confidence_hourly_rollups`.
+- Optional defense-in-depth: normalize empty-string `package_id` → NULL at ingest
+  (M5 writer / `PerceptionSnapshotIngestRequest`) so '' never persists at all
+  (the rollup already folds NULL/'' safely, so this is belt-and-suspenders).
+
+---
+
 ## 2026-05-29 - Reliability M5 fix: window-aggregate confidence drift (works at low object counts)
 
 ### Summary
