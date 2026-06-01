@@ -956,6 +956,178 @@ Geometry saved here is **not** applied to a running processor session: the
 processor picks it up on its next session (P6-C). No dashboard editor yet
 (P6-B).
 
+### `GET /v1/models`
+
+M2. The platform's read-only **model catalog** — the detection models the
+dashboard can offer in a per-camera model picker. This is **facts only**:
+each entry describes a model's capabilities (task type, runtime, supported
+classes/trackers, defaults) so the UI can build a picker and so the
+per-camera processing config can be validated against it. The catalog is
+static, in-process data — there is **no DB table** behind it.
+
+Authenticated (any caller) but **not** account-scoped: the catalog is
+platform-global. No query params.
+
+Response 200: `{ "models": [ModelRegistryEntry, ...] }` where each
+`ModelRegistryEntry` is:
+```json
+{
+  "models": [
+    {
+      "model_key": "trafficcamnet_v1",
+      "display_name": "TrafficCamNet",
+      "description": "NVIDIA TrafficCamNet object detector for road scenes.",
+      "task_type": "object_detection",
+      "runtime": "deepstream",
+      "default_confidence_threshold": 0.4,
+      "supported_classes": ["car", "bicycle", "person", "roadsign"],
+      "supported_trackers": ["iou"],
+      "model_version": null,
+      "detector_version": null,
+      "resource_profile": "gpu_light",
+      "enabled": true,
+      "notes": "The processor runs this detector today but does not yet read this registry or per-camera config.",
+      "limitations": [
+        "Fixed to the 4 TrafficCamNet classes.",
+        "Can misclassify people as cars in some scenes."
+      ]
+    },
+    {
+      "model_key": "mock_detect_v0",
+      "display_name": "Mock Detector",
+      "description": null,
+      "task_type": "object_detection",
+      "runtime": "mock",
+      "default_confidence_threshold": null,
+      "supported_classes": ["person", "car"],
+      "supported_trackers": ["none"],
+      "model_version": null,
+      "detector_version": null,
+      "resource_profile": "cpu",
+      "enabled": true,
+      "notes": "Development/testing detector; outputs are synthetic.",
+      "limitations": ["Not a real detector."]
+    }
+  ]
+}
+```
+
+`model_key` is the stable, snake_case identifier the per-camera processing
+config references. `enabled: false` entries are still listed but cannot be
+selected by a processing-config PUT (→ 422). Unknown fields on an entry are
+rejected (`extra="forbid"`); no styling/overlay fields are modelled.
+
+The live processor does not consume this config yet — it runs its
+hard-coded detector; the catalog exists so the dashboard can author model
+selection ahead of processor integration.
+
+### `GET /v1/cameras/{camera_id}/processing-config`
+
+M3. The dashboard-authored model/**processing config** for one camera —
+which model to run, which classes to keep, the tracker, confidence
+threshold and processing FPS. This is **config / facts only**: presentation
+(colors, stroke, fill, opacity, CSS, overlay styling) is deliberately not
+modelled here and is rejected (422) — overlay styling stays frontend-owned.
+This is a **new table** (`camera_processing_configs`), separate from the
+account-level `processing_enabled` switch.
+
+Query: `account_id`.
+
+Response 200: `{ "processing_config": CameraProcessingConfigRecord }` where
+`CameraProcessingConfigRecord` is:
+```json
+{
+  "id": "uuid|null",
+  "account_id": "uuid",
+  "camera_id": "uuid",
+  "revision": 3,
+  "config": {
+    "version": 1,
+    "model_key": "trafficcamnet_v1",
+    "selected_classes": ["car", "person"],
+    "tracker": "iou",
+    "confidence_threshold": 0.5,
+    "processing_fps": 10
+  },
+  "is_default": false,
+  "created_at": "2026-06-01T12:00:00Z",
+  "updated_at": "2026-06-01T12:00:01Z"
+}
+```
+
+Two distinct, never-conflated numbers: `config.version` is the JSON
+**schema version** (always `1`); `revision` is the DB **row revision** —
+`0` for the unsaved default, `1` on first save, `+1` on every subsequent
+PUT.
+
+When a camera has no saved config the endpoint returns the **default**
+config with `is_default: true`, `revision: 0`, `id: null`, and null
+timestamps:
+```json
+{
+  "processing_config": {
+    "id": null,
+    "account_id": "uuid",
+    "camera_id": "uuid",
+    "revision": 0,
+    "config": {
+      "version": 1,
+      "model_key": "trafficcamnet_v1",
+      "selected_classes": [],
+      "tracker": null,
+      "confidence_threshold": null,
+      "processing_fps": null
+    },
+    "is_default": true,
+    "created_at": null,
+    "updated_at": null
+  }
+}
+```
+
+The default selects `trafficcamnet_v1` with `selected_classes: []` (which
+means **all supported classes**) and leaves tracker/threshold/fps unset
+(processor-side defaults apply). A saved config returns `is_default: false`
+with `revision >= 1`. The base config payload re-validates structurally on
+read even if the registry later changes (registry checks gate writes only).
+
+Errors: `camera_not_found` (404 — unknown camera or a camera in another
+account).
+
+The live processor does not consume this config yet.
+
+### `PUT /v1/cameras/{camera_id}/processing-config`
+
+M3/M4. Full-replace upsert of a camera's processing config. Query:
+`account_id`.
+
+Body: `{ "config": CameraProcessingConfig }` — the `config` object from the
+record above. `account_id` / `camera_id` are derived from the authenticated
+caller and path; any tenant fields in the body are ignored.
+
+The new config overwrites any prior one and the row `revision` bumps by one
+(first save → `revision: 1`). Response 200: `{ "processing_config":
+CameraProcessingConfigRecord }` with `is_default: false`.
+
+Structural validation (→ 422 `validation_error`): `version` must be `1`;
+`model_key` 1–128 chars; `selected_classes` ≤ 64 items; `tracker` ≤ 64
+chars; `confidence_threshold` in `[0, 1]`; `processing_fps` in `[1, 30]`;
+unknown fields (including any styling/overlay field) rejected.
+
+Registry validation (→ 422 `validation_error`, enforced against the
+`GET /v1/models` catalog): `model_key` must exist **and** be `enabled`;
+every `selected_classes` item must be in that model's `supported_classes`
+(an empty `selected_classes` is allowed and means **all supported
+classes**); `tracker`, when set, must be in the model's
+`supported_trackers`. Registry checks gate **writes only** — they are not
+re-run when an existing row is read.
+
+Errors: `camera_not_found` (404). No PATCH — replacement only.
+
+The live processor does not consume this config yet: it is saved as the
+*intended* per-camera configuration ahead of processor integration. No
+dashboard editor yet.
+
 ### `GET /v1/dashboard/summary`
 
 Query: `account_id`.

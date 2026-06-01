@@ -28,6 +28,7 @@ from upstream_api.routers import (
     dashboard,
     heartbeats,
     ingest,
+    models,
     processor,
     reliability,
     snapshots,
@@ -102,6 +103,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(reliability.router)  # /v1/cameras/{id}/reliability/*
     app.include_router(ingest.router)
     app.include_router(processor.router)  # /v1/internal/processor/* (M8.0)
+    app.include_router(models.router)  # /v1/models
     app.include_router(users.router)
     app.include_router(accounts.router)
     app.include_router(dashboard.router)

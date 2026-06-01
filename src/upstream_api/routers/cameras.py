@@ -16,6 +16,10 @@ from upstream_api.schemas.geometry import (
     GeometryConfigResponse,
     GeometryConfigUpdateRequest,
 )
+from upstream_api.schemas.processing_config_camera import (
+    CameraProcessingConfigResponse,
+    CameraProcessingConfigUpdateRequest,
+)
 from upstream_api.schemas.processor import (
     LatestPerceptionSnapshotResponse,
     LatestProcessorStatusResponse,
@@ -35,6 +39,11 @@ from upstream_api.services.limits import (
     check_camera_defaults,
     check_camera_slot_available,
     load_account_limits,
+)
+from upstream_api.services.processing_config_camera import (
+    default_camera_processing_config_record,
+    fetch_camera_processing_config,
+    upsert_camera_processing_config,
 )
 from upstream_api.services.processor import (
     coerce_jsonb,
@@ -467,3 +476,79 @@ async def put_geometry_config(
             config=body.config,
         )
     return GeometryConfigResponse(geometry_config=record)
+
+
+@router.get(
+    "/{camera_id}/processing-config",
+    response_model=CameraProcessingConfigResponse,
+)
+async def get_processing_config(
+    camera_id: UUID,
+    caller: CurrentCaller,
+    pool: PoolDep,
+    account_id: Annotated[UUID | None, Query()] = None,
+) -> CameraProcessingConfigResponse:
+    """Dashboard-authored model/processing config for one camera.
+
+    Returns the saved config, or the default config with
+    ``is_default = true`` / ``revision = 0`` when the camera has none yet.
+    Scoped to the caller's account by an explicit camera-ownership check
+    and by the account-scoped query. The processor does not consume this
+    config yet.
+    """
+    scope_account = caller.resolve_account(account_id)
+    async with pool.acquire() as conn:
+        owner_row = await conn.fetchrow(
+            "select account_id from cameras where id = $1",
+            camera_id,
+        )
+        if owner_row is None or owner_row["account_id"] != scope_account:
+            raise NotFoundError("Camera not found.", code="camera_not_found")
+
+        record = await fetch_camera_processing_config(
+            conn,
+            account_id=scope_account,
+            camera_id=camera_id,
+        )
+    if record is None:
+        record = default_camera_processing_config_record(
+            account_id=scope_account,
+            camera_id=camera_id,
+        )
+    return CameraProcessingConfigResponse(processing_config=record)
+
+
+@router.put(
+    "/{camera_id}/processing-config",
+    response_model=CameraProcessingConfigResponse,
+)
+async def put_processing_config(
+    camera_id: UUID,
+    body: CameraProcessingConfigUpdateRequest,
+    caller: CurrentCaller,
+    pool: PoolDep,
+    account_id: Annotated[UUID | None, Query()] = None,
+) -> CameraProcessingConfigResponse:
+    """Replace the model/processing config for one camera.
+
+    Full replacement — the new config overwrites any prior one and the row
+    revision bumps by one. ``account_id`` / ``camera_id`` are derived from
+    the authenticated caller and path, never trusted from the request body.
+    The config is validated against the model registry before write.
+    """
+    scope_account = caller.resolve_account(account_id)
+    async with pool.acquire() as conn, conn.transaction():
+        owner_row = await conn.fetchrow(
+            "select account_id from cameras where id = $1",
+            camera_id,
+        )
+        if owner_row is None or owner_row["account_id"] != scope_account:
+            raise NotFoundError("Camera not found.", code="camera_not_found")
+
+        record = await upsert_camera_processing_config(
+            conn,
+            account_id=scope_account,
+            camera_id=camera_id,
+            config=body.config,
+        )
+    return CameraProcessingConfigResponse(processing_config=record)
