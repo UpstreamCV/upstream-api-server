@@ -105,6 +105,23 @@ class EligibleGeometryConfig(BaseModel):
     config: dict[str, Any]
 
 
+class EligibleProcessingConfig(BaseModel):
+    """The camera's saved processing config, carried in eligible-sessions (M7B).
+
+    ``revision`` is the DB row revision (bumps on every save) — the
+    processor's signal that the per-camera model/processing selection changed
+    between sessions. ``config`` is the ``CameraProcessingConfig.model_dump()``
+    JSON, kept as an opaque ``dict``: the envelope is strongly typed, but the
+    nested shape is validated on the write path
+    (``PUT /v1/cameras/{id}/processing-config``), not re-validated here. M7B is
+    STAMP-ONLY — this is wire-carried for lineage; the runtime still runs its
+    hard-coded defaults and consumes nothing from this config.
+    """
+
+    revision: int
+    config: dict[str, Any]
+
+
 class EligibleProcessorSession(BaseModel):
     session_id: UUID
     # The MediaMTX path / read identifier (`sess_<16hex>`). Not a secret; it
@@ -121,6 +138,10 @@ class EligibleProcessorSession(BaseModel):
     # null when the camera has no saved config. Wire-carried only — the
     # processor begins consuming it in P6-C.
     geometry_config: EligibleGeometryConfig | None = None
+    # M7B: the camera's dashboard-authored per-camera processing config, or
+    # null when the camera has no saved config. Wire-carried; consumed for
+    # lineage only — runtime behavior is unchanged (STAMP-ONLY milestone).
+    processing_config: EligibleProcessingConfig | None = None
     started_at: datetime | None
     processor_eligible: bool = True
 

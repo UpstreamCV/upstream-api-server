@@ -1192,6 +1192,7 @@ Response 200:
         "created_at": "2026-05-18T12:00:00Z"
       },
       "geometry_config": null,
+      "processing_config": null,
       "started_at": "2026-05-18T11:59:00Z",
       "processor_eligible": true
     }
@@ -1212,6 +1213,20 @@ nvdsanalytics runtime config on its next eligible session, and stamps the
 revision + source onto its status payload and emitted observations'
 `source` block. (This field replaces the former always-null `zones_lines`
 placeholder.)
+
+`processing_config` (M7B) carries the camera's saved per-camera processing
+config (cloned additively from `geometry_config`, a LEFT join — eligibility /
+`processing_enabled` / `package_id` are unchanged). It is `null` when the
+camera has no `camera_processing_configs` row; otherwise it is
+`{"revision": <int>, "config": <CameraProcessingConfig>}` where `config` is
+the `model_dump()` shape (`version`, `model_key`, `selected_classes`,
+`tracker`, `confidence_threshold`, `processing_fps`) — see
+`GET /v1/cameras/{camera_id}/processing-config`. M7B is STAMP-ONLY: the field
+is wire-carried for lineage and nothing from it is applied. The processor
+status payload gains an additive `applied_processing_config` block whose
+`applied` is ALWAYS the current runtime defaults (`trafficcamnet_v1` / `[]`
+all-classes / `iou` / `null` / `null`); a requested value is never echoed
+into `applied`, and `partially_applied` is reserved for a later milestone.
 
 ### `POST /v1/internal/processor/status`
 

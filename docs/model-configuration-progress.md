@@ -67,11 +67,42 @@ The base config payload re-validates structurally on read, so a stored row
 stays readable even if the registry later changes — registry checks gate
 writes only.
 
+### M7B — Processing config carried on eligible-sessions (api-server half)
+
+STAMP-ONLY wire change, cloned additively from the geometry-config envelope
+(P6-A). The internal `GET /v1/internal/processor/eligible-sessions` response
+now carries the camera's saved processing config alongside `geometry_config`:
+
+```json
+"processing_config": { "revision": <int>, "config": <CameraProcessingConfig> } | null
+```
+
+- `processing_config` is `null` when the camera has no
+  `camera_processing_configs` row (a LEFT join, never inner — eligibility,
+  the WHERE clause, `processing_enabled`, and `package_id` resolution are
+  untouched).
+- `config` is the `CameraProcessingConfig.model_dump()` shape
+  (`version`, `model_key`, `selected_classes`, `tracker`,
+  `confidence_threshold`, `processing_fps`), kept opaque on the wire and
+  validated only on the write path.
+
+**Runtime behavior is unchanged.** M7B is stamp-only: nothing from the config
+is applied. The processor status payload gains an additive
+`applied_processing_config` block whose `applied` is ALWAYS the current
+runtime defaults (`trafficcamnet_v1` / `[]` = all classes / `iou` /
+`null` confidence / `null` fps) — a requested value is never echoed into
+`applied`, and `partially_applied` is reserved for a later milestone and is
+never emitted in M7B. The only observable changes are the new nullable
+envelope field and the additive status-payload key.
+
 ## Not yet done
 
-- **Processor consumption** — the eligible-sessions envelope and the
-  DeepStream config are untouched; the live processor still runs its
-  hard-coded detector and does not read this config.
+- **Processor consumption** — the live processor still runs its hard-coded
+  detector and applies nothing from this config. M7B wire-carries the
+  processing config on eligible-sessions (and stamps lineage), but actually
+  applying model/class/tracker selection is deferred to a later milestone.
+- **DeepStream config wiring** — the nvinfer/nvdsanalytics runtime config is
+  untouched by the per-camera processing config.
 - **Dashboard UI** — no model-picker / processing-config editor yet.
 - **Reliability grouping** — no reliability rollup dimension for model or
   processing config.
