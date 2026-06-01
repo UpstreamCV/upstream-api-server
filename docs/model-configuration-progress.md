@@ -1,12 +1,16 @@
 # Model Configuration — Progress Log
 
-A milestone log for the per-camera model/processing configuration work in
-`upstream-api-server`. This tracks the API-server surface only.
+A milestone log for the per-camera model/processing configuration work across
+the platform (`upstream-api-server`, `upstream-dashboard`, `upstream-processor`).
+Each milestone notes which repo it landed in.
 
 ## Honest status
 
-> Users/API can save intended per-camera processing configuration, but the
-> live processor does not consume it yet.
+> Users can configure model, classes, tracker, confidence threshold, and
+> processing FPS per camera in the dashboard, and the saved config is now
+> carried to the processor and stamped as requested-vs-applied lineage — but
+> live detector behavior is still unchanged (nothing from the config is
+> applied at runtime yet).
 
 ## Milestones
 
@@ -67,11 +71,47 @@ The base config payload re-validates structurally on read, so a stored row
 stays readable even if the registry later changes — registry checks gate
 writes only.
 
-### M7B — Processing config carried on eligible-sessions (api-server half)
+### M5 — Dashboard "Model & Detection" UI: model + class selection (`upstream-dashboard`)
 
-STAMP-ONLY wire change, cloned additively from the geometry-config envelope
-(P6-A). The internal `GET /v1/internal/processor/eligible-sessions` response
-now carries the camera's saved processing config alongside `geometry_config`:
+New `/dashboard/cameras/{cameraId}/configure/detection` route, cloned from the
+geometry-editor triad (server page + Server Action + client panel). It reads
+`GET /v1/models` and GET/PUTs the per-camera processing config:
+
+- Model dropdown sourced from the registry (disabled/unavailable models are
+  shown but not selectable).
+- "All supported classes" toggle + a per-class checklist; an empty selection
+  persists as `[]` (= all supported, never "detect nothing").
+- Save flows through a Server Action → `PUT .../processing-config` →
+  `revalidatePath`; a status tile shows "Not configured yet" vs
+  "Operator-saved r{revision}".
+
+Tracker / confidence / FPS were deferred to M6 (sent as `null`). Saves operator
+intent only — no runtime effect.
+
+### M6 — Dashboard tracker / confidence / FPS controls (`upstream-dashboard`)
+
+Completed the Model & Detection editor with the three remaining fields (the
+api-server already validated them in M4):
+
+- **Tracker** — `<select>` ("Runtime default" = `null`, else a value from the
+  model's `supported_trackers`); changing the model resets an unsupported tracker.
+- **Confidence threshold** — range slider + numeric input with a "Use default"
+  (`null`) affordance; helper copy shows the model's `default_confidence_threshold`.
+- **Processing FPS** — preset `<select>` (Default = `null`, else 1/2/5/10/15/30).
+
+The client validator was flipped from "these must ride as `null`" to real
+bounds checks matching the api-server (tracker ∈ `supported_trackers`,
+confidence `[0, 1]`, fps integer `[1, 30]`; `null` always valid). The save
+payload now sends real values (or `null`), and the saved-config summary shows
+all five fields. Copy makes clear the config is saved but not live-applied.
+
+### M7B — Processing config envelope + requested-vs-applied lineage
+
+Two repos: `upstream-api-server` carries the saved config on eligible-sessions;
+`upstream-processor` resolves it at worker startup and stamps lineage. STAMP-ONLY,
+cloned additively from the geometry-config envelope (P6-A). The internal
+`GET /v1/internal/processor/eligible-sessions` response now carries the camera's
+saved processing config alongside `geometry_config`:
 
 ```json
 "processing_config": { "revision": <int>, "config": <CameraProcessingConfig> } | null
@@ -103,7 +143,6 @@ envelope field and the additive status-payload key.
   applying model/class/tracker selection is deferred to a later milestone.
 - **DeepStream config wiring** — the nvinfer/nvdsanalytics runtime config is
   untouched by the per-camera processing config.
-- **Dashboard UI** — no model-picker / processing-config editor yet.
 - **Reliability grouping** — no reliability rollup dimension for model or
   processing config.
 - **Applied-config metadata on observations** — observations do not yet
