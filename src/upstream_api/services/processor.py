@@ -52,7 +52,9 @@ select
     v.mismatch_fields   as v_mismatch_fields,
     v.created_at        as v_created_at,
     gc.revision         as gc_revision,
-    gc.config           as gc_config
+    gc.config           as gc_config,
+    pc.revision         as pc_revision,
+    pc.config           as pc_config
   from stream_sessions ss
   join cameras c on c.id = ss.camera_id
   join accounts a on a.id = ss.account_id
@@ -64,6 +66,7 @@ select
           limit 1
        ) v on true
   left join camera_geometry_configs gc on gc.camera_id = ss.camera_id
+  left join camera_processing_configs pc on pc.camera_id = ss.camera_id
  where ss.state = 'streaming'
    and ss.expires_at > now()
    and v.passed = true

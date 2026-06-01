@@ -46,6 +46,12 @@ class _Candidate:
     # P6-A: the LEFT JOIN onto camera_geometry_configs. None = no saved row.
     geometry_revision: int | None = None
     geometry_config: dict[str, Any] | None = None
+    # M7B: the LEFT JOIN onto camera_processing_configs. None = no saved row.
+    # Mirrors the geometry envelope exactly; the LEFT join means a camera with
+    # no processing config row is still eligible (the field just comes back
+    # null). STAMP-ONLY: wire-carried for lineage, runtime unchanged.
+    processing_revision: int | None = None
+    processing_config: dict[str, Any] | None = None
     # M3: account-level processing master switch. ``None`` matches the
     # production default (key absent in ``accounts.metadata`` -> coalesce
     # to true). Explicit ``False`` drops the candidate, mirroring the new
@@ -84,6 +90,8 @@ class _Candidate:
             "v_created_at": now - timedelta(seconds=10),
             "gc_revision": self.geometry_revision,
             "gc_config": self.geometry_config,
+            "pc_revision": self.processing_revision,
+            "pc_config": self.processing_config,
         }
 
 
@@ -359,6 +367,9 @@ def test_response_contains_internal_rtsp_url_built_from_base_and_streamid() -> N
     assert s["stream_key"] == _STREAM_KEY
     assert s["runtime"] == "mock"
     assert s["geometry_config"] is None
+    # M7B: the processing-config envelope sits next to geometry_config and is
+    # null on the default (no-saved-row) path, same as geometry.
+    assert s["processing_config"] is None
     assert s["approved"] == {
         "codec": "h264",
         "width": 1280,
@@ -424,6 +435,213 @@ def test_geometry_config_envelope_when_saved_row_exists() -> None:
     assert r.json()["sessions"][0]["geometry_config"] == {"revision": 3, "config": cfg}
 
 
+# ---------------------------------------------------------------------------
+# M7B: processing_config envelope (mirrors the P6-A geometry_config envelope).
+# STAMP-ONLY — wire-carried for lineage; the runtime applies nothing from it.
+# ---------------------------------------------------------------------------
+
+
+def test_processing_config_null_when_no_saved_row() -> None:
+    """M7B: a camera with no ``camera_processing_configs`` row carries a null
+    ``processing_config`` — the processor falls back to its runtime defaults
+    (trafficcamnet_v1 / all classes / iou)."""
+    conn = FakeEligibleConn([_Candidate("streaming", _FUTURE, [True])])
+    r = _client(conn).get("/v1/internal/processor/eligible-sessions", headers=_headers())
+    assert r.json()["sessions"][0]["processing_config"] is None
+
+
+def test_processing_config_envelope_when_saved_row_exists() -> None:
+    """M7B: a saved processing config is carried as a ``{revision, config}``
+    envelope (the nested config is ``CameraProcessingConfig.model_dump()``),
+    round-tripping verbatim so the processor can log its lineage."""
+    cfg = {
+        "version": 1,
+        "model_key": "trafficcamnet_v1",
+        "selected_classes": ["car", "truck"],
+        "tracker": "iou",
+        "confidence_threshold": 0.45,
+        "processing_fps": 10,
+    }
+    conn = FakeEligibleConn(
+        [_Candidate("streaming", _FUTURE, [True], processing_revision=7, processing_config=cfg)]
+    )
+    r = _client(conn).get("/v1/internal/processor/eligible-sessions", headers=_headers())
+    assert r.json()["sessions"][0]["processing_config"] == {"revision": 7, "config": cfg}
+
+
+def test_processing_config_envelope_carries_nullable_nested_fields() -> None:
+    """M7B: the nested config's optional fields (tracker, confidence_threshold,
+    processing_fps) may be null and must round-trip as null, not be dropped."""
+    cfg = {
+        "version": 1,
+        "model_key": "trafficcamnet_v1",
+        "selected_classes": [],
+        "tracker": None,
+        "confidence_threshold": None,
+        "processing_fps": None,
+    }
+    conn = FakeEligibleConn(
+        [_Candidate("streaming", _FUTURE, [True], processing_revision=1, processing_config=cfg)]
+    )
+    r = _client(conn).get("/v1/internal/processor/eligible-sessions", headers=_headers())
+    assert r.json()["sessions"][0]["processing_config"] == {"revision": 1, "config": cfg}
+
+
+def test_camera_with_no_processing_config_still_eligible() -> None:
+    """M7B: the join onto ``camera_processing_configs`` is a LEFT join, never
+    an INNER join — a camera with no saved processing config must still appear
+    in the eligible list (with ``processing_config`` null)."""
+    conn = FakeEligibleConn([_Candidate("streaming", _FUTURE, [True])])
+    r = _client(conn).get("/v1/internal/processor/eligible-sessions", headers=_headers())
+    sessions = r.json()["sessions"]
+    assert len(sessions) == 1
+    assert sessions[0]["processor_eligible"] is True
+    assert sessions[0]["processing_config"] is None
+
+
+def test_processing_and_geometry_configs_are_independent() -> None:
+    """M7B regression: the two LEFT joins are independent. A camera may have a
+    saved processing config but no geometry config (and vice versa); each
+    envelope is populated/nulled on its own row, neither affecting the other."""
+    pcfg = {
+        "version": 1,
+        "model_key": "trafficcamnet_v1",
+        "selected_classes": ["car"],
+        "tracker": "iou",
+        "confidence_threshold": None,
+        "processing_fps": None,
+    }
+    conn = FakeEligibleConn(
+        [_Candidate("streaming", _FUTURE, [True], processing_revision=2, processing_config=pcfg)]
+    )
+    r = _client(conn).get("/v1/internal/processor/eligible-sessions", headers=_headers())
+    s = r.json()["sessions"][0]
+    assert s["processing_config"] == {"revision": 2, "config": pcfg}
+    # Geometry was never set on this candidate, so its envelope stays null.
+    assert s["geometry_config"] is None
+
+
+def test_geometry_and_processing_configs_coexist() -> None:
+    """M7B regression: when a camera has both a geometry and a processing
+    config row, both envelopes round-trip side by side and unchanged."""
+    gcfg = {
+        "version": 1,
+        "frame": {"width": 1280, "height": 720, "coordinate_space": "normalized"},
+        "rois": [],
+        "lines": [],
+    }
+    pcfg = {
+        "version": 1,
+        "model_key": "trafficcamnet_v1",
+        "selected_classes": ["car", "bus"],
+        "tracker": "iou",
+        "confidence_threshold": 0.5,
+        "processing_fps": 15,
+    }
+    conn = FakeEligibleConn(
+        [
+            _Candidate(
+                "streaming",
+                _FUTURE,
+                [True],
+                geometry_revision=4,
+                geometry_config=gcfg,
+                processing_revision=9,
+                processing_config=pcfg,
+            )
+        ]
+    )
+    r = _client(conn).get("/v1/internal/processor/eligible-sessions", headers=_headers())
+    s = r.json()["sessions"][0]
+    # P6-A geometry envelope is unchanged by the M7B addition (regression).
+    assert s["geometry_config"] == {"revision": 4, "config": gcfg}
+    assert s["processing_config"] == {"revision": 9, "config": pcfg}
+
+
+def test_processing_config_does_not_affect_package_id() -> None:
+    """M7B regression: package_id resolution is independent of the processing
+    config envelope (M7B is STAMP-ONLY — it changes no runtime selection,
+    including package routing)."""
+    pcfg = {
+        "version": 1,
+        "model_key": "trafficcamnet_v1",
+        "selected_classes": [],
+        "tracker": "iou",
+        "confidence_threshold": None,
+        "processing_fps": None,
+    }
+    # Default package_id (no metadata override) is unchanged by a saved config.
+    default_conn = FakeEligibleConn(
+        [
+            _Candidate(
+                "streaming",
+                _FUTURE,
+                [True],
+                metadata={},
+                processing_revision=1,
+                processing_config=pcfg,
+            )
+        ]
+    )
+    r = _client(default_conn).get("/v1/internal/processor/eligible-sessions", headers=_headers())
+    assert r.json()["sessions"][0]["package_id"] == "mock.detect.v0"
+    # An explicit metadata override is likewise unaffected by the config row.
+    override_conn = FakeEligibleConn(
+        [
+            _Candidate(
+                "streaming",
+                _FUTURE,
+                [True],
+                metadata={"package_id": "custom.pkg.v2"},
+                processing_revision=1,
+                processing_config=pcfg,
+            )
+        ]
+    )
+    r = _client(override_conn).get("/v1/internal/processor/eligible-sessions", headers=_headers())
+    assert r.json()["sessions"][0]["package_id"] == "custom.pkg.v2"
+
+
+def test_processing_config_does_not_affect_processing_enabled_gate() -> None:
+    """M7B regression: the M3 account-level ``processing_enabled`` gate is
+    unaffected by a saved processing config. A camera with a config row whose
+    account has processing disabled is STILL dropped from the eligible list."""
+    pcfg = {
+        "version": 1,
+        "model_key": "trafficcamnet_v1",
+        "selected_classes": ["car"],
+        "tracker": "iou",
+        "confidence_threshold": None,
+        "processing_fps": None,
+    }
+    conn = FakeEligibleConn(
+        [
+            # Account disabled + has a saved config -> still dropped.
+            _Candidate(
+                "streaming",
+                _FUTURE,
+                [True],
+                account_processing_enabled=False,
+                processing_revision=1,
+                processing_config=pcfg,
+            ),
+            # Account enabled + has a saved config -> survives, config carried.
+            _Candidate(
+                "streaming",
+                _FUTURE,
+                [True],
+                account_processing_enabled=True,
+                processing_revision=2,
+                processing_config=pcfg,
+            ),
+        ]
+    )
+    r = _client(conn).get("/v1/internal/processor/eligible-sessions", headers=_headers())
+    sessions = r.json()["sessions"]
+    assert len(sessions) == 1
+    assert sessions[0]["processing_config"] == {"revision": 2, "config": pcfg}
+
+
 def test_production_eligibility_sql_pins_every_predicate() -> None:
     """Guards the FakeEligibleConn simulation against drifting from the
     real query that runs in production."""
@@ -437,6 +655,14 @@ def test_production_eligibility_sql_pins_every_predicate() -> None:
     # P6-A: geometry config is LEFT-joined so a camera with no config still
     # appears in the result (geometry_config just comes back null).
     assert "left join camera_geometry_configs gc on gc.camera_id = ss.camera_id" in sql
+    # M7B: processing config is LEFT-joined for the same reason — a camera with
+    # no camera_processing_configs row stays eligible (processing_config null).
+    # The UNIQUE index on camera_id means this join cannot fan out rows.
+    assert "left join camera_processing_configs pc on pc.camera_id = ss.camera_id" in sql
+    assert "pc.revision" in sql
+    assert "pc_revision" in sql
+    assert "pc.config" in sql
+    assert "pc_config" in sql
     # The SRT publish URL must never be selected onto a processor surface.
     assert "srt_url" not in sql
     # M3: account-level processing master switch. Absent key (NULL JSONB

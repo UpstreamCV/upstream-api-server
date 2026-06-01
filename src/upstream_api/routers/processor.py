@@ -23,6 +23,7 @@ from upstream_api.observability.logging import get_logger
 from upstream_api.schemas.processor import (
     ApprovedStreamSummary,
     EligibleGeometryConfig,
+    EligibleProcessingConfig,
     EligibleProcessorSession,
     LatestPerceptionSnapshotResponse,
     PerceptionSnapshotIngestRequest,
@@ -137,6 +138,14 @@ async def eligible_sessions(
                         config=coerce_jsonb(row["gc_config"]),
                     )
                     if row["gc_revision"] is not None
+                    else None
+                ),
+                processing_config=(
+                    EligibleProcessingConfig(
+                        revision=row["pc_revision"],
+                        config=coerce_jsonb(row["pc_config"]),
+                    )
+                    if row["pc_revision"] is not None
                     else None
                 ),
                 started_at=parse_iso_datetime(row["started_at"]),

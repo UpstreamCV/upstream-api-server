@@ -4,6 +4,63 @@ Reverse chronological. Newest at top. Every meaningful commit gets an entry foll
 
 ---
 
+## 2026-06-01 - Model config M7B: carry processing_config on eligible-sessions (api-server, stamp-only)
+
+### Summary
+The per-camera `camera_processing_configs` row (M3/M4) was saveable but
+invisible to the processor — eligible-sessions only carried `geometry_config`.
+M7B clones that envelope **additively** so the internal eligible-sessions
+response now also carries `processing_config` `{revision, config}` (the
+`CameraProcessingConfig.model_dump()` shape), `null` when the camera has no
+row. This is STAMP-ONLY: nothing from the config is applied. The processor's
+status payload gains an additive `applied_processing_config` block whose
+`applied` is ALWAYS the current runtime defaults
+(`trafficcamnet_v1` / `[]` all-classes / `iou` / `null` / `null`) — a
+requested value is never echoed into `applied`, and `partially_applied` is
+reserved for a later milestone. Live behavior is unchanged: the LEFT join
+(never inner) does not touch eligibility, the WHERE clause,
+`processing_enabled`, or `package_id`; no runtime/inference/analytics/geometry
+path is edited. The only observable changes are one new nullable envelope
+field and one additive status-payload key.
+
+### Files touched
+- `schemas/processor.py` — new `EligibleProcessingConfig(BaseModel)`
+  (`revision: int`, `config: dict[str, Any]`), mirroring
+  `EligibleGeometryConfig`; new nullable
+  `EligibleProcessorSession.processing_config` field (default `None`).
+- `services/processor.py` — `_ELIGIBLE_SESSIONS_SQL` gains a
+  `left join camera_processing_configs pc on pc.camera_id = ss.camera_id`
+  and `pc.revision as pc_revision, pc.config as pc_config`. WHERE clause /
+  eligibility untouched.
+- `routers/processor.py` — `EligibleProcessorSession(...)` construction adds
+  the null-safe `processing_config` attach (mirrors `geometry_config`);
+  imports `EligibleProcessingConfig`.
+- `docs/model-configuration-progress.md`, `docs/api-contracts.md`,
+  `docs/commit-log.md`.
+
+### Functions/classes changed
+- `EligibleProcessingConfig` — strongly-typed envelope around the opaque
+  processing-config JSON; the nested shape is validated on the write path,
+  not re-validated here.
+- `EligibleProcessorSession` — gains `processing_config: EligibleProcessingConfig | None`.
+
+### System interaction notes
+`GET /v1/internal/processor/eligible-sessions → fetch_eligible_sessions →
+_ELIGIBLE_SESSIONS_SQL (LEFT join camera_processing_configs) →
+EligibleProcessorSession(processing_config=… if pc_revision is not None else
+None) → ProcessorEligibleSessionsResponse`. The processor consumes this for
+lineage only; the runtime continues to run its hard-coded defaults.
+
+### Testing/checks
+Deferred to a later step (ruff + mypy strict + pytest), not run in this commit.
+
+### Follow-up TODOs
+- Actually apply the per-camera processing config (model/class/tracker
+  selection) in the runtime — deferred past M7B's stamp-only scope.
+- `partially_applied` status emission once partial application lands.
+
+---
+
 ## 2026-05-30 - Reliability M7: confidence-trend read API (backs the Reliability tab chart)
 
 ### Summary
