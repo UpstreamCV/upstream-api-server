@@ -1316,6 +1316,35 @@ carried no usable confidence (the dashboard renders those as gaps). Pure read �
 **does not run the evaluator and does not touch raw metrics or M5 drift**; these
 rollups are long-term chart history only. The dashboard fetches it resiliently
 (any failure degrades to an "unavailable" card, never breaking the tab).
+Model-config M9 left this endpoint byte-identical: extra per-config rollup rows
+blend into the camera-level points exactly as per-package rows already did.
+
+`GET /v1/cameras/{camera_id}/reliability/confidence-trend/by-config`
+(model-config M9) — the same hourly history split into **one series per applied
+processing config** instead of one blended camera-level line. Backed by the M9
+applied-processing-config dimension columns on
+`detection_confidence_hourly_rollups` (extracted at snapshot-metric ingest from
+M8's `snapshot.source.applied_processing_config`; rows recorded before M8 carry
+all-`null` dimensions and form their own group, ordered first). Same
+auth/scoping and `range` semantics as `confidence-trend`. Optional filter query
+params (unset = no filter): `processing_config_revision` (int ≥ 0),
+`processing_config_status` (`applied` | `partially_applied` |
+`requested_not_applied` | `applied_defaults` | `fallback_default_on_error`;
+bogus → 422), `applied_selected_classes_key` (canonical key: `all`, `person`,
+`car,person`…), `applied_confidence_threshold` (float in [0,1]), `warning`
+(groups whose warning codes include it, e.g.
+`selected_classes_analytics_counts_not_filtered`). Response: `{camera_id,
+range, bucket_size:"1h", group_count, groups:[{processing_config_source,
+processing_config_revision, processing_config_status, applied_model_key,
+applied_selected_classes_key, applied_confidence_threshold,
+processing_config_warnings, points:[...], summary:{...}}]}` — `points`/`summary`
+per group use the exact `confidence-trend` point/summary shapes. Groups are
+ordered ascending by revision with no-metadata/default groups first. Pure read;
+no evaluator, no raw metrics. Honest read: grouped trends show association
+under a config, not proven causation, and M9 applies nothing new at runtime —
+confidence threshold and selected classes are applied only where supported;
+model switching, tracker, processing FPS, and class-filtered line/ROI counts
+remain not live-applied.
 
 ### Intentionally deferred (not in M8.0)
 

@@ -26,7 +26,9 @@ from fastapi import APIRouter, Query
 
 from upstream_api.errors import NotFoundError
 from upstream_api.schemas.reliability import (
+    ConfidenceTrendByConfigResponse,
     ConfidenceTrendResponse,
+    ProcessingConfigStatus,
     ReliabilityFindingsResponse,
     ReliabilitySummaryResponse,
 )
@@ -35,7 +37,10 @@ from upstream_api.services.reliability_service import (
     get_findings_for_camera,
     get_summary_for_camera,
 )
-from upstream_api.services.reliability_trends import get_confidence_trend_for_camera
+from upstream_api.services.reliability_trends import (
+    get_confidence_trend_by_config_for_camera,
+    get_confidence_trend_for_camera,
+)
 
 router = APIRouter(tags=["reliability"])
 
@@ -158,4 +163,63 @@ async def get_reliability_confidence_trend(
             account_id=scope_account,
             camera_id=camera_id,
             range_=range_,
+        )
+
+
+@router.get(
+    "/v1/cameras/{camera_id}/reliability/confidence-trend/by-config",
+    response_model=ConfidenceTrendByConfigResponse,
+)
+async def get_reliability_confidence_trend_by_config(
+    camera_id: UUID,
+    caller: CurrentCaller,
+    pool: PoolDep,
+    settings: SettingsDep,
+    account_id: Annotated[UUID | None, Query()] = None,
+    range_: Annotated[Literal["24h", "7d"], Query(alias="range")] = "24h",
+    processing_config_revision: Annotated[int | None, Query(ge=0)] = None,
+    processing_config_status: Annotated[ProcessingConfigStatus | None, Query()] = None,
+    applied_selected_classes_key: Annotated[str | None, Query(min_length=1, max_length=512)] = None,
+    applied_confidence_threshold: Annotated[float | None, Query(ge=0.0, le=1.0)] = None,
+    warning: Annotated[str | None, Query(min_length=1, max_length=128)] = None,
+) -> ConfidenceTrendByConfigResponse:
+    """Hourly confidence history split per applied processing config (M9).
+
+    Same data/window as ``confidence-trend``, but instead of blending every
+    rollup row of an hour into one camera-level point, the M9 dimension columns
+    stay grouped: one series per distinct applied-processing-config group.
+    Optional query params filter to matching groups only:
+
+    - ``processing_config_revision`` — the saved config's revision counter.
+    - ``processing_config_status`` — e.g. ``applied`` / ``partially_applied``.
+    - ``applied_selected_classes_key`` — canonical class key (``all``,
+      ``person``, ``car,person``...).
+    - ``applied_confidence_threshold`` — the threshold actually applied.
+    - ``warning`` — only groups whose warnings include this code, e.g.
+      ``selected_classes_analytics_counts_not_filtered``.
+
+    History recorded before the processor stamped applied_processing_config
+    (pre-M8) appears as the all-``null``-dimension group. This is a pure read
+    of the M6/M9 rollups — no evaluator, no raw metrics, and the existing
+    ``confidence-trend`` endpoint's blended response is untouched.
+    """
+    scope_account = caller.resolve_account(account_id)
+    async with pool.acquire() as conn, conn.transaction():
+        owner_row = await conn.fetchrow(
+            "select account_id from cameras where id = $1",
+            camera_id,
+        )
+        if owner_row is None or owner_row["account_id"] != scope_account:
+            raise NotFoundError("Camera not found.", code="camera_not_found")
+
+        return await get_confidence_trend_by_config_for_camera(
+            conn,
+            account_id=scope_account,
+            camera_id=camera_id,
+            range_=range_,
+            processing_config_revision=processing_config_revision,
+            processing_config_status=processing_config_status,
+            applied_selected_classes_key=applied_selected_classes_key,
+            applied_confidence_threshold=applied_confidence_threshold,
+            warning=warning,
         )

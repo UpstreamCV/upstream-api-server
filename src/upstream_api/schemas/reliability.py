@@ -133,3 +133,51 @@ class ConfidenceTrendResponse(BaseModel):
     bucket_size: Literal["1h"]
     points: list[ConfidenceTrendPoint]
     summary: ConfidenceTrendSummary
+
+
+# ---------------------------------------------------------------------------
+# Confidence trend by applied processing config (model-config M9) — the same
+# hourly history, split into one series per applied-processing-config dimension
+# group instead of blended to a single camera-level line. Backed by the M9
+# dimension columns on ``detection_confidence_hourly_rollups``. A separate
+# endpoint/response (not new fields on ConfidenceTrendResponse) so the existing
+# dashboard chart contract stays byte-identical.
+#
+# Dimension fields are ``None`` for data recorded before the processor stamped
+# applied_processing_config (pre-M8) — those rows form their own "no config
+# metadata" group rather than being dropped or mislabeled.
+# ---------------------------------------------------------------------------
+
+# The processor resolver's status vocabulary (closed today; extend in lockstep
+# with upstream-processor's ResolvedProcessingConfig if it grows).
+ProcessingConfigStatus = Literal[
+    "applied",
+    "partially_applied",
+    "requested_not_applied",
+    "applied_defaults",
+    "fallback_default_on_error",
+]
+
+
+class ConfidenceTrendConfigGroup(BaseModel):
+    """One applied-config dimension group: the dimensions that identify it,
+    its hourly points (oldest-first), and a per-group headline summary. All
+    dimension fields ``None`` == the "no config metadata" (pre-M8) group."""
+
+    processing_config_source: str | None
+    processing_config_revision: int | None
+    processing_config_status: str | None
+    applied_model_key: str | None
+    applied_selected_classes_key: str | None
+    applied_confidence_threshold: float | None
+    processing_config_warnings: list[str] | None
+    points: list[ConfidenceTrendPoint]
+    summary: ConfidenceTrendSummary
+
+
+class ConfidenceTrendByConfigResponse(BaseModel):
+    camera_id: UUID
+    range: ConfidenceTrendRange
+    bucket_size: Literal["1h"]
+    group_count: int
+    groups: list[ConfidenceTrendConfigGroup]

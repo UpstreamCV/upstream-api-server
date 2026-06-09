@@ -34,8 +34,11 @@ Why this is safe (read before touching the SQL):
   ran for that hour) is never deleted, no matter how old. ``DELETE`` removes
   each raw row at most once even if its hour holds several per-package buckets.
 
-Compactness posture matches the raw table: ONLY numeric summaries move here,
-never the raw snapshot / objects JSON, never secrets.
+Compactness posture matches the raw table: ONLY numeric summaries move here —
+plus, since model-config M9, the compact applied-processing-config dimension
+columns (scalar lineage identifiers + a text[] of warning codes, which become
+additional GROUP BY keys so different applied configs in one hour stay
+distinguishable) — never the raw snapshot / objects JSON, never secrets.
 
 This module deliberately does NOT touch ``services/detection_metrics.py`` or the
 M5 drift path: M5 drift keeps reading RAW metrics (its 30-min window sits well
@@ -105,10 +108,23 @@ ROLLUP_LOOKBACK_HOURS = 96
 # rather than two rows that would collide on the unique index; the stored
 # package_id is nullif(...,'') so no sentinel string is ever written.
 #
+# M9: the applied-processing-config dimensions stamped on the raw rows are
+# additional GROUP BY keys, following the exact package_id pattern — every
+# nullable dimension is grouped on coalesce(dim, <sentinel>) (so NULL
+# "no-metadata" rows fold into one group) and stored as nullif(..., <sentinel>)
+# (so no sentinel is ever written). An hour in which a camera ran under two
+# different applied configs therefore yields two distinguishable rollup rows
+# instead of one blended point. The boolean
+# selected_classes_analytics_counts_not_filtered column is NOT carried here —
+# on rollups it is derivable from processing_config_warnings.
+#
 # $1 = now (timestamptz); $2 = ROLLUP_LOOKBACK_HOURS (int).
 _ROLLUP_HOURLY_SQL = """
 insert into detection_confidence_hourly_rollups (
     account_id, camera_id, stream_session_id, package_id,
+    processing_config_source, processing_config_revision, processing_config_status,
+    applied_model_key, applied_selected_classes_key, applied_confidence_threshold,
+    processing_config_warnings,
     bucket_start, bucket_end,
     metric_count, object_count_total, confidence_sample_count,
     avg_confidence_weighted, min_confidence, max_confidence,
@@ -120,6 +136,15 @@ select
     m.camera_id,
     null::uuid                                              as stream_session_id,
     nullif(coalesce(m.package_id, ''), '')                  as package_id,
+    nullif(coalesce(m.processing_config_source, ''), '')    as processing_config_source,
+    nullif(coalesce(m.processing_config_revision, -1), -1)  as processing_config_revision,
+    nullif(coalesce(m.processing_config_status, ''), '')    as processing_config_status,
+    nullif(coalesce(m.applied_model_key, ''), '')           as applied_model_key,
+    nullif(coalesce(m.applied_selected_classes_key, ''), '') as applied_selected_classes_key,
+    nullif(coalesce(m.applied_confidence_threshold, -1.0), -1.0)
+                                                            as applied_confidence_threshold,
+    nullif(coalesce(m.processing_config_warnings, '{}'::text[]), '{}'::text[])
+                                                            as processing_config_warnings,
     date_trunc('hour', m.observed_at)                       as bucket_start,
     date_trunc('hour', m.observed_at) + interval '1 hour'   as bucket_end,
     count(*)                                                as metric_count,
@@ -143,8 +168,23 @@ select
   from snapshot_detection_metrics m
  where m.observed_at >= date_trunc('hour', $1::timestamptz - make_interval(hours => $2::int))
    and m.observed_at <  date_trunc('hour', $1::timestamptz)
- group by m.account_id, m.camera_id, coalesce(m.package_id, ''), date_trunc('hour', m.observed_at)
-on conflict (account_id, camera_id, bucket_start, coalesce(package_id, '')) do update set
+ group by m.account_id, m.camera_id, coalesce(m.package_id, ''),
+          coalesce(m.processing_config_source, ''),
+          coalesce(m.processing_config_revision, -1),
+          coalesce(m.processing_config_status, ''),
+          coalesce(m.applied_model_key, ''),
+          coalesce(m.applied_selected_classes_key, ''),
+          coalesce(m.applied_confidence_threshold, -1.0),
+          coalesce(m.processing_config_warnings, '{}'::text[]),
+          date_trunc('hour', m.observed_at)
+on conflict (account_id, camera_id, bucket_start, coalesce(package_id, ''),
+    coalesce(processing_config_source, ''),
+    coalesce(processing_config_revision, -1),
+    coalesce(processing_config_status, ''),
+    coalesce(applied_model_key, ''),
+    coalesce(applied_selected_classes_key, ''),
+    coalesce(applied_confidence_threshold, -1.0),
+    coalesce(processing_config_warnings, '{}'::text[])) do update set
     bucket_end                        = excluded.bucket_end,
     metric_count                      = excluded.metric_count,
     object_count_total                = excluded.object_count_total,
@@ -275,11 +315,19 @@ async def run_detection_metrics_rollup(
 @dataclass(frozen=True)
 class HourlyRollupBucket:
     """One computed hourly bucket — the reference's output, mirroring the
-    rollup table's aggregate columns."""
+    rollup table's aggregate columns. ``processing_config_warnings`` is a tuple
+    here (hashable for the frozen dataclass); the SQL stores ``text[]``."""
 
     account_id: UUID
     camera_id: UUID
     package_id: str | None
+    processing_config_source: str | None
+    processing_config_revision: int | None
+    processing_config_status: str | None
+    applied_model_key: str | None
+    applied_selected_classes_key: str | None
+    applied_confidence_threshold: float | None
+    processing_config_warnings: tuple[str, ...] | None
     bucket_start: datetime
     bucket_end: datetime
     metric_count: int
@@ -295,6 +343,38 @@ class HourlyRollupBucket:
 def _hour_floor(value: datetime) -> datetime:
     """``date_trunc('hour', value)``."""
     return value.replace(minute=0, second=0, microsecond=0)
+
+
+# The normalised M9 dimension tuple: (source, revision, status, model_key,
+# selected_classes_key, confidence_threshold, warnings).
+_ConfigDimensionKey = tuple[
+    str | None,
+    int | None,
+    str | None,
+    str | None,
+    str | None,
+    float | None,
+    tuple[str, ...] | None,
+]
+
+
+def _config_dimension_key(row: Mapping[str, Any]) -> _ConfigDimensionKey:
+    """The normalised M9 dimension tuple for one raw row — mirrors the SQL's
+    coalesce(...) GROUP BY sentinel-folds and the nullif(...) stored
+    projections (the two coincide: fold NULL with ''/empty into one group,
+    store NULL). Text dimensions fold '' with NULL via `or None`;
+    revision/threshold use impossible sentinels in SQL (-1 / -1.0) so plain
+    identity is the Python fold; warnings fold NULL with the empty array."""
+    warnings_raw = row.get("processing_config_warnings")
+    return (
+        row.get("processing_config_source") or None,
+        row.get("processing_config_revision"),
+        row.get("processing_config_status") or None,
+        row.get("applied_model_key") or None,
+        row.get("applied_selected_classes_key") or None,
+        row.get("applied_confidence_threshold"),
+        tuple(warnings_raw) if warnings_raw else None,
+    )
 
 
 def _weighted(rows: list[Mapping[str, Any]], field: str) -> float | None:
@@ -331,7 +411,9 @@ def compute_hourly_rollup_buckets(
     SQL uses. Each ``row`` is a mapping with at least: account_id, camera_id,
     package_id, observed_at, object_count, confidence_sample_count,
     avg_confidence, min_confidence, max_confidence, low_confidence_ratio,
-    confidence_stddev.
+    confidence_stddev — plus, optionally, the M9 applied-processing-config
+    dimension columns (absent/None means "no config metadata", the pre-M8
+    shape, which groups exactly like SQL NULLs do).
     """
     # Both window edges are hour-aligned, mirroring the SQL: the rollup only ever
     # scans WHOLE hours, so a boundary hour is never aggregated from a partial
@@ -340,22 +422,38 @@ def compute_hourly_rollup_buckets(
     current_hour = _hour_floor(now)
     lookback_start = _hour_floor(now - timedelta(hours=lookback_hours))
 
-    groups: dict[tuple[UUID, UUID, str | None, datetime], list[Mapping[str, Any]]] = defaultdict(
-        list
-    )
+    groups: dict[
+        tuple[UUID, UUID, str | None, _ConfigDimensionKey, datetime], list[Mapping[str, Any]]
+    ] = defaultdict(list)
     for r in rows:
         observed_at = r["observed_at"]
         if observed_at >= current_hour or observed_at < lookback_start:
             continue  # exclude the current incomplete hour and rows past lookback
         # A NULL and an empty-string package_id fold to the same bucket (the SQL
         # groups on coalesce(package_id,'') and stores nullif(...,'')); both map
-        # to None here so they never produce two colliding rows.
+        # to None here so they never produce two colliding rows. The M9 config
+        # dimensions fold the same way (see _config_dimension_key).
         package_id = r.get("package_id") or None
-        key = (r["account_id"], r["camera_id"], package_id, _hour_floor(observed_at))
+        key = (
+            r["account_id"],
+            r["camera_id"],
+            package_id,
+            _config_dimension_key(r),
+            _hour_floor(observed_at),
+        )
         groups[key].append(r)
 
     buckets: list[HourlyRollupBucket] = []
-    for (account_id, camera_id, package_id, bucket_start), grouped in groups.items():
+    for (account_id, camera_id, package_id, dims, bucket_start), grouped in groups.items():
+        (
+            config_source,
+            config_revision,
+            config_status,
+            model_key,
+            classes_key,
+            threshold,
+            warnings,
+        ) = dims
         mins = [float(g["min_confidence"]) for g in grouped if g.get("min_confidence") is not None]
         maxs = [float(g["max_confidence"]) for g in grouped if g.get("max_confidence") is not None]
         buckets.append(
@@ -363,6 +461,13 @@ def compute_hourly_rollup_buckets(
                 account_id=account_id,
                 camera_id=camera_id,
                 package_id=package_id,
+                processing_config_source=config_source,
+                processing_config_revision=config_revision,
+                processing_config_status=config_status,
+                applied_model_key=model_key,
+                applied_selected_classes_key=classes_key,
+                applied_confidence_threshold=threshold,
+                processing_config_warnings=warnings,
                 bucket_start=bucket_start,
                 bucket_end=bucket_start + timedelta(hours=1),
                 metric_count=len(grouped),
