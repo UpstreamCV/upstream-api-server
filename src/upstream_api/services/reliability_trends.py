@@ -19,17 +19,28 @@ Two pieces, mirroring the style of ``detection_metrics_rollup.py``:
 Internal column names are renamed to clean public names in the SQL aliases
 (``avg_confidence_weighted`` -> ``avg_confidence`` etc.), and no tenant/internal
 columns (account_id, stream_session_id, package_id, source) are projected.
+
+Model-config M9 adds a SECOND, separate read: the by-config trend
+(``_CONFIDENCE_TREND_BY_CONFIG_SQL`` + ``get_confidence_trend_by_config_for_camera``),
+which keeps the M9 applied-processing-config dimension columns as GROUP BY keys
+(one series per applied config) and supports optional dimension filters. The
+camera-level query above is deliberately untouched: it keeps blending across
+ALL rollup rows of an hour — packages and config dimensions alike — so the
+existing dashboard chart contract is byte-identical with or without M9 data.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import Any
 from uuid import UUID
 
 import asyncpg
 
 from upstream_api.schemas.reliability import (
+    ConfidenceTrendByConfigResponse,
+    ConfidenceTrendConfigGroup,
     ConfidenceTrendPoint,
     ConfidenceTrendRange,
     ConfidenceTrendResponse,
@@ -106,6 +117,104 @@ select
 """
 
 
+# M9: the by-config variant. Same window/weighting posture as
+# _CONFIDENCE_TREND_SQL, but the applied-processing-config dimension columns
+# stay in GROUP BY (one output row per config group per hour) and are projected
+# so the rows can be assembled into per-config series. package_id remains
+# blended (a config group can span packages, re-weighted exactly like the
+# camera-level query re-weights per-package rows).
+#
+# Optional dimension filters use the static null-or-match pattern (`$n is null
+# or col = $n`) so the SQL stays one pinned constant — an unset filter binds
+# NULL and the predicate collapses to true. The warning filter matches a code
+# inside the text[] column; rows with NULL warnings (no metadata, or no
+# warnings) never match it.
+#
+# Output rows = hours x config-groups, so the cap is point_cap x
+# _MAX_CONFIG_GROUPS_PER_HOUR (a defensive ceiling, not an expected shape: more
+# than a handful of distinct applied configs per camera per window is
+# pathological). Ordered by bucket_start so each group's points come out
+# oldest-first after the Python group-split.
+#
+# $1=account_id, $2=camera_id, $3=now, $4=lookback_hours, $5=row_cap,
+# $6=processing_config_revision, $7=processing_config_status,
+# $8=applied_selected_classes_key, $9=applied_confidence_threshold,
+# $10=warning code.
+_MAX_CONFIG_GROUPS_PER_HOUR = 8
+
+_CONFIDENCE_TREND_BY_CONFIG_SQL = """
+select
+    processing_config_source,
+    processing_config_revision,
+    processing_config_status,
+    applied_model_key,
+    applied_selected_classes_key,
+    applied_confidence_threshold,
+    processing_config_warnings,
+    bucket_start,
+    bucket_start + interval '1 hour' as bucket_end,
+    sum(avg_confidence_weighted * confidence_sample_count)
+      filter (where avg_confidence_weighted is not null)
+    / nullif(sum(confidence_sample_count)
+             filter (where avg_confidence_weighted is not null), 0) as avg_confidence,
+    min(min_confidence) as min_confidence,
+    max(max_confidence) as max_confidence,
+    sum(avg_low_confidence_ratio_weighted * confidence_sample_count)
+      filter (where avg_low_confidence_ratio_weighted is not null)
+    / nullif(sum(confidence_sample_count)
+             filter (where avg_low_confidence_ratio_weighted is not null), 0)
+      as low_confidence_ratio,
+    sum(avg_confidence_stddev_weighted * confidence_sample_count)
+      filter (where avg_confidence_stddev_weighted is not null)
+    / nullif(sum(confidence_sample_count)
+             filter (where avg_confidence_stddev_weighted is not null), 0) as confidence_stddev,
+    sum(metric_count) as metric_count,
+    sum(object_count_total) as object_count_total,
+    sum(confidence_sample_count) as confidence_sample_count
+  from detection_confidence_hourly_rollups
+ where account_id = $1
+   and camera_id = $2
+   and bucket_start >= date_trunc('hour', $3::timestamptz) - make_interval(hours => $4::int)
+   and bucket_start <  date_trunc('hour', $3::timestamptz)
+   and ($6::int is null or processing_config_revision = $6::int)
+   and ($7::text is null or processing_config_status = $7::text)
+   and ($8::text is null or applied_selected_classes_key = $8::text)
+   and ($9::double precision is null or applied_confidence_threshold = $9::double precision)
+   and ($10::text is null or $10::text = any(processing_config_warnings))
+ group by processing_config_source, processing_config_revision, processing_config_status,
+          applied_model_key, applied_selected_classes_key, applied_confidence_threshold,
+          processing_config_warnings, bucket_start
+ order by bucket_start asc
+ limit $5
+"""
+
+# The dimension columns a by-config row carries, in group-identity order.
+_CONFIG_DIMENSION_COLUMNS = (
+    "processing_config_source",
+    "processing_config_revision",
+    "processing_config_status",
+    "applied_model_key",
+    "applied_selected_classes_key",
+    "applied_confidence_threshold",
+    "processing_config_warnings",
+)
+
+# The point columns (the SQL aliases == the API field names, as in the
+# camera-level query).
+_POINT_COLUMNS = (
+    "bucket_start",
+    "bucket_end",
+    "avg_confidence",
+    "min_confidence",
+    "max_confidence",
+    "low_confidence_ratio",
+    "confidence_stddev",
+    "metric_count",
+    "object_count_total",
+    "confidence_sample_count",
+)
+
+
 async def get_confidence_trend_for_camera(
     conn: asyncpg.Connection,
     *,
@@ -139,6 +248,109 @@ async def get_confidence_trend_for_camera(
         points=points,
         summary=summarize_confidence_trend(points),
     )
+
+
+async def get_confidence_trend_by_config_for_camera(
+    conn: asyncpg.Connection,
+    *,
+    account_id: UUID,
+    camera_id: UUID,
+    range_: ConfidenceTrendRange,
+    now: datetime | None = None,
+    processing_config_revision: int | None = None,
+    processing_config_status: str | None = None,
+    applied_selected_classes_key: str | None = None,
+    applied_confidence_threshold: float | None = None,
+    warning: str | None = None,
+) -> ConfidenceTrendByConfigResponse:
+    """Hourly confidence-trend points split per applied-config group (M9).
+
+    Each filter kwarg is optional; ``None`` means "don't filter on this
+    dimension" (the SQL's null-or-match predicates). Rows recorded before the
+    processor stamped applied_processing_config carry all-``None`` dimensions
+    and form their own group — so old and new history are both visible, never
+    blended into each other.
+    """
+    if now is None:
+        now = datetime.now(tz=UTC)
+    spec = _RANGES[range_]
+    rows = await conn.fetch(
+        _CONFIDENCE_TREND_BY_CONFIG_SQL,
+        account_id,
+        camera_id,
+        now,
+        spec.lookback_hours,
+        spec.point_cap * _MAX_CONFIG_GROUPS_PER_HOUR,
+        processing_config_revision,
+        processing_config_status,
+        applied_selected_classes_key,
+        applied_confidence_threshold,
+        warning,
+    )
+    groups = _split_rows_into_config_groups(rows)
+    return ConfidenceTrendByConfigResponse(
+        camera_id=camera_id,
+        range=range_,
+        bucket_size="1h",
+        group_count=len(groups),
+        groups=groups,
+    )
+
+
+def _split_rows_into_config_groups(
+    rows: list[Any],
+) -> list[ConfidenceTrendConfigGroup]:
+    """Assemble by-config rows (ordered bucket_start asc) into one group per
+    distinct dimension tuple, each with oldest-first points and its own
+    summary. Pure — unit-testable without a DB.
+
+    Groups come out in a deterministic order: ascending config revision with
+    the no-revision groups (defaults / pre-M8 metadata) first, then by the
+    remaining dimension values — so "r3 vs r4" comparisons read top-to-bottom.
+    """
+    grouped: dict[tuple[Any, ...], list[ConfidenceTrendPoint]] = {}
+    dims_by_key: dict[tuple[Any, ...], dict[str, Any]] = {}
+    for row in rows:
+        record = dict(row)
+        dims = {column: record.get(column) for column in _CONFIG_DIMENSION_COLUMNS}
+        # asyncpg returns text[] as a list — normalise to a tuple for the key.
+        warnings = dims["processing_config_warnings"]
+        key_warnings = tuple(warnings) if warnings is not None else None
+        key = tuple(
+            key_warnings if column == "processing_config_warnings" else dims[column]
+            for column in _CONFIG_DIMENSION_COLUMNS
+        )
+        point = ConfidenceTrendPoint(**{column: record[column] for column in _POINT_COLUMNS})
+        grouped.setdefault(key, []).append(point)
+        dims_by_key.setdefault(key, dims)
+
+    def _sort_key(key: tuple[Any, ...]) -> tuple[Any, ...]:
+        revision = key[1]
+        return (
+            revision is not None,  # no-revision groups (defaults / pre-M8) first
+            revision if revision is not None else -1,
+            tuple("" if part is None else str(part) for part in key),
+        )
+
+    groups: list[ConfidenceTrendConfigGroup] = []
+    for key in sorted(grouped, key=_sort_key):
+        dims = dims_by_key[key]
+        points = grouped[key]
+        warnings = dims["processing_config_warnings"]
+        groups.append(
+            ConfidenceTrendConfigGroup(
+                processing_config_source=dims["processing_config_source"],
+                processing_config_revision=dims["processing_config_revision"],
+                processing_config_status=dims["processing_config_status"],
+                applied_model_key=dims["applied_model_key"],
+                applied_selected_classes_key=dims["applied_selected_classes_key"],
+                applied_confidence_threshold=dims["applied_confidence_threshold"],
+                processing_config_warnings=list(warnings) if warnings is not None else None,
+                points=points,
+                summary=summarize_confidence_trend(points),
+            )
+        )
+    return groups
 
 
 def summarize_confidence_trend(points: list[ConfidenceTrendPoint]) -> ConfidenceTrendSummary:

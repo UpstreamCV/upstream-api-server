@@ -11,11 +11,15 @@ The full route (auth/scoping/422/JSON) is covered in test_reliability_endpoints.
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from upstream_api.schemas.reliability import ConfidenceTrendPoint
 from upstream_api.services.reliability_trends import (
+    _CONFIDENCE_TREND_BY_CONFIG_SQL,
     _CONFIDENCE_TREND_SQL,
+    _MAX_CONFIG_GROUPS_PER_HOUR,
     _RANGES,
+    _split_rows_into_config_groups,
     summarize_confidence_trend,
 )
 
@@ -110,6 +114,199 @@ def test_trend_sql_does_not_split_or_leak_internal_columns() -> None:
     # No tenant/internal columns projected (account_id appears only in the WHERE).
     assert "stream_session_id" not in sql
     assert "source" not in sql
+    # M9 must NOT touch the camera-level query: the dimension columns belong to
+    # the by-config query only, so the default endpoint keeps blending across
+    # config groups exactly as it blends across packages.
+    assert "processing_config" not in sql
+    assert "applied_" not in sql
+
+
+# ---------------------------------------------------------------------------
+# M9: by-config SQL pins.
+# ---------------------------------------------------------------------------
+
+
+def test_by_config_sql_groups_and_projects_dimension_columns() -> None:
+    sql = _norm(_CONFIDENCE_TREND_BY_CONFIG_SQL)
+    assert "from detection_confidence_hourly_rollups" in sql
+    assert "where account_id = $1" in sql
+    assert "and camera_id = $2" in sql
+    # Same hour-aligned half-open window as the camera-level query.
+    assert (
+        "bucket_start >= date_trunc('hour', $3::timestamptz) "
+        "- make_interval(hours => $4::int)" in sql
+    )
+    assert "bucket_start < date_trunc('hour', $3::timestamptz)" in sql
+    assert "order by bucket_start asc" in sql
+    assert "limit $5" in sql
+    # All seven dimension columns are projected AND grouped — never blended.
+    for col in (
+        "processing_config_source",
+        "processing_config_revision",
+        "processing_config_status",
+        "applied_model_key",
+        "applied_selected_classes_key",
+        "applied_confidence_threshold",
+        "processing_config_warnings",
+    ):
+        assert col in sql
+    assert (
+        "group by processing_config_source, processing_config_revision, "
+        "processing_config_status, applied_model_key, applied_selected_classes_key, "
+        "applied_confidence_threshold, processing_config_warnings, bucket_start" in sql
+    )
+    # package_id stays blended (a config group can span packages) and tenant
+    # columns are never projected.
+    assert "package_id" not in sql
+    assert "stream_session_id" not in sql
+
+
+def test_by_config_sql_pins_null_or_match_filters() -> None:
+    sql = _norm(_CONFIDENCE_TREND_BY_CONFIG_SQL)
+    assert "and ($6::int is null or processing_config_revision = $6::int)" in sql
+    assert "and ($7::text is null or processing_config_status = $7::text)" in sql
+    assert "and ($8::text is null or applied_selected_classes_key = $8::text)" in sql
+    assert (
+        "and ($9::double precision is null "
+        "or applied_confidence_threshold = $9::double precision)" in sql
+    )
+    assert "and ($10::text is null or $10::text = any(processing_config_warnings))" in sql
+
+
+def test_by_config_sql_weighting_mirrors_camera_level_query() -> None:
+    """The by-config query re-weights per-package rows within each config group
+    with the same per-field FILTER posture as the camera-level query."""
+    sql = _norm(_CONFIDENCE_TREND_BY_CONFIG_SQL)
+    assert (
+        "sum(avg_confidence_weighted * confidence_sample_count) "
+        "filter (where avg_confidence_weighted is not null)" in sql
+    )
+    assert (
+        "nullif(sum(confidence_sample_count) filter (where avg_confidence_weighted is not null), 0)"
+        in sql
+    )
+    assert "as avg_confidence" in sql
+    assert "as low_confidence_ratio" in sql
+    assert "as confidence_stddev" in sql
+    assert "min(min_confidence) as min_confidence" in sql
+    assert "max(max_confidence) as max_confidence" in sql
+    assert "sum(metric_count) as metric_count" in sql
+    assert "sum(confidence_sample_count) as confidence_sample_count" in sql
+
+
+def test_by_config_row_cap_scales_the_point_cap() -> None:
+    """Rows = hours x config groups, so the cap must exceed the plain point cap
+    by the defensive per-hour group ceiling."""
+    assert _MAX_CONFIG_GROUPS_PER_HOUR >= 2
+    for spec in _RANGES.values():
+        assert spec.point_cap * _MAX_CONFIG_GROUPS_PER_HOUR > spec.point_cap
+
+
+# ---------------------------------------------------------------------------
+# M9: _split_rows_into_config_groups (pure).
+# ---------------------------------------------------------------------------
+
+_T0_SPLIT = datetime(2026, 6, 8, 0, 0, 0, tzinfo=UTC)
+
+
+def _by_config_row(
+    hour: int,
+    *,
+    avg: float | None,
+    samples: int,
+    revision: int | None = None,
+    source: str | None = None,
+    status: str | None = None,
+    model_key: str | None = None,
+    classes_key: str | None = None,
+    threshold: float | None = None,
+    warnings: list[str] | None = None,
+) -> dict[str, Any]:
+    start = _T0_SPLIT + timedelta(hours=hour)
+    return {
+        "processing_config_source": source,
+        "processing_config_revision": revision,
+        "processing_config_status": status,
+        "applied_model_key": model_key,
+        "applied_selected_classes_key": classes_key,
+        "applied_confidence_threshold": threshold,
+        "processing_config_warnings": warnings,
+        "bucket_start": start,
+        "bucket_end": start + timedelta(hours=1),
+        "avg_confidence": avg,
+        "min_confidence": None,
+        "max_confidence": None,
+        "low_confidence_ratio": None,
+        "confidence_stddev": None,
+        "metric_count": samples,
+        "object_count_total": samples,
+        "confidence_sample_count": samples,
+    }
+
+
+def test_split_separates_config_groups_and_keeps_point_order() -> None:
+    rows = [
+        _by_config_row(
+            0, avg=0.5, samples=10, revision=3, source="operator_saved", status="applied"
+        ),
+        _by_config_row(
+            0,
+            avg=0.9,
+            samples=20,
+            revision=4,
+            source="operator_saved",
+            status="applied",
+            threshold=0.2,
+        ),
+        _by_config_row(
+            1, avg=0.6, samples=10, revision=3, source="operator_saved", status="applied"
+        ),
+    ]
+    groups = _split_rows_into_config_groups(rows)
+    assert len(groups) == 2
+    r3 = next(g for g in groups if g.processing_config_revision == 3)
+    r4 = next(g for g in groups if g.processing_config_revision == 4)
+    assert [p.avg_confidence for p in r3.points] == [0.5, 0.6]
+    assert r3.points[0].bucket_start < r3.points[1].bucket_start
+    assert r3.summary.point_count == 2
+    assert r4.applied_confidence_threshold == 0.2
+    assert [p.avg_confidence for p in r4.points] == [0.9]
+    assert r4.summary.latest_avg_confidence == 0.9
+    # Deterministic ordering: ascending revision.
+    assert [g.processing_config_revision for g in groups] == [3, 4]
+
+
+def test_split_null_dimension_rows_form_their_own_group_first() -> None:
+    """Pre-M8 history (all-None dimensions) is its own visible group, ordered
+    before revisioned groups — never blended into them, never dropped."""
+    rows = [
+        _by_config_row(0, avg=0.7, samples=10),  # all-None dims (old data)
+        _by_config_row(0, avg=0.9, samples=10, revision=1, source="operator_saved"),
+    ]
+    groups = _split_rows_into_config_groups(rows)
+    assert len(groups) == 2
+    assert groups[0].processing_config_revision is None
+    assert groups[0].processing_config_source is None
+    assert groups[0].processing_config_warnings is None
+    assert groups[1].processing_config_revision == 1
+
+
+def test_split_warnings_identity_distinguishes_groups() -> None:
+    """Same scalar dims but different warning sets are different groups (the
+    rollup table keys on warnings too), and the warnings list round-trips."""
+    code = "selected_classes_analytics_counts_not_filtered"
+    rows = [
+        _by_config_row(0, avg=0.7, samples=10, revision=2, classes_key="person", warnings=[code]),
+        _by_config_row(0, avg=0.8, samples=10, revision=2, classes_key="person", warnings=None),
+    ]
+    groups = _split_rows_into_config_groups(rows)
+    assert len(groups) == 2
+    warned = next(g for g in groups if g.processing_config_warnings is not None)
+    assert warned.processing_config_warnings == [code]
+
+
+def test_split_empty_rows_yield_no_groups() -> None:
+    assert _split_rows_into_config_groups([]) == []
 
 
 # ---------------------------------------------------------------------------

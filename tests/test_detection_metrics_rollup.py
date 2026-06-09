@@ -37,10 +37,21 @@ from upstream_api.services.detection_metrics_rollup import (
     run_detection_metrics_rollup,
 )
 
-# Stable expression shared by the migration's unique index and the rollup's
-# ON CONFLICT target. If these two ever differ byte-for-byte, the upsert fails
-# to infer the arbiter index at runtime — so the tests pin BOTH against this.
-_CONFLICT_EXPR = "coalesce(package_id, '')"
+# Stable expression list shared by the (M9-re-keyed) unique index and the
+# rollup's ON CONFLICT target. If these two ever differ byte-for-byte, the
+# upsert fails to infer the arbiter index at runtime — so the tests pin BOTH
+# against this. M9 extended the M6 package fold with the applied-processing-
+# config dimension folds, same coalesce-sentinel pattern per dimension.
+_CONFLICT_EXPR = (
+    "coalesce(package_id, ''), "
+    "coalesce(processing_config_source, ''), "
+    "coalesce(processing_config_revision, -1), "
+    "coalesce(processing_config_status, ''), "
+    "coalesce(applied_model_key, ''), "
+    "coalesce(applied_selected_classes_key, ''), "
+    "coalesce(applied_confidence_threshold, -1.0), "
+    "coalesce(processing_config_warnings, '{}'::text[])"
+)
 
 
 def _norm(sql: str) -> str:
@@ -109,12 +120,39 @@ def test_rollup_sql_pins_weighted_math_and_idempotent_upsert() -> None:
     assert "max(m.max_confidence)" in sql
     # Group on coalesce(package_id,'') so a NULL and an empty-string package_id
     # fold into one group (matching the conflict arbiter); store nullif(...,'')
-    # so no sentinel string is persisted.
+    # so no sentinel string is persisted. M9: the applied-processing-config
+    # dimensions follow the exact same fold/store pattern as extra GROUP BY keys.
     assert (
         "group by m.account_id, m.camera_id, coalesce(m.package_id, ''), "
+        "coalesce(m.processing_config_source, ''), "
+        "coalesce(m.processing_config_revision, -1), "
+        "coalesce(m.processing_config_status, ''), "
+        "coalesce(m.applied_model_key, ''), "
+        "coalesce(m.applied_selected_classes_key, ''), "
+        "coalesce(m.applied_confidence_threshold, -1.0), "
+        "coalesce(m.processing_config_warnings, '{}'::text[]), "
         "date_trunc('hour', m.observed_at)" in sql
     )
     assert "nullif(coalesce(m.package_id, ''), '') as package_id" in sql
+    assert "nullif(coalesce(m.processing_config_source, ''), '') as processing_config_source" in sql
+    assert (
+        "nullif(coalesce(m.processing_config_revision, -1), -1) as processing_config_revision"
+        in sql
+    )
+    assert "nullif(coalesce(m.processing_config_status, ''), '') as processing_config_status" in sql
+    assert "nullif(coalesce(m.applied_model_key, ''), '') as applied_model_key" in sql
+    assert (
+        "nullif(coalesce(m.applied_selected_classes_key, ''), '') as applied_selected_classes_key"
+        in sql
+    )
+    assert (
+        "nullif(coalesce(m.applied_confidence_threshold, -1.0), -1.0) "
+        "as applied_confidence_threshold" in sql
+    )
+    assert (
+        "nullif(coalesce(m.processing_config_warnings, '{}'::text[]), '{}'::text[]) "
+        "as processing_config_warnings" in sql
+    )
     # Exclude the current incomplete hour; the lookback lower bound is ALSO
     # hour-aligned so the rollup only ever scans whole hours.
     assert "m.observed_at < date_trunc('hour', $1::timestamptz)" in sql
@@ -184,11 +222,12 @@ def test_migration_file_pins_rollup_table_shape() -> None:
     )
     sql = _norm(migration.read_text())
     assert "create table detection_confidence_hourly_rollups" in sql
-    # Unique EXPRESSION index whose coalesce expression is byte-identical to the
-    # rollup's ON CONFLICT target (so the upsert can infer it).
+    # The ORIGINAL (M6) unique expression index. The M9 migration DROPs and
+    # re-creates it with the config-dimension folds — the live index expression
+    # is pinned against the M9 migration file in
+    # test_m9_migration_file_pins_dimension_rekey below.
     assert "unique index detection_confidence_hourly_rollups_bucket_idx" in sql
-    assert f"(account_id, camera_id, bucket_start, {_CONFLICT_EXPR})" in sql
-    assert _CONFLICT_EXPR in _norm(_ROLLUP_HOURLY_SQL)  # cross-pin: both sides match
+    assert "(account_id, camera_id, bucket_start, coalesce(package_id, ''))" in sql
     # The three trend-chart read indexes.
     assert "detection_confidence_hourly_rollups_account_camera_bucket_idx" in sql
     assert "detection_confidence_hourly_rollups_camera_bucket_idx" in sql
@@ -216,6 +255,40 @@ def test_migration_file_pins_rollup_table_shape() -> None:
         "bucket_end",
     ):
         assert col in sql
+
+
+def test_m9_migration_file_pins_dimension_rekey() -> None:
+    """The M9 migration adds the dimension columns to BOTH metrics tables and
+    re-keys the rollup unique index with the dimension folds, byte-identical to
+    the rollup's ON CONFLICT target (so the upsert can infer the arbiter)."""
+    root = Path(__file__).resolve().parents[1]
+    migration = root / "supabase" / "migrations" / "20260609120000_processing_config_dimensions.sql"
+    sql = _norm(migration.read_text())
+    assert "alter table snapshot_detection_metrics" in sql
+    assert "alter table detection_confidence_hourly_rollups" in sql
+    for col in (
+        "processing_config_source",
+        "processing_config_revision",
+        "processing_config_status",
+        "applied_model_key",
+        "applied_selected_classes_key",
+        "applied_confidence_threshold",
+        "processing_config_warnings",
+    ):
+        assert f"add column {col}" in sql
+    # The boolean caveat flag lives on the raw table only (derivable from
+    # warnings on rollups).
+    assert "add column selected_classes_analytics_counts_not_filtered boolean" in sql
+    # Old index dropped, new one created with the dimension folds — and the
+    # expression list is byte-identical to the service's ON CONFLICT target.
+    assert "drop index detection_confidence_hourly_rollups_bucket_idx" in sql
+    assert "create unique index detection_confidence_hourly_rollups_bucket_idx" in sql
+    assert f"(account_id, camera_id, bucket_start, {_CONFLICT_EXPR})" in sql
+    assert _CONFLICT_EXPR in _norm(_ROLLUP_HOURLY_SQL)  # cross-pin: both sides match
+    # Compact dimensions only — never the raw snapshot, never requested-value
+    # columns (warnings codes already record requested-but-not-applied facts).
+    assert "jsonb" not in sql
+    assert "add column requested_" not in sql
 
 
 # ---------------------------------------------------------------------------
@@ -383,6 +456,13 @@ def _raw(
     account: UUID = _ACCOUNT,
     camera: UUID = _CAMERA,
     package: str | None = "pkg-1",
+    config_source: str | None = None,
+    config_revision: int | None = None,
+    config_status: str | None = None,
+    model_key: str | None = None,
+    classes_key: str | None = None,
+    threshold: float | None = None,
+    warnings: list[str] | None = None,
 ) -> dict[str, Any]:
     return {
         "account_id": account,
@@ -396,6 +476,13 @@ def _raw(
         "max_confidence": mx,
         "low_confidence_ratio": low_ratio,
         "confidence_stddev": stddev,
+        "processing_config_source": config_source,
+        "processing_config_revision": config_revision,
+        "processing_config_status": config_status,
+        "applied_model_key": model_key,
+        "applied_selected_classes_key": classes_key,
+        "applied_confidence_threshold": threshold,
+        "processing_config_warnings": warnings,
     }
 
 
@@ -662,6 +749,180 @@ def test_buckets_isolated_per_account_and_camera() -> None:
     assert len(buckets) == 2
     keys = {(b.account_id, b.camera_id) for b in buckets}
     assert keys == {(_ACCOUNT, _CAMERA), (other_account, other_camera)}
+
+
+# ---------------------------------------------------------------------------
+# M9: applied-processing-config dimensions split buckets, never blend.
+# ---------------------------------------------------------------------------
+
+
+def test_two_confidence_thresholds_in_one_hour_yield_two_buckets() -> None:
+    """A camera whose applied confidence_threshold changed mid-hour must NOT
+    blend both configs into one indistinguishable point."""
+    rows = [
+        _raw(
+            datetime(2026, 5, 29, 10, 10, tzinfo=UTC),
+            avg=0.5,
+            samples=10,
+            mn=0.5,
+            mx=0.5,
+            config_source="operator_saved",
+            config_revision=3,
+            config_status="applied",
+            model_key="trafficcamnet_v1",
+            classes_key="all",
+            threshold=None,
+        ),
+        _raw(
+            datetime(2026, 5, 29, 10, 40, tzinfo=UTC),
+            avg=0.9,
+            samples=10,
+            mn=0.9,
+            mx=0.9,
+            config_source="operator_saved",
+            config_revision=4,
+            config_status="applied",
+            model_key="trafficcamnet_v1",
+            classes_key="all",
+            threshold=0.2,
+        ),
+    ]
+    buckets = compute_hourly_rollup_buckets(rows, now=_NOW)
+    assert len(buckets) == 2
+    by_threshold = {b.applied_confidence_threshold: b for b in buckets}
+    assert set(by_threshold) == {None, 0.2}
+    assert by_threshold[None].processing_config_revision == 3
+    assert by_threshold[None].avg_confidence_weighted == pytest.approx(0.5)
+    assert by_threshold[0.2].processing_config_revision == 4
+    assert by_threshold[0.2].avg_confidence_weighted == pytest.approx(0.9)
+    # Both buckets share the same hour — they split on config, not time.
+    assert by_threshold[None].bucket_start == by_threshold[0.2].bucket_start
+
+
+def test_person_only_and_all_classes_in_one_hour_yield_two_buckets() -> None:
+    rows = [
+        _raw(
+            datetime(2026, 5, 29, 10, 10, tzinfo=UTC),
+            avg=0.6,
+            samples=10,
+            mn=0.6,
+            mx=0.6,
+            config_source="default",
+            config_status="applied_defaults",
+            model_key="trafficcamnet_v1",
+            classes_key="all",
+        ),
+        _raw(
+            datetime(2026, 5, 29, 10, 40, tzinfo=UTC),
+            avg=0.8,
+            samples=10,
+            mn=0.8,
+            mx=0.8,
+            config_source="operator_saved",
+            config_revision=2,
+            config_status="partially_applied",
+            model_key="trafficcamnet_v1",
+            classes_key="person",
+            warnings=["selected_classes_analytics_counts_not_filtered"],
+        ),
+    ]
+    buckets = compute_hourly_rollup_buckets(rows, now=_NOW)
+    assert len(buckets) == 2
+    by_classes = {b.applied_selected_classes_key: b for b in buckets}
+    assert set(by_classes) == {"all", "person"}
+    assert by_classes["person"].processing_config_warnings == (
+        "selected_classes_analytics_counts_not_filtered",
+    )
+    assert by_classes["all"].processing_config_warnings is None
+    assert by_classes["person"].avg_confidence_weighted == pytest.approx(0.8)
+
+
+def test_old_null_dimension_rows_still_roll_up_together() -> None:
+    """Pre-M9 raw rows (no dimension keys at all) and explicit-None rows fold
+    into ONE null-dimension bucket — backward compatible, no split, no crash."""
+    legacy_row = {
+        "account_id": _ACCOUNT,
+        "camera_id": _CAMERA,
+        "package_id": "pkg-1",
+        "observed_at": datetime(2026, 5, 29, 10, 10, tzinfo=UTC),
+        "object_count": 5,
+        "confidence_sample_count": 10,
+        "avg_confidence": 0.8,
+        "min_confidence": 0.8,
+        "max_confidence": 0.8,
+        "low_confidence_ratio": None,
+        "confidence_stddev": None,
+        # No M9 keys at all — the pre-migration row shape.
+    }
+    rows = [
+        legacy_row,
+        _raw(datetime(2026, 5, 29, 10, 40, tzinfo=UTC), avg=0.6, samples=10, mn=0.6, mx=0.6),
+    ]
+    buckets = compute_hourly_rollup_buckets(rows, now=_NOW)
+    assert len(buckets) == 1
+    b = buckets[0]
+    assert b.metric_count == 2
+    assert b.avg_confidence_weighted == pytest.approx(0.7)
+    assert b.processing_config_source is None
+    assert b.processing_config_revision is None
+    assert b.applied_selected_classes_key is None
+    assert b.processing_config_warnings is None
+
+
+def test_empty_string_and_null_dimensions_fold_like_package_id() -> None:
+    """'' and NULL text dimensions (and [] vs NULL warnings) fold into one
+    group, mirroring the SQL's coalesce sentinels — otherwise the upsert would
+    hit 'cannot affect row a second time' exactly like the package_id case."""
+    rows = [
+        _raw(
+            datetime(2026, 5, 29, 10, 10, tzinfo=UTC),
+            avg=0.8,
+            samples=10,
+            mn=0.8,
+            mx=0.8,
+            config_source="",
+            classes_key="",
+            warnings=[],
+        ),
+        _raw(datetime(2026, 5, 29, 10, 40, tzinfo=UTC), avg=0.6, samples=10, mn=0.6, mx=0.6),
+    ]
+    buckets = compute_hourly_rollup_buckets(rows, now=_NOW)
+    assert len(buckets) == 1
+    assert buckets[0].processing_config_source is None  # no sentinel stored
+    assert buckets[0].applied_selected_classes_key is None
+    assert buckets[0].processing_config_warnings is None
+    assert buckets[0].metric_count == 2
+
+
+def test_package_split_is_preserved_alongside_config_dimensions() -> None:
+    """M6's per-package split keeps working under M9: same config dimensions
+    but different packages still produce separate buckets."""
+    rows = [
+        _raw(
+            datetime(2026, 5, 29, 10, 10, tzinfo=UTC),
+            avg=0.8,
+            samples=10,
+            mn=0.8,
+            mx=0.8,
+            package="a",
+            config_revision=3,
+            classes_key="all",
+        ),
+        _raw(
+            datetime(2026, 5, 29, 10, 20, tzinfo=UTC),
+            avg=0.6,
+            samples=10,
+            mn=0.6,
+            mx=0.6,
+            package="b",
+            config_revision=3,
+            classes_key="all",
+        ),
+    ]
+    buckets = compute_hourly_rollup_buckets(rows, now=_NOW)
+    assert len(buckets) == 2
+    assert {b.package_id for b in buckets} == {"a", "b"}
+    assert all(b.processing_config_revision == 3 for b in buckets)
 
 
 def test_recompute_is_idempotent() -> None:

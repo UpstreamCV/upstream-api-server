@@ -9,14 +9,19 @@ camera whose model confidence is degrading versus its OWN recent behaviour
 Two hard rules:
 
 - It stores ONLY numeric summaries — never the raw snapshot / objects JSON.
+  (M9 adds the compact applied-processing-config DIMENSIONS — scalar lineage
+  columns plus a text[] of warning codes — which are extracted identifiers,
+  never the snapshot/objects payload.)
 - It must never break perception snapshot ingest. The writer raises on a DB
   error like any repo helper; the ingest router wraps the call in a savepoint
   + try/except so a failure (including the table not existing yet, before the
   M5 migration applies) is logged and swallowed without rolling back the
-  snapshot upsert.
+  snapshot upsert. Dimension extraction itself never raises — an old (pre-M8)
+  or malformed snapshot yields all-NULL dimensions and the row still writes.
 
 Confidence parsing and the summary statistics are reused wholesale from
-``detection_confidence`` — this module does not re-implement them.
+``detection_confidence``; the M9 dimension extraction comes wholesale from
+``processing_config_dimensions`` — this module re-implements neither.
 """
 
 from __future__ import annotations
@@ -36,6 +41,9 @@ from upstream_api.services.detection_confidence import (
     compute_detection_confidence_stats,
     count_detection_objects,
     extract_detection_confidences,
+)
+from upstream_api.services.processing_config_dimensions import (
+    extract_processing_config_dimensions,
 )
 
 # The metric writer summarises a row whenever a frame has at least one usable
@@ -59,7 +67,10 @@ insert into snapshot_detection_metrics (
     object_count, confidence_sample_count,
     avg_confidence, median_confidence, min_confidence, max_confidence,
     low_confidence_count, low_confidence_ratio, confidence_stddev,
-    source
+    source,
+    processing_config_source, processing_config_revision, processing_config_status,
+    applied_model_key, applied_selected_classes_key, applied_confidence_threshold,
+    processing_config_warnings, selected_classes_analytics_counts_not_filtered
 )
 values (
     $1, $2, $3, $4,
@@ -67,7 +78,10 @@ values (
     $8, $9,
     $10, $11, $12, $13,
     $14, $15, $16,
-    $17
+    $17,
+    $18, $19, $20,
+    $21, $22, $23,
+    $24, $25
 )
 on conflict (camera_id, observed_at) do nothing
 returning id
@@ -109,11 +123,17 @@ async def write_detection_metrics_for_perception_snapshot(
     are null. Stats are summarised whenever there is at least one usable
     confidence value (``_MIN_METRIC_SAMPLE_COUNT``); a frame with zero
     confidences carries counts but null stats.
+
+    M9: the row also carries the applied-processing-config dimensions extracted
+    from ``snapshot.source.applied_processing_config`` (all NULL for pre-M8 or
+    malformed snapshots — extraction never raises, and the numeric confidence
+    metrics are computed exactly as before, untouched by the dimensions).
     """
     values = extract_detection_confidences(snapshot)
     object_count = count_detection_objects(snapshot)
     confidence_sample_count = len(values)
     stats = compute_detection_confidence_stats(values, min_sample_count=_MIN_METRIC_SAMPLE_COUNT)
+    dimensions = extract_processing_config_dimensions(snapshot)
 
     if stats is None:
         avg = median = min_c = max_c = low_ratio = stddev = None
@@ -146,6 +166,14 @@ async def write_detection_metrics_for_perception_snapshot(
         low_ratio,
         stddev,
         source,
+        dimensions.processing_config_source,
+        dimensions.processing_config_revision,
+        dimensions.processing_config_status,
+        dimensions.applied_model_key,
+        dimensions.applied_selected_classes_key,
+        dimensions.applied_confidence_threshold,
+        dimensions.warnings_list(),
+        dimensions.selected_classes_analytics_counts_not_filtered,
     )
     return DetectionMetricWriteResult(
         written=row is not None,

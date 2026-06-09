@@ -89,6 +89,11 @@ class FakeReliabilityConn:
         # that selects `from detection_confidence_hourly_rollups`) returns. Keys
         # must match the SQL aliases (the API field names).
         confidence_trend_rows: list[dict[str, Any]] | None = None,
+        # M9: canned rows for the by-config trend query (routed by its
+        # dimension projection before the generic rollups check). The fake
+        # applies the null-or-match dimension filters in Python so filter
+        # params are exercised end-to-end.
+        confidence_trend_by_config_rows: list[dict[str, Any]] | None = None,
     ) -> None:
         self.camera_account_id = camera_account_id
         self.session_row = session_row
@@ -106,6 +111,8 @@ class FakeReliabilityConn:
         }
         self.resolves: list[dict[str, Any]] = []
         self.confidence_trend_rows = confidence_trend_rows or []
+        self.confidence_trend_by_config_rows = confidence_trend_by_config_rows or []
+        self.by_config_calls: list[tuple[Any, ...]] = []
 
     def transaction(self) -> FakeTx:
         return FakeTx()
@@ -158,7 +165,32 @@ class FakeReliabilityConn:
         return None
 
     async def fetch(self, query: str, *args: Any) -> list[dict[str, Any]]:
-        # M7: confidence-trend read (the only fetch over the rollup table).
+        # M9: by-config trend read — routed FIRST (it also selects from the
+        # rollup table; its dimension projection is the discriminator). The
+        # fake mirrors the SQL's null-or-match filters so filter params are
+        # exercised end-to-end.
+        if (
+            "from detection_confidence_hourly_rollups" in query
+            and "applied_selected_classes_key" in query
+        ):
+            self.by_config_calls.append(args)
+            revision, status, classes_key, threshold, warning = args[5:10]
+            rows = []
+            for row in self.confidence_trend_by_config_rows:
+                if revision is not None and row["processing_config_revision"] != revision:
+                    continue
+                if status is not None and row["processing_config_status"] != status:
+                    continue
+                if classes_key is not None and row["applied_selected_classes_key"] != classes_key:
+                    continue
+                if threshold is not None and row["applied_confidence_threshold"] != threshold:
+                    continue
+                if warning is not None and warning not in (row["processing_config_warnings"] or []):
+                    continue
+                rows.append(row)
+            return rows
+
+        # M7: confidence-trend read (the camera-level fetch over the rollups).
         if "from detection_confidence_hourly_rollups" in query:
             return list(self.confidence_trend_rows)
 
@@ -1159,3 +1191,245 @@ def test_confidence_trend_summary_math() -> None:
     got = s["latest_bucket_start"]
     assert got is not None
     assert datetime.fromisoformat(got.replace("Z", "+00:00")) == _BASE_HOUR + timedelta(hours=2)
+
+
+# ===========================================================================
+# confidence-trend/by-config (model-config M9 — per-applied-config series).
+# ===========================================================================
+
+
+_BY_CONFIG_PATH = "/v1/cameras/{camera_id}/reliability/confidence-trend/by-config"
+_CLASSES_WARNING = "selected_classes_analytics_counts_not_filtered"
+
+
+def _by_config_trend_row(
+    hour_offset: int,
+    *,
+    avg: float | None,
+    samples: int,
+    revision: int | None = None,
+    source: str | None = None,
+    status: str | None = None,
+    model_key: str | None = None,
+    classes_key: str | None = None,
+    threshold: float | None = None,
+    warnings: list[str] | None = None,
+) -> dict[str, Any]:
+    """One by-config row: a trend point plus its dimension columns."""
+    row = _trend_row(hour_offset, avg=avg, samples=samples)
+    row.update(
+        {
+            "processing_config_source": source,
+            "processing_config_revision": revision,
+            "processing_config_status": status,
+            "applied_model_key": model_key,
+            "applied_selected_classes_key": classes_key,
+            "applied_confidence_threshold": threshold,
+            "processing_config_warnings": warnings,
+        }
+    )
+    return row
+
+
+def _two_config_rows() -> list[dict[str, Any]]:
+    """One hour under config r3 (all classes), the next under r4 (person-only,
+    threshold 0.2, with the analytics-counts warning)."""
+    return [
+        _by_config_trend_row(
+            0,
+            avg=0.50,
+            samples=100,
+            revision=3,
+            source="operator_saved",
+            status="applied",
+            model_key="trafficcamnet_v1",
+            classes_key="all",
+            threshold=None,
+        ),
+        _by_config_trend_row(
+            1,
+            avg=0.90,
+            samples=80,
+            revision=4,
+            source="operator_saved",
+            status="partially_applied",
+            model_key="trafficcamnet_v1",
+            classes_key="person",
+            threshold=0.2,
+            warnings=[_CLASSES_WARNING],
+        ),
+    ]
+
+
+def test_by_config_unauthenticated_401() -> None:
+    conn = FakeReliabilityConn(camera_account_id=uuid4())
+    r = _caller_client_no_auth(conn).get(_BY_CONFIG_PATH.format(camera_id=uuid4()))
+    assert r.status_code == 401
+
+
+def test_by_config_cross_account_404() -> None:
+    caller_account, camera_owner = uuid4(), uuid4()
+    conn = FakeReliabilityConn(camera_account_id=camera_owner)
+    r = _caller_client(conn, account_id=caller_account).get(
+        _BY_CONFIG_PATH.format(camera_id=uuid4())
+    )
+    assert r.status_code == 404
+    assert r.json()["error"]["code"] == "camera_not_found"
+
+
+def test_by_config_invalid_range_422() -> None:
+    account = uuid4()
+    conn = FakeReliabilityConn(camera_account_id=account)
+    r = _caller_client(conn, account_id=account).get(
+        _BY_CONFIG_PATH.format(camera_id=uuid4()) + "?range=banana"
+    )
+    assert r.status_code == 422
+
+
+def test_by_config_invalid_status_422() -> None:
+    account = uuid4()
+    conn = FakeReliabilityConn(camera_account_id=account)
+    r = _caller_client(conn, account_id=account).get(
+        _BY_CONFIG_PATH.format(camera_id=uuid4()) + "?processing_config_status=banana"
+    )
+    assert r.status_code == 422
+
+
+def test_by_config_empty_data_is_safe() -> None:
+    account, camera = uuid4(), uuid4()
+    conn = FakeReliabilityConn(camera_account_id=account, confidence_trend_by_config_rows=[])
+    r = _caller_client(conn, account_id=account).get(_BY_CONFIG_PATH.format(camera_id=camera))
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["camera_id"] == str(camera)
+    assert body["range"] == "24h"
+    assert body["bucket_size"] == "1h"
+    assert body["group_count"] == 0
+    assert body["groups"] == []
+
+
+def test_by_config_returns_distinct_config_groups() -> None:
+    """Two configs in the window come back as two separate series — never one
+    blended line — each with its own dimensions, points, and summary."""
+    account, camera = uuid4(), uuid4()
+    conn = FakeReliabilityConn(
+        camera_account_id=account, confidence_trend_by_config_rows=_two_config_rows()
+    )
+    r = _caller_client(conn, account_id=account).get(_BY_CONFIG_PATH.format(camera_id=camera))
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["group_count"] == 2
+    groups = body["groups"]
+    assert [g["processing_config_revision"] for g in groups] == [3, 4]
+    r3, r4 = groups
+    assert r3["processing_config_status"] == "applied"
+    assert r3["applied_selected_classes_key"] == "all"
+    assert r3["applied_confidence_threshold"] is None
+    assert r3["processing_config_warnings"] is None
+    assert [p["avg_confidence"] for p in r3["points"]] == [0.50]
+    assert r3["summary"]["latest_avg_confidence"] == 0.50
+    assert r4["processing_config_status"] == "partially_applied"
+    assert r4["applied_selected_classes_key"] == "person"
+    assert r4["applied_confidence_threshold"] == 0.2
+    assert r4["processing_config_warnings"] == [_CLASSES_WARNING]
+    assert [p["avg_confidence"] for p in r4["points"]] == [0.90]
+    assert r4["summary"]["latest_avg_confidence"] == 0.90
+
+
+def test_by_config_null_dimension_history_is_its_own_group() -> None:
+    """Pre-M8 rollup rows (all-null dimensions) come back as a visible group
+    rather than vanishing or polluting a config group."""
+    account, camera = uuid4(), uuid4()
+    rows = [
+        _by_config_trend_row(0, avg=0.70, samples=50),  # all-null dims
+        *_two_config_rows(),
+    ]
+    conn = FakeReliabilityConn(camera_account_id=account, confidence_trend_by_config_rows=rows)
+    r = _caller_client(conn, account_id=account).get(_BY_CONFIG_PATH.format(camera_id=camera))
+    assert r.status_code == 200, r.text
+    groups = r.json()["groups"]
+    assert len(groups) == 3
+    # The no-metadata group sorts first.
+    assert groups[0]["processing_config_revision"] is None
+    assert groups[0]["processing_config_source"] is None
+    assert groups[0]["points"][0]["avg_confidence"] == 0.70
+
+
+def test_by_config_filter_by_revision() -> None:
+    account, camera = uuid4(), uuid4()
+    conn = FakeReliabilityConn(
+        camera_account_id=account, confidence_trend_by_config_rows=_two_config_rows()
+    )
+    r = _caller_client(conn, account_id=account).get(
+        _BY_CONFIG_PATH.format(camera_id=camera) + "?processing_config_revision=4"
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["group_count"] == 1
+    assert body["groups"][0]["processing_config_revision"] == 4
+    # The filter rode into the SQL params (None for the unused filters).
+    assert conn.by_config_calls[0][5] == 4
+    assert conn.by_config_calls[0][6:10] == (None, None, None, None)
+
+
+def test_by_config_filter_by_selected_classes_key() -> None:
+    account, camera = uuid4(), uuid4()
+    conn = FakeReliabilityConn(
+        camera_account_id=account, confidence_trend_by_config_rows=_two_config_rows()
+    )
+    r = _caller_client(conn, account_id=account).get(
+        _BY_CONFIG_PATH.format(camera_id=camera) + "?applied_selected_classes_key=person"
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["group_count"] == 1
+    assert body["groups"][0]["applied_selected_classes_key"] == "person"
+    assert body["groups"][0]["processing_config_revision"] == 4
+
+
+def test_by_config_filter_by_confidence_threshold() -> None:
+    account, camera = uuid4(), uuid4()
+    conn = FakeReliabilityConn(
+        camera_account_id=account, confidence_trend_by_config_rows=_two_config_rows()
+    )
+    r = _caller_client(conn, account_id=account).get(
+        _BY_CONFIG_PATH.format(camera_id=camera) + "?applied_confidence_threshold=0.2"
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["group_count"] == 1
+    assert body["groups"][0]["applied_confidence_threshold"] == 0.2
+
+
+def test_by_config_filter_by_warning_code() -> None:
+    account, camera = uuid4(), uuid4()
+    conn = FakeReliabilityConn(
+        camera_account_id=account, confidence_trend_by_config_rows=_two_config_rows()
+    )
+    r = _caller_client(conn, account_id=account).get(
+        _BY_CONFIG_PATH.format(camera_id=camera) + f"?warning={_CLASSES_WARNING}"
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["group_count"] == 1
+    assert body["groups"][0]["processing_config_warnings"] == [_CLASSES_WARNING]
+
+
+def test_by_config_does_not_change_default_trend_endpoint() -> None:
+    """The camera-level endpoint stays blended and shape-identical even when
+    by-config data exists — M9 must not break the existing dashboard chart."""
+    account, camera = uuid4(), uuid4()
+    conn = FakeReliabilityConn(
+        camera_account_id=account,
+        confidence_trend_rows=[_trend_row(0, avg=0.7, samples=50)],
+        confidence_trend_by_config_rows=_two_config_rows(),
+    )
+    r = _caller_client(conn, account_id=account).get(_TREND_PATH.format(camera_id=camera))
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert set(body) == {"camera_id", "range", "bucket_size", "points", "summary"}
+    assert len(body["points"]) == 1
+    # No dimension fields leak into the camera-level response.
+    raw = r.text
+    for leaked in ("processing_config", "applied_model_key", "applied_selected_classes_key"):
+        assert leaked not in raw
