@@ -90,7 +90,7 @@ def _health_client(monkeypatch: pytest.MonkeyPatch, *, db_ok: bool) -> TestClien
 
     app = create_app()
     app.state.http_client = object()  # lifespan doesn't run under TestClient
-    app.dependency_overrides[get_pool] = lambda: FakePool()
+    app.dependency_overrides[get_pool] = FakePool
     app.dependency_overrides[current_platform_admin] = lambda: _ADMIN
     return TestClient(app)
 
