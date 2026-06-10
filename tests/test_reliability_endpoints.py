@@ -1473,3 +1473,103 @@ def test_by_config_does_not_change_default_trend_endpoint() -> None:
     raw = r.text
     for leaked in ("processing_config", "applied_model_key", "applied_selected_classes_key"):
         assert leaked not in raw
+
+
+# ===========================================================================
+# config-comparison-summary (M11 — descriptive report card).
+# ===========================================================================
+
+
+_COMPARISON_PATH = "/v1/cameras/{camera_id}/reliability/config-comparison-summary"
+
+
+def test_comparison_unauthenticated_401() -> None:
+    conn = FakeReliabilityConn(camera_account_id=uuid4())
+    r = _caller_client_no_auth(conn).get(_COMPARISON_PATH.format(camera_id=uuid4()))
+    assert r.status_code == 401
+
+
+def test_comparison_cross_account_404() -> None:
+    caller_account, camera_owner = uuid4(), uuid4()
+    conn = FakeReliabilityConn(camera_account_id=camera_owner)
+    r = _caller_client(conn, account_id=caller_account).get(
+        _COMPARISON_PATH.format(camera_id=uuid4())
+    )
+    assert r.status_code == 404
+    assert r.json()["error"]["code"] == "camera_not_found"
+
+
+def test_comparison_invalid_range_422() -> None:
+    account = uuid4()
+    conn = FakeReliabilityConn(camera_account_id=account)
+    r = _caller_client(conn, account_id=account).get(
+        _COMPARISON_PATH.format(camera_id=uuid4()) + "?range=banana"
+    )
+    assert r.status_code == 422
+
+
+def test_comparison_no_data_is_safe() -> None:
+    account, camera = uuid4(), uuid4()
+    conn = FakeReliabilityConn(camera_account_id=account, confidence_trend_by_config_rows=[])
+    r = _caller_client(conn, account_id=account).get(_COMPARISON_PATH.format(camera_id=camera))
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["comparison_status"] == "no_data"
+    assert body["baseline"] is None
+    assert body["candidate"] is None
+    assert body["metric_deltas"] is None
+    assert body["metric_directions"] == []
+
+
+def test_comparison_returns_descriptive_report_card() -> None:
+    account, camera = uuid4(), uuid4()
+    conn = FakeReliabilityConn(
+        camera_account_id=account, confidence_trend_by_config_rows=_two_config_rows()
+    )
+    r = _caller_client(conn, account_id=account).get(_COMPARISON_PATH.format(camera_id=camera))
+    assert r.status_code == 200, r.text
+    body = r.json()
+    # r3 (no threshold) vs r4 (threshold 0.2, fps 5, warnings) -> population
+    # changed -> mixed_metrics with notes, never a judgment.
+    assert body["comparison_mode"] == "latest_vs_previous"
+    assert body["comparison_status"] == "mixed_metrics"
+    assert body["baseline"]["processing_config_revision"] == 3
+    assert body["candidate"]["processing_config_revision"] == 4
+    assert body["candidate"]["label"] == "person · confidence 0.20 · 5 FPS"
+    assert body["metric_deltas"]["applied_processing_fps_delta"] == 5
+    assert "avg_confidence_higher" in body["metric_directions"]
+    assert any("Confidence threshold changed" in n for n in body["comparability_notes"])
+    assert any("output cadence only" in c for c in body["caveats"])
+    assert "Directional comparison only, not causal proof." in body["caveats"]
+    raw = r.text.lower()
+    for forbidden in ("better", "worse", "best config", "recommend", "caused"):
+        assert forbidden not in raw, forbidden
+
+
+def test_comparison_min_samples_param() -> None:
+    account, camera = uuid4(), uuid4()
+    conn = FakeReliabilityConn(
+        camera_account_id=account, confidence_trend_by_config_rows=_two_config_rows()
+    )
+    r = _caller_client(conn, account_id=account).get(
+        _COMPARISON_PATH.format(camera_id=camera) + "?min_samples=5000"
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["comparison_status"] == "inconclusive"
+    assert body["min_samples"] == 5000
+
+
+def test_comparison_explicit_revisions_param() -> None:
+    account, camera = uuid4(), uuid4()
+    conn = FakeReliabilityConn(
+        camera_account_id=account, confidence_trend_by_config_rows=_two_config_rows()
+    )
+    r = _caller_client(conn, account_id=account).get(
+        _COMPARISON_PATH.format(camera_id=camera) + "?baseline_revision=4&candidate_revision=3"
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["comparison_mode"] == "explicit"
+    assert body["baseline"]["processing_config_revision"] == 4
+    assert body["candidate"]["processing_config_revision"] == 3
