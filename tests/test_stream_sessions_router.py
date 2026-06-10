@@ -139,6 +139,8 @@ class FakeConn:
         return None
 
     async def fetchval(self, query: str, *args: Any) -> Any:
+        if "status from accounts" in query:
+            return "active"
         if "to_regclass" in query:
             return False
         if "exists" in query.lower():

@@ -4,6 +4,71 @@ Reverse chronological. Newest at top. Every meaningful commit gets an entry foll
 
 ---
 
+## 2026-06-10 - feat(admin): /v1/admin/* routers + audit trail + suspension enforcement
+
+### Summary
+The full cross-tenant API surface for the platform admin panel: system
+health rollup, cross-account stream/account/usage reads, audited PATCHes for
+plan/status/limits, and the audit-log read. Also makes `accounts.status`
+real: session starts on a suspended account are rejected with
+`403 account_suspended` (previously the column was unenforced).
+
+### Files touched
+- `src/upstream_api/routers/platform_admin/` — new package: `me.py`,
+  `system.py`, `streams.py`, `accounts.py`, `usage.py`, `audit.py` under
+  `APIRouter(prefix="/v1/admin")`. `/streams/summary` is declared before
+  `/streams/{session_id}` so it doesn't parse as a UUID.
+- `src/upstream_api/schemas/platform_admin.py` — new; all request/response
+  shapes. `AdminAccountUpdate` constrains `plan` to free|pro|enterprise and
+  `status` to active|suspended (`deleted` deliberately not settable).
+- `src/upstream_api/services/admin_audit.py` — new; `record_admin_action`
+  inserts the `{before, after}` diff + `request_id_var` correlation.
+- `src/upstream_api/services/admin_health.py` — new; DB probe (0.5 s, mirrors
+  /readyz, reports latency), MediaMTX probe (`GET /v3/paths/list`, 1 s,
+  degrades to `unreachable`), processor rollup (active/stale split at
+  5 minutes of `updated_at` silence, scoped to active sessions only).
+- `src/upstream_api/services/limits.py` — new `check_account_active` called
+  at the top of `check_session_start`.
+- `src/upstream_api/app.py` — router wiring.
+- `tests/test_platform_admin_{accounts,streams,usage,system}.py` — new; 32
+  tests (audit-insert capture, PATCH validation incl. `deleted` rejection
+  and empty-body 400, filter passthrough, range/bucket validation, degraded
+  health probes via httpx.MockTransport, suspension enforcement).
+- `tests/test_session_lifecycle.py`, `tests/test_stream_sessions_router.py` —
+  FakeConn answers the new `status from accounts` query with `'active'`.
+- `docs/api-contracts.md` — auth-header row + full endpoint table + error
+  codes (`not_platform_admin`, `account_suspended`, `empty_update`,
+  `invalid_range`, `range_too_large`); notes admin routes are proxy-only so
+  CORS `allow_methods` is unchanged.
+- `docs/module-map.md` — routers/schemas/migrations entries.
+
+### Functions/classes changed
+- `check_account_active(conn, account_id)` — 404 unknown account, 403
+  `account_suspended` on non-active status. Suspension stops NEW sessions
+  only; in-flight sessions keep streaming.
+- `record_admin_action(...)` — see above; called inside the same transaction
+  as the PATCH so audit and change commit atomically.
+
+### System interaction notes
+`admin panel proxy → Bearer Supabase JWT → current_platform_admin →
+platform_admins lookup → handler → (PATCH: row lock, update, audit insert,
+re-read) → response`. Health endpoint additionally fans out to MediaMTX via
+`app.state.http_client`.
+
+### Testing/checks
+`uv run pytest -q` (690 passed), `ruff check`, `ruff format`, `mypy src
+tests` (0 errors).
+
+### Strict non-goals
+- No Stripe/billing enforcement — usage stays a read-only ledger report.
+- No admin mutation of members/tokens (read-only in v1).
+
+### Follow-up TODOs
+- Verify the prod DB role can read `auth.users` for member emails (the
+  handler already degrades to null emails if not).
+
+---
+
 ## 2026-06-10 - feat(admin): current_platform_admin identity dep (fifth identity class)
 
 ### Summary
