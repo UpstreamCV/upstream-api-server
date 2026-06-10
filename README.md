@@ -74,7 +74,7 @@ uv run python scripts/smoke_local.py
 ```
 ok  agent_id=…
 ok  camera_id=…
-ok  srt_url=srt://ingest.upstream.tv:8890?streamid=publish:…
+ok  srt_url=srt://ingest.upstreamcv.com:18890?streamid=publish:…&latency=…&passphrase=…&pbkeylen=32
 ok  jwt claims session_id=…
 ok  session stopped
 PASS
@@ -180,15 +180,11 @@ Every var the service reads:
 
 ## Status
 
-Phase 1 ships. Agent auth + camera registration + session creation work end-to-end against the local stack. Migrations are applied. CI runs ruff + mypy strict + pytest.
+Phases 1–5 ship and run end-to-end: agent auth + camera registration + session creation; `/v1/ingest/*` webhooks for MediaMTX (incl. the `mediamtx-auth` SRT deny gate); batched `/v1/heartbeats` and `/v1/snapshots` (HTTPS frame uploads); dashboard read endpoints (`limit` + `before` time-keyset paging); and the processor surface + `usage_events` rollups. On top of those: the reliability findings/trends track (M0–M7) and the model-config track (model registry, account + per-camera processing config, by-config trends + comparison; M2–M4, M7B, M9/M9.1, M11). Migrations are applied. CI runs ruff + mypy strict + pytest.
 
-Not yet implemented:
-- Phase 2 — `/v1/ingest/*` webhooks for MediaMTX.
-- Phase 3 — `/v1/heartbeats` (batched) and `/v1/snapshots` (HTTPS frame uploads).
-- Phase 4 — dashboard read endpoints with cursor pagination.
-- Phase 5 — processor surface + `usage_events` rollups.
-- Phase 6 — Prometheus metrics, Sentry, slowapi rate limiting.
-- Deployment automation (Docker on the EC2 box, Caddy, secrets in SSM).
+Partially implemented:
+- Phase 6 observability / limiting — IP-level rate limiting is **live** at the Caddy edge (`deploy/Caddyfile`: `public_burst` 30 req/min/IP, `api_per_ip` 600 req/min/IP). Still unwired in-app: the Prometheus `/metrics` endpoint (only the `UPSTREAM_PROMETHEUS_AUTH_TOKEN` config field exists), Sentry (`sentry-sdk` is a dependency but `sentry_sdk.init` is never called), and per-token `slowapi` limits (declared but unused).
+- Deployment — manual `docker compose` on the EC2 box behind a custom Caddy build (`deploy/`); secrets still live in a plaintext `.env` (SSM Parameter Store is the planned follow-up). No CD / auto-deploy.
 
 See `docs/architecture.md` for the full phased delivery plan.
 

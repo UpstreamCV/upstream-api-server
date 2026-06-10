@@ -4,6 +4,136 @@ Reverse chronological. Newest at top. Every meaningful commit gets an entry foll
 
 ---
 
+## 2026-06-10 - docs: sweep design docs to reflect current state
+
+### Summary
+Documentation-only commit. The design docs and the root README had drifted
+from the code after a long run of feature commits (M4.1 path-segment auth,
+FU-6 per-session SRT passphrase + MediaMTX path provisioning, FU-3 WHEP proxy,
+M5.1 report-only validation endpoints, M6.2-delta webhook-authed snapshots,
+M8.0 processor readiness gate, P4-B..E real observation types, P5-A recent
+observations, P5-C latest perception snapshots, P6-A geometry config, the
+`usage_events` table). The sweep was originally written 2026-05-27 against
+that state; before landing, 28 more commits were pulled (fast-forwarded onto
+main on 2026-06-10) covering the reliability track (M0–M7 findings /
+evaluator / metrics / rollups / trends + the M11 config comparison), the
+model-config track (M2–M4 registry + account/per-camera processing config,
+M7B eligible-sessions carriage, M9/M9.1 dimensions), image analysis +
+snapshot brightness, new scripts, and ten new migrations (`20260528*` through
+`20260610*`) — so the sweep was reconciled against the post-pull code before
+commit. This commit walks every doc in `docs/` plus `README.md` and brings
+every claim back in line with the current code, migrations, config, and
+Makefile. No code, schema, or test change.
+
+### Files touched
+- `docs/architecture.md` — fixed identity table (processor path was
+  `/v1/processor/*`, actual is `/v1/internal/processor/*`); renumbered the
+  four-token model (was numbered 1, 2, 4, 3); added a fifth-secret note for
+  the per-session SRT passphrase; rewrote the phased delivery table to
+  reflect M8.0 / P5 / P6 status (incl. P6-D) and added a post-table note for
+  the two feature tracks that landed on the Phase 5 surface (reliability
+  M0–M7; model-config M2–M4 / M7B / M9 / M9.1 / M11); added a bullet list of
+  the five extra ingest routes that have landed since the Phase 2 diagram
+  (mediamtx-auth, lookup-session, expected, stream-validations, snapshots);
+  added new sections for "Per-session SRT passphrase + MediaMTX path
+  provisioning", "Read-path auth — WHEP proxy", "Phase 5 — Processor
+  surface", "Realtime publication"; split the Phase 3 snapshot note into the
+  two variants (agent-token `/v1/snapshots` vs webhook-authed
+  `/v1/ingest/snapshots`).
+- `docs/module-map.md` — rewrote every section against the post-pull tree:
+  migrations list (4 → 24 entries, through `20260610120000`); top-level
+  inventory now covers `deploy/` and `scripts/`; `security/deps.py` no
+  longer mis-describes `current_ingest` / `current_processor` as
+  placeholders (both are real `verify_shared_secret` callers), now also
+  documents the fifth dep `current_caller` + `require_account_role` +
+  `bind_agent_context`, and `UserAuth`'s `aal` / `amr` MFA fields;
+  `services/` now lists all 25 files (was 4 — incl. the reliability
+  evaluator/repo/service/trends/comparison, detection metrics + rollup,
+  detection confidence, image analysis, snapshot brightness, models, and
+  the three processing-config modules); `routers/` now lists all 14 (was
+  7 — incl. `models.py` and `reliability.py`, plus the camera
+  processing-config / processor-status routes on `cameras.py` and the
+  account master switch on `accounts.py`); `schemas/` now lists all 17
+  (was 1); `tests/` rewritten away from a stale named-files list to a
+  pattern + anchoring-tests doc (~43 files, ~600 cases, with the
+  reliability and model-config suites called out); `scripts/` documents
+  the post-`make dev-account` layout plus `run_detection_metrics_rollup.py`
+  and `_smoke_reliability_inprocess.py`.
+- `docs/api-contracts.md` — added 12 missing error codes to the "Codes
+  currently emitted" table (`account_not_found`, `invalid_resource_id`,
+  `invalid_sdp`, `streamid_malformed`, `perception_snapshot_not_found`,
+  `processor_status_not_found`, `snapshot_not_found`, `stream_not_ready`,
+  `session_expired`, `session_not_streaming`, `mediamtx_provision_failed`,
+  `upstream_unavailable`); added env-var rows for `UPSTREAM_MEDIAMTX_BASE_URL`
+  and `UPSTREAM_MEDIAMTX_API_BASE_URL`; clarified
+  `UPSTREAM_PROMETHEUS_AUTH_TOKEN` as reserved-for-Phase-6 (env var
+  required at boot but endpoint not yet implemented); documented
+  `GET /` (admin landing); documented the M5.1 endpoints
+  `GET /v1/ingest/expected/{session_id}` and `POST /v1/ingest/stream-validations`;
+  post-pull additions: documented `GET`/`PATCH /v1/account/processing-config`
+  (M3 master switch), `GET /v1/cameras/{id}/reliability/summary` and
+  `GET …/reliability/findings?status=` (M0), and the M3
+  `processing_enabled` gate as a fifth eligible-sessions filter bullet.
+- `docs/troubleshooting.md` — rewrote the stale `record_event` subsection
+  (the `usage_events` table now ships; `to_regclass` probe replaced the
+  try/except swallow); fixed the misleading "re-implement the sweeper"
+  wording (the sweeper was never implemented — there's nothing to re-do).
+- `docs/agent-quickstart.md` — updated `seed_dev_token.py` references to
+  recommend `make dev-account`; added the FU-6 `&passphrase=…&pbkeylen=32`
+  query parameters to the SRT URL examples and a one-line note about
+  preserving them through any URL-rewriting layer.
+- `README.md` — fixed the stale `srt://ingest.upstream.tv:8890` line in
+  the smoke-test output (actual default is `ingest.upstreamcv.com:18890`
+  with passphrase parameters); the Status-section rewrite is logged as its
+  own entry below ("refresh stale README Status") — the reconciliation
+  pass additionally corrected its paging wording (the planned "cursor
+  pagination" shipped as `limit` + `before` time-keyset paging, not cursor
+  tokens) and added the reliability + model-config tracks.
+- `docs/commit-log.md` — this entry (re-dated from 2026-05-27 to
+  2026-06-10 after the post-pull reconciliation).
+
+### Testing/checks
+None — no code or migration changed. Verified by re-reading each edited doc
+end-to-end, grepping the doc tree for the old strings that were replaced
+(`ingest.upstream.tv`, `re-implement the sweeper`, `/v1/processor/*`,
+`Phase 5 not started`, etc.), and cross-checking module-map.md against
+`ls` of `supabase/migrations/`, `routers/`, `schemas/`, `services/`,
+`tests/`, `scripts/` plus a grep of the error codes raised in `src/` —
+every file on disk is mentioned and no conflict markers remain.
+
+### Strict non-goals
+- No code, schema, or test change.
+- No implementation of the gaps the sweep exposed (background sweeper,
+  `/metrics` endpoint, slowapi rate limiting, MediaMTX path reconciler,
+  package registry, Phase 7 hardening). Each is a separate commit.
+- No backfilled commit-log entries for the 28 pulled commits beyond what
+  their own commits already recorded.
+- No edits to `docs/deployment.md` — verified accurate as of this date.
+
+---
+
+## 2026-06-10 - Docs: refresh stale README Status (Phases 2-5 shipped)
+
+### Summary
+Docs-only correction, no code or behavior change. The README "Status"
+section still claimed Phases 2-5 were "not yet implemented," but they
+ship and run: ingest webhooks (incl. the `mediamtx-auth` deny gate),
+batched heartbeats + snapshot uploads, dashboard read endpoints, and the
+processor surface + `usage_events` rollups (commit-log history runs
+through M7B on 2026-06-01; the routers exist under
+`src/upstream_api/routers/`). Rewrote Status to reflect reality: Phases
+1-5 shipped; Phase 6 partial (IP-level rate limiting live at the Caddy
+edge, but in-app `/metrics`, Sentry init, and slowapi per-token limits
+still unwired — verified absent via grep); deployment is manual with
+plaintext `.env` secrets (SSM still a follow-up).
+
+### Files touched
+- `README.md` — "Status" / "Not yet implemented" section rewritten to
+  match shipped state (Phases 1-5 done; Phase 6 + deployment partial).
+- `docs/commit-log.md` — this entry.
+
+---
+
 ## 2026-06-01 - Model config M7B: carry processing_config on eligible-sessions (api-server, stamp-only)
 
 ### Summary
@@ -393,6 +523,8 @@ the dashboard already filters to the viewed camera client-side.
 **Status:** the fix is confirmed only once the dashboard overlay chip reads
 "Realtime connected" (temporary console diagnostics added on the dashboard side
 to verify end-to-end this round).
+
+---
 
 ## 2026-05-22 - P6-A: Geometry config API
 

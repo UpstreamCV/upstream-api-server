@@ -56,13 +56,29 @@ Every non-2xx response uses this shape:
 | 403 | `account_id_required` | dashboard user has multiple memberships but did not pass `?account_id=` |
 | 403 | `forbidden_resource` | heartbeat references a `camera_id` or `session_id` not owned by the agent |
 | 400 | `empty_upload` | snapshot upload had a zero-byte body |
+| 400 | `invalid_resource_id` | WHEP `DELETE` path-traversal guard tripped (resource id outside `[A-Za-z0-9_~-]{1,128}`) |
+| 400 | `invalid_sdp` | WHEP `POST` body was empty / not `application/sdp` |
+| 400 | `streamid_malformed` | ingest webhook received a streamid that doesn't decode (also used as a `reason` code on `validate-stream`) |
+| 404 | `account_not_found` | account row missing for the looked-up id |
+| 404 | `perception_snapshot_not_found` | `GET /v1/cameras/{id}/perception/latest` and no snapshot has been written yet |
+| 404 | `processor_status_not_found` | `GET /v1/cameras/{id}/processor-status/latest` and no processor has ever reported for this camera (or nothing matches the supplied `stream_session_id`) |
+| 404 | `snapshot_not_found` | `GET /v1/cameras/{id}/latest-frame` and no snapshot row exists |
+| 404 | `stream_not_ready` | WHEP `POST` while MediaMTX hasn't registered the path yet (client should retry) |
+| 409 | `session_expired` | ingest webhook fired on a session whose `expires_at` has passed |
+| 409 | `session_not_streaming` | WHEP `POST` while session is `approved` / `ended` / `expired` / `failed` |
 | 413 | `snapshot_too_large` | snapshot upload exceeds `UPSTREAM_SNAPSHOT_MAX_BYTES` |
-| 415 | `invalid_content_type` | snapshot upload was not `image/jpeg` |
+| 415 | `invalid_content_type` | snapshot upload was not `image/jpeg`, or WHEP body wasn't `application/sdp` |
 | 429 | `snapshot_quota_exceeded` | trailing-30-day snapshot bytes would exceed `account_limits.snapshot_storage_mb` |
 | 422 | `validation_error` | pydantic request validation failed |
 | 500 | `internal_error` | unhandled exception |
+| 502 | `mediamtx_provision_failed` | `/start` couldn't PATCH the MediaMTX path for the new session; row is left `failed` with `failure_code='mediamtx_provision_failed'` |
+| 502 | `upstream_unavailable` | WHEP proxy timed out, got a 5xx, or got an unparseable response from MediaMTX |
 
 ## Endpoints — Phase 1 (implemented)
+
+### `GET /`
+
+No auth. Service-info landing page; returns a small JSON object identifying the service. Safe to leave on in production — useful for ops smoke tests.
 
 ### `GET /healthz`
 
@@ -335,7 +351,9 @@ Authenticated via `CurrentCaller`. The `resource_id` is the value the client rec
 | `UPSTREAM_MEDIAMTX_WEBHOOK_SECRET` | yes | Verifies `/v1/ingest/*` callers |
 | `UPSTREAM_PROCESSOR_WEBHOOK_SECRET` | yes | Verifies `/v1/internal/processor/*` callers (M8.0) |
 | `UPSTREAM_MEDIAMTX_RTSP_BASE` | no | Internal MediaMTX RTSP read base advertised to a processor (default `rtsp://host.docker.internal:8554`). The read surface, **not** the SRT publish URL |
-| `UPSTREAM_PROMETHEUS_AUTH_TOKEN` | yes | Will gate `/admin/metrics` (Phase 6) |
+| `UPSTREAM_MEDIAMTX_BASE_URL` | no | MediaMTX WHEP base for the dashboard read-path proxy (default `http://localhost:8889`). Must be reachable only from the api-server in production |
+| `UPSTREAM_MEDIAMTX_API_BASE_URL` | no | MediaMTX HTTP control-API base used to provision/deprovision per-session paths and passphrases (default `http://localhost:9997`). Reachable only from the api-server in production |
+| `UPSTREAM_PROMETHEUS_AUTH_TOKEN` | yes | Reserved for the `/metrics` Bearer auth gate. The endpoint itself isn't implemented yet (Phase 6 pending); the value is still required at boot so a Phase-6 rollout doesn't trip startup |
 | `UPSTREAM_SRT_INGEST_HOST` | no | SRT ingest host advertised in `srt_url` (default `ingest.upstreamcv.com`) |
 | `UPSTREAM_SRT_INGEST_PORT` | no | SRT ingest port (default `18890`) |
 | `UPSTREAM_PORT` | no | HTTP port (default 4000) |
@@ -441,6 +459,46 @@ Request:
 ```
 
 Response 200: `{ "session_id": "...", "state": "failed" }`.
+
+### `GET /v1/ingest/expected/{session_id}` (M5.1)
+
+Fetch the expected media-config block for a session. Same shape as the `expected` object `validate-stream` returns when it accepts, plus `account_id` / `agent_id` / `camera_id` / `state` / `expires_at`. State-agnostic — unlike `validate-stream`, this does NOT gate on `state='approved'`, so the streaming server's M5.1 comparator can keep running after a reconnect into an already-`streaming` session.
+
+Response 200:
+```json
+{
+  "session_id": "uuid",
+  "account_id": "uuid",
+  "agent_id": "uuid",
+  "camera_id": "uuid",
+  "state": "streaming",
+  "expires_at": "2026-05-13T00:00:00Z",
+  "expected": {
+    "codec": "h264",
+    "width": 1280, "height": 720, "fps": 30,
+    "bitrate_kbps": 3000, "latency_mode": "balanced"
+  }
+}
+```
+
+Errors: 404 `session_not_found`; 401 on missing/wrong webhook secret.
+
+### `POST /v1/ingest/stream-validations` (M5.1)
+
+Report-only validation row insert. Accepts both `passed=true` and `passed=false`; in **both** cases the API ONLY inserts a `stream_validations` row — it does NOT call `mark_streaming` / `mark_failed`, does NOT update `stream_sessions`, does NOT touch `cameras.status`, does NOT deprovision the MediaMTX path. Use this when the streaming server wants the dashboard to surface a validation outcome without changing session state. For mismatches that should drop the connection, use `validation-failed` instead.
+
+Request:
+```json
+{
+  "session_id": "uuid",
+  "passed": false,
+  "observed": { "codec": "h265", "width": 1280, "height": 720, "fps": 30, "bitrate_kbps": 3000 },
+  "expected": { "codec": "h264", "width": 1280, "height": 720, "fps": 30, "bitrate_kbps": 3000 },
+  "mismatch_fields": ["codec"]
+}
+```
+
+Response 200: `{ "validation_id": "uuid" }`. Errors: 404 `session_not_found`; 401 on missing/wrong webhook secret.
 
 ### `POST /v1/ingest/lookup-session`
 
@@ -688,6 +746,38 @@ Query: `account_id`.
 Response 200: full `account_limits` row.
 
 Errors: `account_limits_missing`.
+
+### `GET /v1/account/processing-config`
+
+M3. The **account-level processing master switch** — one boolean per account,
+stored as a `processing_enabled` key in `accounts.metadata` JSONB (no new
+table). An account that has never written the flag reads as `true`, so every
+pre-M3 account keeps processing exactly as before.
+
+Query: `account_id` (UUID, required for multi-account users).
+
+Response 200:
+```json
+{
+  "account_id": "uuid",
+  "processing_enabled": true,
+  "updated_at": "2026-06-01T12:00:00Z"
+}
+```
+
+Errors: `account_not_found`.
+
+### `PATCH /v1/account/processing-config`
+
+M3. Flip the master switch. Body: `{ "processing_enabled": false }`.
+
+OFF → the processor's eligible-sessions SQL drops every session under this
+account (`coalesce((accounts.metadata->>'processing_enabled')::boolean, true)`
+in the WHERE clause), so workers drain on their next poll. Stream sessions
+stay alive — only worker-side processing pauses. ON → currently-streaming
+sessions become eligible again within one poll cycle.
+
+Response 200: same shape as the GET. Errors: `account_not_found`.
 
 ### `GET /v1/api-tokens`
 
@@ -1166,6 +1256,9 @@ Returns a session **only if** (filter enforced entirely in SQL):
 - a `stream_validations` row exists (excludes streaming-with-no-validation)
 - the **latest** validation has `passed = true` (excludes streaming-then-failed,
   even if an older validation passed)
+- the account's processing master switch is on (M3 —
+  `coalesce((accounts.metadata->>'processing_enabled')::boolean, true) = true`;
+  see `GET`/`PATCH /v1/account/processing-config`)
 
 `internal_rtsp_url` is built as `{UPSTREAM_MEDIAMTX_RTSP_BASE}/{stream_key}` from
 the session's `streamid`. The response never contains `srt_url`, an agent/API
@@ -1294,6 +1387,37 @@ input.** Constants (override per run): `RAW_METRIC_RETENTION_HOURS=72`,
 `HOURLY_ROLLUP_RETENTION_DAYS=90`, `ROLLUP_LOOKBACK_HOURS=96` (the 24h surplus
 over retention is catch-up margin so a lapsed-then-resumed run still rolls up
 prunable hours before deleting their raw rows).
+
+`GET /v1/cameras/{camera_id}/reliability/summary` (Reliability M0) — the
+categorical reliability verdict for one camera that backs the dashboard's
+Reliability card. **Evaluate-on-read**: the request runs the rule set
+(`services/reliability_evaluator.py` — currently five rules:
+`stream_valid_processor_silent`, `latest_frame_stale`,
+`processor_using_default_geometry`, `scene_too_dark_for_reliable_detection`,
+`unstable_detection_confidence`), persists finding upserts/resolves, and
+returns the resulting state in a single transaction — no background worker.
+Auth/scoping like the other camera reads (`CurrentCaller` + camera-ownership →
+404 `camera_not_found`, no existence oracle); query: `account_id`. Response:
+`{camera_id, status, highest_severity, open_findings_count, top_findings,
+recommended_next_action, last_evaluated_at}` where `status` ∈
+`healthy | info | needs_review | critical | unknown` (unknown = not enough
+data, distinct from "no open findings") and `top_findings` is the ≤3
+highest-severity open `ReliabilityFindingRecord`s.
+
+`GET /v1/cameras/{camera_id}/reliability/findings?status=open&limit=50`
+(Reliability M0; `status=` filter added later) — the findings list behind the
+Reliability tab. Same auth/scoping and evaluate-on-read behavior as
+`summary`. Query: `account_id`, `limit` (1–200, default 50), `status` ∈
+`open | resolved | suppressed | ignored` (default `open`; bogus value → 422).
+`status=open` returns severity-first ordering (the M0 contract);
+`status=resolved` is newest-resolved first (the "Recently resolved" section).
+Response: `{findings: [ReliabilityFindingRecord, ...], last_evaluated_at}`;
+each record carries `finding_type` (open vocabulary), `category`
+(`stream | processor | scene_quality | geometry_config | detection`),
+`severity` (`info | warning | critical`), `status`, `title` / `message` /
+`likely_cause` / `recommended_action`, JSONB `evidence`, `dedupe_key`,
+`detector_version`, and the first/last-seen + resolved timestamps.
+`account_id` is never echoed.
 
 `GET /v1/cameras/{camera_id}/reliability/confidence-trend?range=24h` (Reliability
 M7) — hourly detection-confidence history for the camera Reliability tab's trend
