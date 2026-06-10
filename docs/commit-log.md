@@ -4,6 +4,45 @@ Reverse chronological. Newest at top. Every meaningful commit gets an entry foll
 
 ---
 
+## 2026-06-10 - ci: fix mypy errors in reliability/model-config tests, bump Node 20 actions
+
+### Summary
+CI on main was red: the `Type check` step failed with 8 mypy errors, all in
+test files that landed with the reliability (M0-M7) and model-config (M2-M11)
+commits. No `src/` behavior change. Also clears the runner's Node.js 20
+deprecation warning by bumping the two affected actions.
+
+### Files touched
+- `tests/test_processing_config_dimensions.py` — annotate `block` as
+  `dict[str, Any]` (mypy can't infer the heterogeneous literal).
+- `tests/test_detection_metrics.py` — pre-declare the loop variable
+  `snapshot: dict[str, Any]` in `test_handles_missing_and_empty_objects`.
+- `tests/test_detection_confidence.py` — drop three unused
+  `type: ignore[arg-type]` comments (`extract_detection_confidences` takes
+  `Any`).
+- `tests/test_reliability_config_comparison.py` — drop an unused
+  `type: ignore[arg-type]` for the same reason.
+- `tests/test_reliability_endpoints.py` — rename the resolve-branch local to
+  `open_row`; `row` was already bound to a non-optional dict earlier in the
+  same method, so the `.get()` result couldn't re-bind it.
+- `tests/test_ingest_snapshots.py` — annotate `FakeConn.limit_row` as
+  `dict[str, Any] | None`; the missing-account-limits test sets it to `None`.
+- `.github/workflows/ci.yml` — `actions/checkout` v4 → v5 and
+  `astral-sh/setup-uv` v3 → v6 (Node 24 runtimes; Node 20 actions are forced
+  to Node 24 on 2026-06-16 and removed 2026-09-16). The uv version pin
+  (`0.5.x`) is unchanged.
+
+### Testing/checks
+`ruff check`, `ruff format --check`, `mypy src tests` (0 errors), and
+`pytest -q` (652 passed) — the same steps CI runs, locally with the CI env
+vars.
+
+### Strict non-goals
+- The CodeQL default-setup job's "Requires authentication" failure — that job
+  is GitHub-managed (no workflow in this repo); nothing here can fix it.
+
+---
+
 ## 2026-06-10 - docs: sweep design docs to reflect current state
 
 ### Summary

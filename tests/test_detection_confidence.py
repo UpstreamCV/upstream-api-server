@@ -117,9 +117,9 @@ def test_empty_payload_returns_empty() -> None:
 def test_non_dict_payload_returns_empty() -> None:
     """Defensive: a row whose JSONB is unexpectedly a list / string / None
     must not crash the evaluator."""
-    assert extract_detection_confidences(None) == []  # type: ignore[arg-type]
-    assert extract_detection_confidences([]) == []  # type: ignore[arg-type]
-    assert extract_detection_confidences("nope") == []  # type: ignore[arg-type]
+    assert extract_detection_confidences(None) == []
+    assert extract_detection_confidences([]) == []
+    assert extract_detection_confidences("nope") == []
 
 
 def test_unrelated_numeric_fields_never_treated_as_confidence() -> None:

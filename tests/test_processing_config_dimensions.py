@@ -103,7 +103,7 @@ def test_non_mapping_snapshot_yields_all_none() -> None:
 
 def test_default_lineage_extracts_source_and_status() -> None:
     """The 'default' block (no saved config): null revision, applied defaults."""
-    block = {
+    block: dict[str, Any] = {
         "source": "default",
         "revision": None,
         "status": "applied_defaults",
