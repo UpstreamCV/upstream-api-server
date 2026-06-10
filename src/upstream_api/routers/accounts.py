@@ -68,7 +68,7 @@ async def get_account_limits(
             """
             select account_id, max_cameras, max_concurrent_sessions, max_fps,
                    max_width, max_height, max_bitrate_kbps, allowed_codecs,
-                   monthly_minutes_quota, snapshot_storage_mb,
+                   allowed_stream_types, monthly_minutes_quota, snapshot_storage_mb,
                    created_at, updated_at
               from account_limits
              where account_id = $1
@@ -86,6 +86,7 @@ async def get_account_limits(
         max_height=row["max_height"],
         max_bitrate_kbps=row["max_bitrate_kbps"],
         allowed_codecs=list(row["allowed_codecs"]),
+        allowed_stream_types=list(row["allowed_stream_types"]),
         monthly_minutes_quota=row["monthly_minutes_quota"],
         snapshot_storage_mb=row["snapshot_storage_mb"],
         created_at=row["created_at"],

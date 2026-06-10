@@ -1505,3 +1505,88 @@ read over rollups; no migration, no new write path.
 - package-registry / model-registry tables, package marketplace
 - dashboard zones/lines UI, custom line-crossing, rules engine, billing
 - WebSocket event delivery, the stale-session sweeper
+
+## Endpoints — Agent smart flow (bootstrap, stream types, web cameras)
+
+Migration: `20260611120000_stream_types_and_web_cameras.sql` — adds
+`account_limits.allowed_stream_types text[]` (default `{webcam,rtsp}`),
+`cameras.source_type text` (nullable), and makes `cameras.agent_id`
+nullable (dashboard-created cameras start unassigned).
+
+### `GET /v1/agents/bootstrap`
+
+Auth: `current_agent`. One call returns everything an agent needs to
+render account status and decide what it may stream. All data is scoped
+to the token's account.
+
+**No-secrets guarantee:** the response never contains `srt_url`,
+`streamid`, session tokens, SRT passphrases, or token `prefix`/`hash`.
+`active_sessions` is a reduced shape for exactly this reason.
+
+Response 200:
+```json
+{
+  "account": { "id": "uuid", "name": "…", "slug": "…", "plan": "free", "status": "active" },
+  "token": { "name": "…", "scopes": ["agent"], "last_four": "ABCD", "expires_at": null },
+  "agents": [ { "id": "uuid", "name": "…", "status": "active", "version": "0.1.0", "last_seen_at": "…" } ],
+  "limits": {
+    "max_cameras": 5, "max_concurrent_sessions": 5, "max_fps": 60,
+    "max_width": 1920, "max_height": 1080, "max_bitrate_kbps": 8000,
+    "allowed_codecs": ["h264"], "allowed_stream_types": ["rtsp", "webcam"],
+    "monthly_minutes_quota": 600, "snapshot_storage_mb": 1024
+  },
+  "usage": { "camera_count": 1, "active_session_count": 0, "monthly_minutes_used": 42 },
+  "cameras": [ { "…": "CameraResponse incl. source_type and nullable agent_id" } ],
+  "active_sessions": [
+    { "id": "uuid", "camera_id": "uuid", "agent_id": "uuid", "state": "streaming",
+      "created_at": "…", "expires_at": "…", "started_at": "…",
+      "approved": { "width": 1280, "height": 720, "fps": 30, "codec": "h264",
+                     "bitrate_kbps": 3000, "latency_mode": "balanced" } }
+  ],
+  "server_time": "…"
+}
+```
+
+`usage.monthly_minutes_used` is approximate: it sums `session_ended`
+usage events for the current calendar month, so in-flight session time
+is invisible until the session ends. `agents` is empty when no agent
+has registered yet.
+
+### Stream types (`allowed_stream_types` / `source_type`)
+
+- `POST /v1/cameras/register` accepts an optional `source_type` (max 32
+  chars). Validation: `check_stream_type_allowed` rejects values not in
+  `account_limits.allowed_stream_types` with 403
+  `limit_exceeded.stream_type_not_allowed` (details carry `requested` +
+  `allowed`). `source_type = null` is default-allowed (pre-smart-flow
+  agents). On re-register the update uses `coalesce`, so an older agent
+  that omits the field cannot clear a previously declared value — and a
+  declared value cannot be cleared via register at all (use PATCH).
+- `POST /v1/stream-sessions/start` re-checks the camera's stored
+  `source_type` against the allow-list — stream time is an enforcement
+  point too, so disallowing a type takes effect on the next session.
+- `GET /v1/account/limits` now includes `allowed_stream_types`.
+
+### Dashboard camera management (auth: `current_user` via `current_caller`)
+
+- `POST /v1/cameras` — owner/admin only (403 `forbidden.role` otherwise;
+  agents get 403 `forbidden.user_required`). Body: `name`,
+  `source_type` (required), `device_path`, `default_*` fields. Validated
+  against limits (`check_camera_defaults`, `check_stream_type_allowed`,
+  `check_camera_slot_available`). Creates the row with
+  `agent_id = null`. 201 → `CameraResponse`.
+- `PATCH /v1/cameras/{camera_id}` — owner/admin only. Partial update of
+  `name`/`source_type`/`device_path`/`default_*`; the merged result is
+  re-validated against limits. 404 `camera_not_found` on cross-account.
+
+### `POST /v1/cameras/{camera_id}/claim`
+
+Auth: `current_agent`. Body: `{ "agent_id": "uuid" }`. Assigns an
+unassigned (dashboard-created) camera to that agent. Idempotent when the
+camera is already held by the same agent. 409
+`camera_claimed_by_other_agent` when another agent holds it; 409
+`agent_account_mismatch` when the agent row isn't in the token's
+account; 404 `camera_not_found` on cross-account.
+
+`POST /v1/stream-sessions/start` rejects cameras with `agent_id IS NULL`
+with 409 `camera_unassigned` — claim before streaming.

@@ -26,6 +26,7 @@ class AccountLimits:
     max_height: int
     max_bitrate_kbps: int
     allowed_codecs: frozenset[str]
+    allowed_stream_types: frozenset[str]
     monthly_minutes_quota: int
     snapshot_storage_mb: int
 
@@ -56,7 +57,8 @@ async def load_account_limits(conn: asyncpg.Connection, account_id: UUID) -> Acc
     row = await conn.fetchrow(
         """
         select max_cameras, max_concurrent_sessions, max_fps, max_width, max_height,
-               max_bitrate_kbps, allowed_codecs, monthly_minutes_quota, snapshot_storage_mb
+               max_bitrate_kbps, allowed_codecs, allowed_stream_types,
+               monthly_minutes_quota, snapshot_storage_mb
           from account_limits
          where account_id = $1
         """,
@@ -76,9 +78,29 @@ async def load_account_limits(conn: asyncpg.Connection, account_id: UUID) -> Acc
         max_height=row["max_height"],
         max_bitrate_kbps=row["max_bitrate_kbps"],
         allowed_codecs=frozenset(row["allowed_codecs"]),
+        allowed_stream_types=frozenset(row["allowed_stream_types"]),
         monthly_minutes_quota=row["monthly_minutes_quota"],
         snapshot_storage_mb=row["snapshot_storage_mb"],
     )
+
+
+def check_stream_type_allowed(limits: AccountLimits, source_type: str | None) -> None:
+    """Reject cameras whose source type isn't in the account's allow-list.
+
+    ``source_type is None`` is default-allowed: cameras registered by
+    pre-smart-flow agents never declared a type.
+    """
+    if source_type is None:
+        return
+    if source_type.lower() not in {t.lower() for t in limits.allowed_stream_types}:
+        raise LimitExceeded(
+            f"Stream type '{source_type}' is not allowed for this account.",
+            code="limit_exceeded.stream_type_not_allowed",
+            details={
+                "requested": source_type,
+                "allowed": sorted(limits.allowed_stream_types),
+            },
+        )
 
 
 def check_camera_defaults(limits: AccountLimits, defaults: RequestedStream) -> None:
@@ -119,6 +141,7 @@ async def check_session_start(
     *,
     account_id: UUID,
     requested: RequestedStream,
+    camera_source_type: str | None = None,
 ) -> LimitsSnapshot:
     """Validate a stream-session start request and return the approved snapshot.
 
@@ -127,6 +150,7 @@ async def check_session_start(
     limits = await load_account_limits(conn, account_id)
 
     check_camera_defaults(limits, requested)
+    check_stream_type_allowed(limits, camera_source_type)
 
     # Serialize concurrent start_session calls for the same account so the
     # count(*) below and the eventual insert observe a consistent view of
