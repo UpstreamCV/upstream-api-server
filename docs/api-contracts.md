@@ -1333,10 +1333,13 @@ params (unset = no filter): `processing_config_revision` (int ≥ 0),
 bogus → 422), `applied_selected_classes_key` (canonical key: `all`, `person`,
 `car,person`…), `applied_confidence_threshold` (float in [0,1]), `warning`
 (groups whose warning codes include it, e.g.
-`selected_classes_analytics_counts_not_filtered`). Response: `{camera_id,
+`selected_classes_analytics_counts_not_filtered`), and — M9.1 —
+`applied_processing_fps` (int in [1,30]; the M7E output-cadence FPS actually
+applied — cadence only, not inference FPS). Response: `{camera_id,
 range, bucket_size:"1h", group_count, groups:[{processing_config_source,
 processing_config_revision, processing_config_status, applied_model_key,
 applied_selected_classes_key, applied_confidence_threshold,
+requested_processing_fps, applied_processing_fps,
 processing_config_warnings, points:[...], summary:{...}}]}` — `points`/`summary`
 per group use the exact `confidence-trend` point/summary shapes. Groups are
 ordered ascending by revision with no-metadata/default groups first. Pure read;

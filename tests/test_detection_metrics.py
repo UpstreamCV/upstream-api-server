@@ -110,10 +110,11 @@ _OBJECT_COUNT, _SAMPLE_COUNT = 7, 8
 _AVG, _MEDIAN, _MIN, _MAX = 9, 10, 11, 12
 _LOW_COUNT, _LOW_RATIO, _STDDEV = 13, 14, 15
 _SOURCE = 16
-# M9 applied-processing-config dimensions.
+# M9/M9.1 applied-processing-config dimensions.
 _PC_SOURCE, _PC_REVISION, _PC_STATUS = 17, 18, 19
 _PC_MODEL_KEY, _PC_CLASSES_KEY, _PC_THRESHOLD = 20, 21, 22
-_PC_WARNINGS, _PC_CLASSES_WARNING_FLAG = 23, 24
+_PC_REQUESTED_FPS, _PC_APPLIED_FPS = 23, 24
+_PC_WARNINGS, _PC_CLASSES_WARNING_FLAG = 25, 26
 
 
 # ---------------------------------------------------------------------------
@@ -144,6 +145,8 @@ async def test_writes_metric_for_normal_snapshot() -> None:
         _PC_MODEL_KEY,
         _PC_CLASSES_KEY,
         _PC_THRESHOLD,
+        _PC_REQUESTED_FPS,
+        _PC_APPLIED_FPS,
         _PC_WARNINGS,
         _PC_CLASSES_WARNING_FLAG,
     ):
@@ -290,6 +293,8 @@ async def test_writes_processing_config_dimensions_from_m8_snapshot() -> None:
     assert args[_PC_MODEL_KEY] == "trafficcamnet_v1"
     assert args[_PC_CLASSES_KEY] == "car,person"  # canonical sort
     assert args[_PC_THRESHOLD] == 0.2
+    assert args[_PC_REQUESTED_FPS] is None  # fixture requests no fps
+    assert args[_PC_APPLIED_FPS] is None
     assert args[_PC_WARNINGS] == ["selected_classes_analytics_counts_not_filtered"]
     assert args[_PC_CLASSES_WARNING_FLAG] is True
 
@@ -322,6 +327,42 @@ async def test_dimensions_do_not_change_numeric_confidence_metrics() -> None:
         assert plain_args[index] == stamped_args[index]
 
 
+async def test_writes_fps_dimensions_from_m7e_snapshot() -> None:
+    """M9.1: an M7E lineage block (fps requested AND applied, with the
+    output-cadence caveat) lands in the dedicated FPS columns, and the caveat
+    rides in warnings as before."""
+    conn = FakeMetricWriteConn()
+    source = _m8_source_block(
+        status="partially_applied",
+        warnings=["processing_fps_output_cadence_only"],
+    )
+    source["applied_processing_config"]["requested"]["processing_fps"] = 5
+    source["applied_processing_config"]["applied"]["processing_fps"] = 5
+    snapshot = {"objects": [{"confidence": 0.8}], "source": source}
+    result = await _write(conn, snapshot=snapshot)
+    assert result.written is True
+    args = conn.inserts[0]
+    assert args[_PC_REQUESTED_FPS] == 5
+    assert args[_PC_APPLIED_FPS] == 5
+    assert args[_PC_WARNINGS] == ["processing_fps_output_cadence_only"]
+
+
+async def test_fps_requested_but_not_applied_stores_request_only() -> None:
+    """An unsupported-mode lineage (requested fps, applied null) keeps the
+    "asked for 5, got default" distinction queryable."""
+    conn = FakeMetricWriteConn()
+    source = _m8_source_block(
+        status="requested_not_applied",
+        warnings=["processing_fps_requested_not_applied"],
+    )
+    source["applied_processing_config"]["requested"]["processing_fps"] = 5
+    source["applied_processing_config"]["applied"]["processing_fps"] = None
+    await _write(conn, snapshot={"objects": [{"confidence": 0.8}], "source": source})
+    args = conn.inserts[0]
+    assert args[_PC_REQUESTED_FPS] == 5
+    assert args[_PC_APPLIED_FPS] is None
+
+
 async def test_malformed_applied_processing_config_still_writes_row() -> None:
     """A garbage block must not crash the writer — the row writes with NULL
     dimensions (the savepoint in the router is the LAST line of defense, not
@@ -335,6 +376,8 @@ async def test_malformed_applied_processing_config_still_writes_row() -> None:
     assert result.written is True
     args = conn.inserts[0]
     assert args[_PC_SOURCE] is None
+    assert args[_PC_REQUESTED_FPS] is None
+    assert args[_PC_APPLIED_FPS] is None
     assert args[_PC_WARNINGS] is None
     assert args[_PC_CLASSES_WARNING_FLAG] is None
 
@@ -389,11 +432,13 @@ def test_insert_sql_pins_idempotency_target() -> None:
         "applied_model_key",
         "applied_selected_classes_key",
         "applied_confidence_threshold",
+        "requested_processing_fps",
+        "applied_processing_fps",
         "processing_config_warnings",
         "selected_classes_analytics_counts_not_filtered",
     ):
         assert column in sql
-    assert "$25" in sql
+    assert "$27" in sql
 
 
 # ---------------------------------------------------------------------------

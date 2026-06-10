@@ -139,7 +139,7 @@ select
 # $1=account_id, $2=camera_id, $3=now, $4=lookback_hours, $5=row_cap,
 # $6=processing_config_revision, $7=processing_config_status,
 # $8=applied_selected_classes_key, $9=applied_confidence_threshold,
-# $10=warning code.
+# $10=warning code, $11=applied_processing_fps (M9.1).
 _MAX_CONFIG_GROUPS_PER_HOUR = 8
 
 _CONFIDENCE_TREND_BY_CONFIG_SQL = """
@@ -150,6 +150,8 @@ select
     applied_model_key,
     applied_selected_classes_key,
     applied_confidence_threshold,
+    requested_processing_fps,
+    applied_processing_fps,
     processing_config_warnings,
     bucket_start,
     bucket_start + interval '1 hour' as bucket_end,
@@ -181,8 +183,10 @@ select
    and ($8::text is null or applied_selected_classes_key = $8::text)
    and ($9::double precision is null or applied_confidence_threshold = $9::double precision)
    and ($10::text is null or $10::text = any(processing_config_warnings))
+   and ($11::int is null or applied_processing_fps = $11::int)
  group by processing_config_source, processing_config_revision, processing_config_status,
           applied_model_key, applied_selected_classes_key, applied_confidence_threshold,
+          requested_processing_fps, applied_processing_fps,
           processing_config_warnings, bucket_start
  order by bucket_start asc
  limit $5
@@ -196,6 +200,8 @@ _CONFIG_DIMENSION_COLUMNS = (
     "applied_model_key",
     "applied_selected_classes_key",
     "applied_confidence_threshold",
+    "requested_processing_fps",
+    "applied_processing_fps",
     "processing_config_warnings",
 )
 
@@ -262,6 +268,7 @@ async def get_confidence_trend_by_config_for_camera(
     applied_selected_classes_key: str | None = None,
     applied_confidence_threshold: float | None = None,
     warning: str | None = None,
+    applied_processing_fps: int | None = None,
 ) -> ConfidenceTrendByConfigResponse:
     """Hourly confidence-trend points split per applied-config group (M9).
 
@@ -286,6 +293,7 @@ async def get_confidence_trend_by_config_for_camera(
         applied_selected_classes_key,
         applied_confidence_threshold,
         warning,
+        applied_processing_fps,
     )
     groups = _split_rows_into_config_groups(rows)
     return ConfidenceTrendByConfigResponse(
@@ -345,6 +353,8 @@ def _split_rows_into_config_groups(
                 applied_model_key=dims["applied_model_key"],
                 applied_selected_classes_key=dims["applied_selected_classes_key"],
                 applied_confidence_threshold=dims["applied_confidence_threshold"],
+                requested_processing_fps=dims["requested_processing_fps"],
+                applied_processing_fps=dims["applied_processing_fps"],
                 processing_config_warnings=list(warnings) if warnings is not None else None,
                 points=points,
                 summary=summarize_confidence_trend(points),

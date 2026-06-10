@@ -50,6 +50,8 @@ _CONFLICT_EXPR = (
     "coalesce(applied_model_key, ''), "
     "coalesce(applied_selected_classes_key, ''), "
     "coalesce(applied_confidence_threshold, -1.0), "
+    "coalesce(requested_processing_fps, -1), "
+    "coalesce(applied_processing_fps, -1), "
     "coalesce(processing_config_warnings, '{}'::text[])"
 )
 
@@ -130,6 +132,8 @@ def test_rollup_sql_pins_weighted_math_and_idempotent_upsert() -> None:
         "coalesce(m.applied_model_key, ''), "
         "coalesce(m.applied_selected_classes_key, ''), "
         "coalesce(m.applied_confidence_threshold, -1.0), "
+        "coalesce(m.requested_processing_fps, -1), "
+        "coalesce(m.applied_processing_fps, -1), "
         "coalesce(m.processing_config_warnings, '{}'::text[]), "
         "date_trunc('hour', m.observed_at)" in sql
     )
@@ -149,6 +153,8 @@ def test_rollup_sql_pins_weighted_math_and_idempotent_upsert() -> None:
         "nullif(coalesce(m.applied_confidence_threshold, -1.0), -1.0) "
         "as applied_confidence_threshold" in sql
     )
+    assert "nullif(coalesce(m.requested_processing_fps, -1), -1) as requested_processing_fps" in sql
+    assert "nullif(coalesce(m.applied_processing_fps, -1), -1) as applied_processing_fps" in sql
     assert (
         "nullif(coalesce(m.processing_config_warnings, '{}'::text[]), '{}'::text[]) "
         "as processing_config_warnings" in sql
@@ -283,12 +289,42 @@ def test_m9_migration_file_pins_dimension_rekey() -> None:
     # expression list is byte-identical to the service's ON CONFLICT target.
     assert "drop index detection_confidence_hourly_rollups_bucket_idx" in sql
     assert "create unique index detection_confidence_hourly_rollups_bucket_idx" in sql
-    assert f"(account_id, camera_id, bucket_start, {_CONFLICT_EXPR})" in sql
-    assert _CONFLICT_EXPR in _norm(_ROLLUP_HOURLY_SQL)  # cross-pin: both sides match
+    # The HISTORICAL M9 expression (superseded by the M9.1 re-key, which is
+    # pinned against the live conflict target in
+    # test_m9_1_migration_file_pins_fps_rekey below).
+    assert (
+        "(account_id, camera_id, bucket_start, coalesce(package_id, ''), "
+        "coalesce(processing_config_source, ''), "
+        "coalesce(processing_config_revision, -1), "
+        "coalesce(processing_config_status, ''), "
+        "coalesce(applied_model_key, ''), "
+        "coalesce(applied_selected_classes_key, ''), "
+        "coalesce(applied_confidence_threshold, -1.0), "
+        "coalesce(processing_config_warnings, '{}'::text[]))" in sql
+    )
     # Compact dimensions only — never the raw snapshot, never requested-value
-    # columns (warnings codes already record requested-but-not-applied facts).
+    # columns (warnings codes already record requested-but-not-applied facts;
+    # M9.1 later adds the deliberate exception: requested_processing_fps).
     assert "jsonb" not in sql
     assert "add column requested_" not in sql
+
+
+def test_m9_1_migration_file_pins_fps_rekey() -> None:
+    """The M9.1 migration adds the FPS dimension columns to BOTH metrics
+    tables and re-keys the rollup unique index with the FPS folds, byte-
+    identical to the rollup's live ON CONFLICT target."""
+    root = Path(__file__).resolve().parents[1]
+    migration = root / "supabase" / "migrations" / "20260610120000_processing_fps_dimensions.sql"
+    sql = _norm(migration.read_text())
+    assert "alter table snapshot_detection_metrics" in sql
+    assert "alter table detection_confidence_hourly_rollups" in sql
+    assert sql.count("add column requested_processing_fps int") == 2
+    assert sql.count("add column applied_processing_fps int") == 2
+    assert "drop index detection_confidence_hourly_rollups_bucket_idx" in sql
+    assert "create unique index detection_confidence_hourly_rollups_bucket_idx" in sql
+    assert f"(account_id, camera_id, bucket_start, {_CONFLICT_EXPR})" in sql
+    assert _CONFLICT_EXPR in _norm(_ROLLUP_HOURLY_SQL)  # cross-pin: both sides match
+    assert "jsonb" not in sql
 
 
 # ---------------------------------------------------------------------------
@@ -462,6 +498,8 @@ def _raw(
     model_key: str | None = None,
     classes_key: str | None = None,
     threshold: float | None = None,
+    requested_fps: int | None = None,
+    applied_fps: int | None = None,
     warnings: list[str] | None = None,
 ) -> dict[str, Any]:
     return {
@@ -482,6 +520,8 @@ def _raw(
         "applied_model_key": model_key,
         "applied_selected_classes_key": classes_key,
         "applied_confidence_threshold": threshold,
+        "requested_processing_fps": requested_fps,
+        "applied_processing_fps": applied_fps,
         "processing_config_warnings": warnings,
     }
 
@@ -892,6 +932,66 @@ def test_empty_string_and_null_dimensions_fold_like_package_id() -> None:
     assert buckets[0].applied_selected_classes_key is None
     assert buckets[0].processing_config_warnings is None
     assert buckets[0].metric_count == 2
+
+
+def test_two_applied_fps_in_one_hour_yield_two_buckets() -> None:
+    """M9.1: a camera whose applied processing_fps changed mid-hour (5 -> 1)
+    must split into two rollup rows, not blend."""
+    rows = [
+        _raw(
+            datetime(2026, 5, 29, 10, 10, tzinfo=UTC),
+            avg=0.8,
+            samples=10,
+            mn=0.8,
+            mx=0.8,
+            config_revision=5,
+            requested_fps=5,
+            applied_fps=5,
+            warnings=["processing_fps_output_cadence_only"],
+        ),
+        _raw(
+            datetime(2026, 5, 29, 10, 40, tzinfo=UTC),
+            avg=0.6,
+            samples=10,
+            mn=0.6,
+            mx=0.6,
+            config_revision=6,
+            requested_fps=1,
+            applied_fps=1,
+            warnings=["processing_fps_output_cadence_only"],
+        ),
+    ]
+    buckets = compute_hourly_rollup_buckets(rows, now=_NOW)
+    assert len(buckets) == 2
+    by_fps = {b.applied_processing_fps: b for b in buckets}
+    assert set(by_fps) == {5, 1}
+    assert by_fps[5].requested_processing_fps == 5
+    assert by_fps[5].avg_confidence_weighted == pytest.approx(0.8)
+    assert by_fps[1].avg_confidence_weighted == pytest.approx(0.6)
+    assert by_fps[5].bucket_start == by_fps[1].bucket_start
+
+
+def test_null_fps_and_applied_fps_in_one_hour_yield_two_buckets() -> None:
+    """Default-FPS history (null) and an applied 5 FPS in the same hour stay
+    distinguishable; the null rows still roll up safely as their own group."""
+    rows = [
+        _raw(datetime(2026, 5, 29, 10, 10, tzinfo=UTC), avg=0.7, samples=10, mn=0.7, mx=0.7),
+        _raw(
+            datetime(2026, 5, 29, 10, 40, tzinfo=UTC),
+            avg=0.9,
+            samples=10,
+            mn=0.9,
+            mx=0.9,
+            requested_fps=5,
+            applied_fps=5,
+        ),
+    ]
+    buckets = compute_hourly_rollup_buckets(rows, now=_NOW)
+    assert len(buckets) == 2
+    by_fps = {b.applied_processing_fps: b for b in buckets}
+    assert set(by_fps) == {None, 5}
+    assert by_fps[None].requested_processing_fps is None
+    assert by_fps[None].avg_confidence_weighted == pytest.approx(0.7)
 
 
 def test_package_split_is_preserved_alongside_config_dimensions() -> None:
