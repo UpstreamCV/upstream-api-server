@@ -14,7 +14,7 @@ from uuid import UUID
 
 import asyncpg
 
-from upstream_api.errors import LimitExceeded, NotFoundError
+from upstream_api.errors import ForbiddenError, LimitExceeded, NotFoundError
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,6 +50,28 @@ class LimitsSnapshot:
     codec: str
     bitrate_kbps: int
     latency_mode: str = "balanced"
+
+
+async def check_account_active(conn: asyncpg.Connection, account_id: UUID) -> None:
+    """Reject session starts for suspended accounts.
+
+    `accounts.status` is set from the admin panel (PATCH /v1/admin/accounts/
+    {id}); without this gate the suspend toggle would be cosmetic. In-flight
+    sessions are not killed — suspension stops NEW sessions only.
+    """
+    status = await conn.fetchval("select status from accounts where id = $1", account_id)
+    if status is None:
+        raise NotFoundError(
+            "Account not found.",
+            code="account_not_found",
+            details={"account_id": str(account_id)},
+        )
+    if status != "active":
+        raise ForbiddenError(
+            "Account is suspended.",
+            code="account_suspended",
+            details={"account_id": str(account_id), "status": status},
+        )
 
 
 async def load_account_limits(conn: asyncpg.Connection, account_id: UUID) -> AccountLimits:
@@ -124,6 +146,7 @@ async def check_session_start(
 
     Raises :class:`LimitExceeded` on any failure with a stable error code.
     """
+    await check_account_active(conn, account_id)
     limits = await load_account_limits(conn, account_id)
 
     check_camera_defaults(limits, requested)

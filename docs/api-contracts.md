@@ -10,6 +10,7 @@ Stable contract between the API server and its callers. Paths are all under `/v1
 | Dashboard user | `Authorization: Bearer <Supabase access token>` | `UPSTREAM_SUPABASE_JWT_SECRET` (HS256, `aud=authenticated`) |
 | Streaming server | `X-Upstream-Webhook-Secret: …` | `UPSTREAM_MEDIAMTX_WEBHOOK_SECRET` |
 | Processor | `X-Upstream-Webhook-Secret: …` | `UPSTREAM_PROCESSOR_WEBHOOK_SECRET` |
+| Platform admin | `Authorization: Bearer <Supabase access token>` | same JWT verification as a dashboard user + `platform_admins` allowlist row |
 
 ## Error envelope
 
@@ -1505,3 +1506,36 @@ read over rollups; no migration, no new write path.
 - package-registry / model-registry tables, package marketplace
 - dashboard zones/lines UI, custom line-crossing, rules engine, billing
 - WebSocket event delivery, the stale-session sweeper
+
+## Endpoints — Platform admin (auth: `current_platform_admin`)
+
+Cross-tenant surface consumed only by `upstream-admin-panel` (which reaches it
+through its own server-side proxy — these routes are proxy-only and are not
+called from a browser origin, so they need no CORS method additions). A valid
+Supabase JWT whose `sub` is missing from `platform_admins` gets
+`403 not_platform_admin`; a bad/expired token gets `401 invalid_user_token`.
+
+All mutations write an `admin_audit_log` row (`{before, after}` diff,
+`request_id` correlation).
+
+| Method | Path | Notes |
+|---|---|---|
+| GET | `/v1/admin/me` | Gate check: `{user_id, email}`. |
+| GET | `/v1/admin/system/health` | Rollup: `{api, database, streaming_server, processors}`. Probes degrade (DB 0.5 s timeout, MediaMTX `GET /v3/paths/list` 1 s timeout → `unreachable`); always 200. |
+| GET | `/v1/admin/streams?state=&account_id=&limit=&offset=` | Cross-account sessions, newest first; each item carries `account_name/slug`, `camera_name`, `latest_heartbeat`, `latest_validation_passed`, `processor_status` (lateral joins). `{items, total}`. |
+| GET | `/v1/admin/streams/summary` | `{by_state, started_24h, validation_failures_24h, accounts_streaming, open_reliability_findings}`. |
+| GET | `/v1/admin/streams/{session_id}` | Session + `requested/approved/validated` dicts + last 50 heartbeats + last 20 validations + camera findings + processor statuses. |
+| GET | `/v1/admin/accounts?search=&status=&plan=&limit=&offset=` | `search` ilikes name/slug. Items carry member/agent/camera/active-session counts. `{items, total}`. |
+| GET | `/v1/admin/accounts/{id}` | `{account, limits (nullable), usage_30d}`. |
+| PATCH | `/v1/admin/accounts/{id}` | Body `{plan?, status?}`; `plan ∈ free\|pro\|enterprise`, `status ∈ active\|suspended` (`deleted` is NOT settable). Empty body → `400 empty_update`. Audited (`account.plan.update` / `account.status.update` / `account.update`). |
+| PATCH | `/v1/admin/accounts/{id}/limits` | Partial update of any `account_limits` column; applies to FUTURE sessions only (in-flight keep their `lim_*` snapshot). Audited (`account.limits.update`). |
+| GET | `/v1/admin/accounts/{id}/members` | `[{user_id, role, email?, created_at}]`. Emails best-effort from `auth.users`; degrades to null if the DB role can't read the auth schema. |
+| GET | `/v1/admin/accounts/{id}/api-tokens` | Token metadata (prefix, last_four, scopes, timestamps). `hash` is never selected. |
+| GET | `/v1/admin/usage?start=&end=&bucket=day\|week\|month&account_id=&event_type=` | `date_trunc`-bucketed `usage_events` aggregates. Defaults: last 30 days, `day`. `start >= end` → `400 invalid_range`; > 366 days → `400 range_too_large`. |
+| GET | `/v1/admin/usage/summary?days=30` | Per-account totals over the trailing window (`days` 1–365). |
+| GET | `/v1/admin/audit-log?admin_user_id=&target_id=&limit=&offset=` | `{items, total}`, newest first. |
+
+**Suspension enforcement:** `POST /v1/stream-sessions/start` now rejects with
+`403 account_suspended` when `accounts.status != 'active'` (checked in
+`services/limits.check_account_active` before the limits load). Suspension
+stops NEW sessions only; in-flight sessions are not killed.

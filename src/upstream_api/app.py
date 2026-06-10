@@ -29,6 +29,7 @@ from upstream_api.routers import (
     heartbeats,
     ingest,
     models,
+    platform_admin,
     processor,
     reliability,
     snapshots,
@@ -107,5 +108,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(users.router)
     app.include_router(accounts.router)
     app.include_router(dashboard.router)
+    app.include_router(platform_admin.router)  # /v1/admin/* (admin panel)
 
     return app
