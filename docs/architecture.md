@@ -48,7 +48,7 @@ upstream-agent                  upstream-streaming-server
 | Agent | `Authorization: Bearer ups_<env>_<id>_<secret>` | argon2id against `api_tokens.hash`, prefix-indexed | `/v1/agents/*`, `/v1/cameras/*`, `/v1/stream-sessions/*`, `/v1/heartbeats`, `/v1/snapshots` |
 | Dashboard user | `Authorization: Bearer <Supabase access token>` | HS256 against `UPSTREAM_SUPABASE_JWT_SECRET` + `account_members` lookup | dashboard reads, `/v1/api-tokens` |
 | Streaming server | `X-Upstream-Webhook-Secret: <secret>` | constant-time compare against `UPSTREAM_MEDIAMTX_WEBHOOK_SECRET` | `/v1/ingest/*` (Phase 2) |
-| Processor | `X-Upstream-Webhook-Secret: <secret>` | constant-time compare against `UPSTREAM_PROCESSOR_WEBHOOK_SECRET` | `/v1/processor/*` (Phase 5) |
+| Processor | `X-Upstream-Webhook-Secret: <secret>` | constant-time compare against `UPSTREAM_PROCESSOR_WEBHOOK_SECRET` | `/v1/internal/processor/*` (M8.0) |
 
 Each identity class has its own FastAPI dep in `security/deps.py`: `current_agent`, `current_user`, `current_ingest`, `current_processor`. Routers ask only for the dep they need; account scoping comes from the auth context, never from the request body.
 
@@ -114,12 +114,14 @@ Two concurrent `POST /v1/stream-sessions/start` calls could otherwise race past 
 
 ## Token model
 
-There are three kinds of token in the system:
+There are four kinds of token in the system:
 
 1. **API token** (long-lived, opaque, agent-facing). Plaintext format `ups_<env>_<8 id>_<22 secret>`. The `prefix` (everything except the last segment) is stored in DB and is the unique lookup index; the last segment is argon2id-hashed in `hash`. Shown to the dashboard user exactly once on creation.
-2. **Session token** (4h TTL, JWT, agent-facing). Minted by `POST /v1/stream-sessions/start` and returned at the top level of the response. Carries `acc`/`sub`/`cam`/`sid`/`jti`/`exp`/`lim` claims. *Not* placed in the SRT streamid — see "stream_key" below. Currently a back-compat carrier for non-ingest callers; the live ingest validation path no longer reads it.
-4. **Stream key** (4h TTL, opaque, ingest-only). Short random token (`sess_<16 hex>`) minted per session and stored on `stream_sessions.streamid` as `publish:sess_<hex>`. This is what rides in the SRT streamid query parameter and what `/v1/ingest/validate-stream` looks the session up by.
-3. **Supabase Auth JWT** (1h TTL, JWT, dashboard-user-facing). Issued by Supabase Auth; verified using `UPSTREAM_SUPABASE_JWT_SECRET`.
+2. **Session token** (4h TTL, JWT, agent-facing). Minted by `POST /v1/stream-sessions/start` and returned at the top level of the response. Carries `acc`/`sub`/`cam`/`sid`/`jti`/`exp`/`lim` claims. *Not* placed in the SRT streamid — see "Stream key" below. Currently a back-compat carrier for non-ingest callers; the live ingest validation path no longer reads it.
+3. **Stream key** (4h TTL, opaque, ingest-only). Short random token (`sess_<16 hex>`) minted per session and stored on `stream_sessions.streamid` as `publish:sess_<hex>`. This is what rides in the SRT streamid query parameter and what `/v1/ingest/validate-stream` looks the session up by.
+4. **Supabase Auth JWT** (1h TTL, JWT, dashboard-user-facing). Issued by Supabase Auth; verified using `UPSTREAM_SUPABASE_JWT_SECRET`. Carries the user's `aal` (MFA assurance level) and `amr` (auth methods) claims, which the api-server exposes on `UserAuth` for future per-route MFA gating.
+
+A fifth secret rides on each SRT publish but is not a "token" in the auth sense: every `/start` mints a one-shot AES-256 **SRT passphrase**, embeds it in the returned `srt_url` (`&passphrase=…&pbkeylen=32`), and PATCHes the matching MediaMTX path so the SRT handshake actually negotiates encryption. See "Per-session SRT passphrase" below.
 
 ## Phased delivery
 
@@ -127,12 +129,17 @@ There are three kinds of token in the system:
 |---|---|---|
 | 0 | FastAPI scaffold | done |
 | 1 | Agent auth + session creation | done |
-| 2 | MediaMTX ingest webhooks | done |
+| 2 | MediaMTX ingest webhooks | done — plus follow-ups: per-session SRT passphrase + MediaMTX path provisioning (FU-6), WHEP read-path proxy (FU-3), `lookup-session` resolver, M4.1 path-segment auth gate, M5.1 report-only validation endpoints, M6.2-delta webhook-authed `/v1/ingest/snapshots` |
 | 3 | Heartbeats + snapshots | done |
 | 4 | Dashboard reads (Supabase JWT, RLS) | done — `GET /v1/agents`, `/v1/cameras`, `/v1/stream-sessions` accept either an agent token or a user JWT via `CurrentCaller` (security/deps.py) |
-| 5 | Processor surface + usage rollup | not started |
-| 6 | Observability + rate limiting | partial (structlog + middleware in; Prometheus + slowapi not yet) |
-| 7 | Hardening (token rotation, revocation list, mTLS) | not started |
+| 5 | Processor surface + usage rollup | processor surface done — M8.0 readiness gate, P4-B..E real observation types, P5-A recent observations read, P5-C latest perception snapshots, P6-A geometry config, P6-D latest processor status read. Usage rollup partial — `services/usage.py` writes `usage_events` rows on every billable transition but there is no read/aggregate endpoint yet |
+| 6 | Observability + rate limiting | partial — structlog + `RequestIdMiddleware` + `AccessLogMiddleware` in. No `/metrics` endpoint yet (`UPSTREAM_PROMETHEUS_AUTH_TOKEN` is reserved). No slowapi rate limiting |
+| 7 | Hardening (token rotation, revocation list, mTLS) | not started. Per-session SRT passphrase shipped under Phase 2 / FU-6, not here — it hardens the publish hop, not the API surface |
+
+Two feature tracks have since landed on top of the Phase 5 surface (milestone-numbered independently of the phases above):
+
+- **Reliability** (M0–M7) — persisted `reliability_findings` + the evaluate-on-read rule set behind `GET /v1/cameras/{id}/reliability/summary` / `findings` (five rules: processor-silent, frame-stale, default-geometry, scene-too-dark, unstable-detection-confidence), the M5 `snapshot_detection_metrics` confidence history + windowed drift, the M6 hourly rollups + retention (`run_detection_metrics_rollup`), and the M7 `confidence-trend` read API.
+- **Model config** (M2–M4, M7B, M9/M9.1, M11) — the static `GET /v1/models` registry, the account-level `processing_enabled` master switch (`GET`/`PATCH /v1/account/processing-config`, enforced in the eligible-sessions SQL), per-camera `GET`/`PUT /v1/cameras/{id}/processing-config` (registry-validated), stamp-only `processing_config` carriage on eligible-sessions (M7B), applied-config dimensions on the rollup tables + the `confidence-trend/by-config` read (M9, FPS dimensions in M9.1), and the M11 `config-comparison-summary` report card.
 
 ## Phase 2 — MediaMTX ingest webhook flow
 
@@ -158,10 +165,38 @@ agent ──SRT publish, streamid=publish:<stream_key>──► upstream-streami
 
 If ffprobe finds a mismatch, the streaming server calls `validation-failed` instead of `stream-started`; the session transitions to `failed`, a row lands in `stream_validations` with `passed=false`, and the SRT connection is dropped.
 
+The diagram above shows the original Phase 2 lifecycle. Five additional ingest routes have landed since and share the same `current_ingest` webhook-secret auth:
+
+- `POST /v1/ingest/mediamtx-auth/{secret}` — MediaMTX 1.9.3 `authMethod: http` deny gate (M4.1). Path-segment auth because 1.9.3 has no `authHTTPHeaders`.
+- `POST /v1/ingest/lookup-session` — streamid → session ids resolver for the `runOnReady` / `runOnNotReady` hooks. State-agnostic, unlike `validate-stream`.
+- `GET /v1/ingest/expected/{session_id}` — state-agnostic fetch of the expected media-config block for the streaming-server's comparator (M5.1).
+- `POST /v1/ingest/stream-validations` — report-only validation row insert; does NOT mutate session state (M5.1).
+- `POST /v1/ingest/snapshots` — webhook-authed snapshot upload from the streaming-server (M6.2-delta). Only accepted when the session is `streaming`; tenant fields are always derived from the session row.
+
+### Per-session SRT passphrase + MediaMTX path provisioning (FU-6)
+
+`POST /v1/stream-sessions/start` mints an AES-256 passphrase (~32 url-safe chars) on every session, stores it on `stream_sessions.srt_publish_passphrase`, embeds it in the returned `srt_url` as `&passphrase=<X>&pbkeylen=32`, and PATCHes a matching MediaMTX path via `UPSTREAM_MEDIAMTX_API_BASE_URL` so the SRT handshake actually negotiates encryption. `POST /v1/stream-sessions/{id}/stop` and the `stream-ended` / `validation-failed` ingest hooks DELETE the path (best-effort, 404-tolerant). A leaked passphrase only exposes that one session.
+
+Known gap: MediaMTX's path config is in-memory, so a streaming-server restart drops every dynamic path and in-flight sessions break until the agent re-`/start`s. A periodic reconciler is deferred (FU-7).
+
+## Read-path auth — WHEP proxy
+
+`POST /v1/stream-sessions/{id}/whep` and `DELETE /v1/stream-sessions/{id}/whep/{resource_id}` proxy WebRTC signaling between an authenticated dashboard user and MediaMTX. The api-server authenticates via `CurrentCaller` (agent token OR Supabase JWT, account-scoped) so MediaMTX's permissive `authInternalUsers` posture never reaches the public internet. UDP/ICE media still flows browser ↔ MediaMTX directly; only the HTTP signaling makes the api-server hop. Cited via `UPSTREAM_MEDIAMTX_BASE_URL`.
+
 ## Phase 3 — Heartbeats + snapshots
 
 - **Heartbeats**: agent posts batches of up to 100 every few seconds. Each item carries `status`, `fps`, `bitrate_kbps`, `width`, `height`, `codec`, `last_error`, `agent_version`, `reported_at`. The handler updates `agents.last_seen_at` once per batch — not per heartbeat — to avoid hot-row contention on chatty fleets.
 - **Snapshots**: agent (or, optionally, the streaming server in a later phase) uploads a JPEG as multipart. Bytes go to Supabase Storage at `{account_id}/{camera_id}/{yyyymmdd}/{uuid}.jpg`; metadata + `storage_key` land in `snapshots`. Quota is `account_limits.snapshot_storage_mb` summed across the trailing 30 days. Max upload is `UPSTREAM_SNAPSHOT_MAX_BYTES` (default 5 MB). **Caddy must allow `>= snapshot_max_bytes` on `/v1/snapshots` specifically** — the global 1 MB body cap stays in place everywhere else.
+
+Snapshot upload has two variants. `POST /v1/snapshots` is agent-token authed and is what the agent SDK uses. `POST /v1/ingest/snapshots` (M6.2-delta) is webhook-secret authed and is for the streaming server to forward locally-extracted JPEGs; it only accepts sessions in `streaming` state and derives `account_id` / `agent_id` / `camera_id` from the session row, never the request body. Both share the same Storage / quota / `snapshots`-insert pipeline (`_read_validated_jpeg` / `_enforce_snapshot_quota` / `_persist_snapshot` in `routers/snapshots.py`).
+
+## Phase 5 — Processor surface
+
+Documented in detail in `api-contracts.md` under the M8.0 section; the high-level shape: the api-server is the source of truth for "which sessions are processable" via `GET /v1/internal/processor/eligible-sessions` (the eligibility WHERE clause is the single source of truth), accepts `POST /v1/internal/processor/status` upserts and `POST /v1/internal/processor/observations` appends, plus the P5-A / P5-C / P6-A reads. All processor routes are gated by a **separate** `UPSTREAM_PROCESSOR_WEBHOOK_SECRET` from the ingest webhook secret. `account_id` / `camera_id` are always derived from the session row, never trusted from the request. No `srt_url` / token / passphrase is ever returned to the processor — only the internal RTSP read URL built from `UPSTREAM_MEDIAMTX_RTSP_BASE`.
+
+## Realtime publication
+
+Migration `20260514120000_realtime_publication.sql` adds `stream_sessions` and `cameras` to the `supabase_realtime` publication. The dashboard subscribes via the browser's Supabase client (filtered by the same RLS policies the api-server honors) instead of polling, cutting agent-connect → live-indicator latency from up to 5 s down to ~50-200 ms. The api-server is the only writer to these tables, so the publication is safe.
 
 ## Latency modes
 

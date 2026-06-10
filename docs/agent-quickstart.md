@@ -14,7 +14,7 @@ Send it on every request as `Authorization: Bearer <token>`. The token is scoped
 
 Get a token:
 - **Production**: a dashboard owner/admin issues one via `POST /v1/api-tokens` (or the dashboard UI). The plaintext is shown **once**, then only the prefix + last-four are stored.
-- **Local dev**: see [Local test setup](#local-test-setup) below — `scripts/seed_dev_token.py` mints one for you.
+- **Local dev**: see [Local test setup](#local-test-setup) below — `make dev-account` mints one for you (runs `scripts/seed_dev_account.py`).
 
 Tokens are revoked via `DELETE /v1/api-tokens/{id}`; from that point any agent using it gets `401 token_revoked`.
 
@@ -153,7 +153,7 @@ Response `200`:
     "agent_id": "0b91a1a8-7d3d-4c91-9c6e-ce5b9f0e6e3e",
     "camera_id": "9c8c7e3e-c1a6-4d6c-bdda-b8c0f5a3d211",
     "state": "approved",
-    "srt_url": "srt://ingest.upstreamcv.com:18890?streamid=publish:sess_4f7a2b9c3e1d8a05&latency=200",
+    "srt_url": "srt://ingest.upstreamcv.com:18890?streamid=publish:sess_4f7a2b9c3e1d8a05&latency=200&passphrase=<urlencoded>&pbkeylen=32",
     "streamid": "publish:sess_4f7a2b9c3e1d8a05",
     "expires_at": "2026-05-13T06:00:00Z",
     "started_at": null,
@@ -161,13 +161,13 @@ Response `200`:
     "requested": { "width": 1280, "height": 720, "fps": 30, "codec": "h264", "bitrate_kbps": 3000, "latency_mode": "balanced" },
     "approved":  { "width": 1280, "height": 720, "fps": 30, "codec": "h264", "bitrate_kbps": 3000, "latency_mode": "balanced" }
   },
-  "srt_url": "srt://ingest.upstreamcv.com:18890?streamid=publish:sess_4f7a2b9c3e1d8a05&latency=200",
+  "srt_url": "srt://ingest.upstreamcv.com:18890?streamid=publish:sess_4f7a2b9c3e1d8a05&latency=200&passphrase=<urlencoded>&pbkeylen=32",
   "session_token": "eyJhbGciOiJIUzI1NiI…",
   "expires_at": "2026-05-13T06:00:00Z"
 }
 ```
 
-Pipe `srt_url` straight into ffmpeg — the agent never has to parse the JWT.
+Pipe `srt_url` straight into ffmpeg — the agent never has to parse the JWT. The `passphrase` and `pbkeylen=32` parameters (Phase 2 / FU-6) negotiate AES-256 encryption for the publish hop; libsrt picks them up automatically, but if you forward the URL through anything that re-builds query strings, make sure those params survive untouched.
 
 Errors you'll see here:
 
@@ -254,22 +254,17 @@ UPSTREAM_ENVIRONMENT=development
 
 ### 2. Mint a local dev token
 
-`scripts/seed_dev_token.py` issues a fresh `ups_test_…` token and prints the matching SQL insert. It prints the plaintext **to stderr** (so you can capture it) and the SQL to stdout (so you can pipe it into psql):
+`make dev-account` runs `scripts/seed_dev_account.py`, which creates a stable Supabase Auth user (`dev@upstream.test`), lets the `handle_new_user` trigger provision the matching tenant rows, then mints a fresh API token and prints the plaintext to stdout:
 
 ```bash
-uv run python scripts/seed_dev_token.py \
-  | psql "$(supabase status --output env | grep DB_URL | cut -d= -f2- | tr -d '\"')"
+make dev-account
+#  prints `ups_test_AB12CDEF_FULLSECRET22CHARSWXYZ` (or similar) to stdout.
+#  re-run safely; use `make dev-account-reset` to start fresh.
 ```
 
-stderr will show something like:
+The script is idempotent: re-running issues a new token without touching the rest of the seed data. `scripts/seed_dev_token.py` still exists as a thin shim around `seed_dev_account.py --token-only` for older docs/scripts.
 
-```
--- Save this plaintext token — it will not be retrievable again:
--- ups_test_AB12CDEF_FULLSECRET22CHARSWXYZ
--- (prefix: ups_test_AB12CDEF, last_four: WXYZ)
-```
-
-Grab that plaintext. The token belongs to the fixed dev account `00000000-0000-0000-0000-000000000001` (seeded with `max_cameras=1`, `max_concurrent_sessions=1`, `max_fps=30`, `max_width=1920`, `max_height=1080`, `max_bitrate_kbps=6000`, `allowed_codecs={h264}` by default — bump these in `account_limits` if you need more headroom for tests).
+The token belongs to the account the `handle_new_user` trigger provisions for `dev@upstream.test` (a fresh UUID — not the fixed `00000000-0000-0000-0000-000000000001` "Local Dev" account that `seed.sql` creates), with the trigger's permissive defaults: `max_cameras=5`, `max_concurrent_sessions=5`, `max_fps=60`, `max_width=1920`, `max_height=1080`, `max_bitrate_kbps=8000`, `allowed_codecs={h264,h265}` — bump these in `account_limits` if you need more headroom for tests.
 
 > The token is **not** committed to the repo because it's a real credential. Mint a fresh one whenever you reset your DB.
 
@@ -288,7 +283,7 @@ Expected output:
 ```
   ok  agent_id=0b91a1a8-7d3d-4c91-9c6e-ce5b9f0e6e3e
   ok  camera_id=9c8c7e3e-c1a6-4d6c-bdda-b8c0f5a3d211
-  ok  srt_url=srt://ingest.upstreamcv.com:18890?streamid=publish:sess_4f7a2b9c3e1d8a05&latency=200…
+  ok  srt_url=srt://ingest.upstreamcv.com:18890?streamid=publish:sess_4f7a2b9c3e1d8a05&latency=200&passphrase=…&pbkeylen=32
   ok  stream_key=sess_4f7a2b9c3e1d8a05
   ok  jwt claims session_id=2b6f0ad4-e7c4-4d61-aa1e-a8d4c47e9b22
   ok  session stopped

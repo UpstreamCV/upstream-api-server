@@ -67,17 +67,15 @@ docker exec supabase_db_upstream-api-server psql -U postgres -c "select prefix, 
 The account hit `account_limits.max_cameras`. Either disable an unused camera (`update cameras set status='disabled' where …`) or raise the limit (`update account_limits set max_cameras = N where account_id = …`).
 
 ### `409 camera_already_streaming`
-There's an active session (`state in ('approved','streaming')`) for that camera. Stop it via `POST /v1/stream-sessions/{id}/stop` or let `expires_at` pass (and re-implement the sweeper).
+There's an active session (`state in ('approved','streaming')`) for that camera. Stop it via `POST /v1/stream-sessions/{id}/stop`. Letting `expires_at` pass alone won't help: the background sweeper that would auto-expire stale rows isn't implemented yet, so the row stays in `approved` indefinitely until something stops it.
 
 ### `404 camera_not_found` for a camera that should exist
 The `current_agent` dep binds `account_id` from the API token. The camera's `account_id` must match. Common cause: testing with two different accounts' tokens.
 
 ## Behavior that's correct but surprised someone
 
-### `record_event` silently swallows missing-table errors
-Until Phase 5 ships the `usage_events` table, every call to `record_event` catches `asyncpg.UndefinedTableError`. The insert is wrapped in `async with conn.transaction()` (a SAVEPOINT), so the swallow rolls back only the savepoint, not the parent transaction. There's a `_logger.debug("usage_events_table_missing")` you can watch for.
-
-If you migrate the table and the swallow stays, delete the try/except — leaving it would hide real future errors.
+### `record_event` no-ops when `usage_events` is missing
+The `usage_events` table now ships in `20260513120000_heartbeats_snapshots_usage.sql`, so this normally just inserts. But `services/usage.py` keeps a one-shot `to_regclass('public.usage_events') is not null` probe (cached under an `asyncio.Lock`), so on a database where the migration hasn't been applied yet the insert is skipped and you get a `_logger.debug("usage_events_table_missing")` line instead of an error. The earlier try/except-`UndefinedTableError` swallow is gone.
 
 ### `POST /v1/stream-sessions/start` returns 200 but no row exists
 This was a bug, now fixed. If it returns, the parent transaction is aborting silently — most likely because some code in the same transaction caught an asyncpg error without a SAVEPOINT and left the transaction in an aborted state. Search for bare `except` blocks inside `async with conn.transaction():`.
