@@ -46,6 +46,7 @@ class FakeConn:
                 "id": args[0],
                 "account_id": self.camera_account_id,
                 "agent_id": self.camera_agent_id,
+                "source_type": "webcam",
             }
         if "from account_limits" in query:
             return {
@@ -56,6 +57,7 @@ class FakeConn:
                 "max_height": 2160,
                 "max_bitrate_kbps": 12000,
                 "allowed_codecs": ["h264"],
+                "allowed_stream_types": ["webcam", "rtsp"],
                 "monthly_minutes_quota": 600,
                 "snapshot_storage_mb": 1024,
             }

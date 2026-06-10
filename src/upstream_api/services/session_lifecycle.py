@@ -111,13 +111,18 @@ async def start_session(
     """
     camera = await conn.fetchrow(
         """
-        select id, account_id, agent_id from cameras
+        select id, account_id, agent_id, source_type from cameras
          where id = $1 and status <> 'disabled'
         """,
         camera_id,
     )
     if camera is None or camera["account_id"] != account_id:
         raise NotFoundError("Camera not found.", code="camera_not_found")
+    if camera["agent_id"] is None:
+        raise ConflictError(
+            "Camera is not assigned to an agent yet; claim it before streaming.",
+            code="camera_unassigned",
+        )
     agent_id: UUID = camera["agent_id"]
 
     # Concurrent-session check on the same camera.
@@ -136,7 +141,12 @@ async def start_session(
             code="camera_already_streaming",
         )
 
-    approved = await check_session_start(conn, account_id=account_id, requested=requested)
+    approved = await check_session_start(
+        conn,
+        account_id=account_id,
+        requested=requested,
+        camera_source_type=camera["source_type"],
+    )
 
     session_id = uuid4()
     jti = uuid4()
