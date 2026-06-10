@@ -9,10 +9,11 @@ Each milestone notes which repo it landed in.
 > Users can configure model, classes, tracker, confidence threshold, and
 > processing FPS per camera in the dashboard. The saved config is carried to
 > the processor, stamped as requested-vs-applied lineage on processor status,
-> snapshots, and observations, and reliability metrics can now be grouped and
-> filtered by applied processing config dimensions. Confidence threshold and
-> selected classes are applied only where supported; model switching, tracker
-> changes, processing FPS, and class-filtered line/ROI counts remain not
+> snapshots, and observations; reliability metrics can be grouped and filtered
+> by applied config dimensions, with a dashboard "Reliability by Config"
+> surface. Confidence threshold, selected classes, and processing FPS
+> (perception output cadence) are applied only where supported; model
+> switching, tracker changes, and class-filtered line/ROI counts remain not
 > live-applied.
 
 ## Milestones
@@ -220,18 +221,73 @@ were partially applied", and "which metrics carry the analytics-counts
 caveat" — with the standing caveat that grouped trends show association, not
 proven causation (scene conditions change too).
 
+### M10 — Dashboard "Reliability by Config" section (`upstream-dashboard`)
+
+The camera Reliability tab now surfaces the M9 config-aware data: a new
+section below the existing confidence-trend card renders one card per applied
+processing-config group from
+`GET /v1/cameras/{id}/reliability/confidence-trend/by-config` — readable label
+("All classes · default confidence", "person · confidence 0.20",
+"No config metadata" for pre-M8 history), humanised status
+("partially applied · r4", "default config"), a gap-aware mini sparkline, and
+Latest avg / Low-conf ratio / Samples stats, with a 24h | 7d toggle and
+Classes/Status filters derived from the returned groups (client-side only —
+no unsupported query params). Groups carrying
+`selected_classes_analytics_counts_not_filtered` show a
+"line/ROI counts still all-class" badge. Resilient by design: any by-config
+fetch failure degrades to an "unavailable" body without breaking the tab, and
+the existing camera-level trend card is byte-identical. Hidden in demo mode
+(which swaps real telemetry visuals for the scripted scene card). M10 applies
+nothing at runtime.
+
+### M7E — Processing FPS runtime apply: perception output cadence (`upstream-processor`)
+
+The saved per-camera `processing_fps` is now genuinely applied through the
+safest existing seam: the **perception-snapshot emit cadence**. In the
+analytics mode with perception snapshots enabled, the worker derives its
+per-session snapshot interval from the operator value (`1/fps`), replacing the
+global `perception_snapshot_interval_seconds` for that session only (no
+Settings mutation, no cross-camera leakage; the effective interval is surfaced
+in the status payload).
+
+**Honest scope — output cadence, not inference FPS.** The DeepStream pipeline,
+nvinfer interval, and GStreamer config are untouched: frames keep decoding and
+inferring at the source rate, so this does **not** reduce GPU cost. The
+event-driven observations (line/zone/dwell) are deliberately **not** throttled
+— suppressing discrete events would drop real data. The lineage says exactly
+that:
+
+- applied → `applied.processing_fps` echoes the request **plus** the always-on
+  caveat `processing_fps_output_cadence_only` (so an fps-applied config is at
+  least `partially_applied`, mirroring the M7D analytics-counts caveat).
+- unsupported (non-analytics modes, perception snapshots disabled) →
+  `processing_fps_requested_not_applied`, exactly as before M7E.
+- `processing_fps: null` → behavior-equivalent to pre-M7E; out-of-range values
+  (schema bounds 1–30) still degrade to `fallback_default_on_error`.
+
+M7C confidence apply, M7D class filtering, and the M8 stamping path are
+unchanged (composition-tested). With new metrics, M9/M10 group by
+`applied.processing_fps` automatically via the existing
+`applied_processing_config` block — note the M9 rollup dimensions do not
+include a dedicated `applied_processing_fps` column (follow-up candidate if
+per-fps grouping is wanted in rollups; the full block is on every
+snapshot/observation regardless).
+
 ## Not yet done
 
 - **Model switching at runtime** — the live processor still runs its
   hard-coded detector; `model_key` is stamped but never applied
   (`model_switch_requested_not_applied`).
-- **Tracker + processing FPS apply** — stamped but not applied
-  (`tracker_requested_not_applied`, `processing_fps_requested_not_applied`).
+- **Tracker apply** — stamped but not applied
+  (`tracker_requested_not_applied`).
+- **True inference FPS** — M7E applies output cadence only; reducing actual
+  inference work (nvinfer interval) needs a deeper design pass.
 - **Class-filtered line/ROI counts** — DeepStream nvdsanalytics aggregate
   counts remain all-class even when `selected_classes` is applied to
   per-object outputs (`selected_classes_analytics_counts_not_filtered`).
-- **Dashboard reliability config filters/comparison UI** — the M9 by-config
-  API has no dashboard surface yet (M10).
+- **M9 rollup fps dimension** — `applied_processing_fps` is not a dedicated
+  rollup grouping column (the lineage block on snapshots/observations carries
+  it; add the column if per-fps reliability grouping is wanted).
 
 ## Decisions (final)
 
