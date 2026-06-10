@@ -4,6 +4,32 @@ Reverse chronological. Newest at top. Every meaningful commit gets an entry foll
 
 ---
 
+## 2026-06-10 - feat(admin): seed_platform_admin script + Makefile targets
+
+### Summary
+One-command management of the `platform_admins` allowlist for local dev and
+ops: `make admin-seed EMAIL=...` grants `/v1/admin/*` access,
+`make admin-list` shows current admins. Mirrors `seed_dev_account.py`'s
+env-driven posture so the same script works against local or hosted Supabase.
+
+### Files touched
+- `scripts/seed_platform_admin.py` — new. `--email` (lookup in `auth.users` →
+  upsert allowlist row), `--create --password` (create the auth user via the
+  Supabase Admin API first), `--remove`, `--list`, `--note`.
+- `Makefile` — `admin-seed`, `admin-list` targets.
+- `docs/module-map.md` — scripts section entry.
+
+### Testing/checks
+Ran live against the local stack: created `admin@upstream.test`, verified
+`GET /v1/admin/me` returns the admin, a non-allowlisted user gets
+`403 not_platform_admin`, PATCHes write audit rows, members endpoint
+resolves emails from `auth.users`. `ruff check` clean.
+
+### Follow-up TODOs
+- Document prod seeding (SQL editor) in the admin-panel repo README.
+
+---
+
 ## 2026-06-10 - feat(admin): /v1/admin/* routers + audit trail + suspension enforcement
 
 ### Summary

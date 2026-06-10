@@ -1,4 +1,4 @@
-.PHONY: install dev test lint typecheck format db-start db-stop db-reset db-diff db-push dev-account dev-account-reset
+.PHONY: install dev test lint typecheck format db-start db-stop db-reset db-diff db-push dev-account dev-account-reset admin-seed admin-list
 
 install:
 	uv sync
@@ -43,3 +43,10 @@ dev-account:
 
 dev-account-reset:
 	uv run python scripts/seed_dev_account.py --reset
+
+# Grant /v1/admin/* access to an auth user: make admin-seed EMAIL=you@example.com
+admin-seed:
+	uv run python scripts/seed_platform_admin.py --email $(EMAIL)
+
+admin-list:
+	uv run python scripts/seed_platform_admin.py --list
