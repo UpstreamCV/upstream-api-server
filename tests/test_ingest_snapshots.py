@@ -77,7 +77,9 @@ class FakeConn:
     ) -> None:
         self.session_row = session_row
         self.used_bytes = used_bytes
-        self.limit_row = {"snapshot_storage_mb": 1024} if limit_row is None else limit_row
+        self.limit_row: dict[str, Any] | None = (
+            {"snapshot_storage_mb": 1024} if limit_row is None else limit_row
+        )
         self.insert_args: tuple[Any, ...] | None = None
 
     def transaction(self) -> FakeTx:

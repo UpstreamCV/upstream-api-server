@@ -81,7 +81,7 @@ def _row(
 async def _summary(rows: list[dict[str, Any]], **kwargs: Any) -> Any:
     conn = FakeByConfigConn(rows)
     return await get_config_comparison_summary(
-        conn,  # type: ignore[arg-type]
+        conn,
         account_id=uuid4(),
         camera_id=uuid4(),
         range_="24h",

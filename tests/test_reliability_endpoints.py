@@ -224,11 +224,11 @@ class FakeReliabilityConn:
             keys = list(args[2])
             self.resolves.append({"keys": keys, "reason": args[3]})
             for k in keys:
-                row = self.open_findings.get(k)
-                if row is not None and row["status"] == "open":
-                    row["status"] = "resolved"
-                    row["resolved_at"] = datetime.now(tz=UTC)
-                    row["resolved_reason"] = args[3]
+                open_row = self.open_findings.get(k)
+                if open_row is not None and open_row["status"] == "open":
+                    open_row["status"] = "resolved"
+                    open_row["resolved_at"] = datetime.now(tz=UTC)
+                    open_row["resolved_reason"] = args[3]
             return []
 
         return []

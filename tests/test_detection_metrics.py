@@ -197,6 +197,7 @@ async def test_skips_invalid_confidence_values() -> None:
 
 
 async def test_handles_missing_and_empty_objects() -> None:
+    snapshot: dict[str, Any]
     for snapshot in ({}, {"objects": []}, {"frame": {"width": 100}}):
         conn = FakeMetricWriteConn()
         result = await _write(conn, snapshot=snapshot)
