@@ -273,6 +273,38 @@ include a dedicated `applied_processing_fps` column (follow-up candidate if
 per-fps grouping is wanted in rollups; the full block is on every
 snapshot/observation regardless).
 
+### M9.1 — FPS-aware reliability dimensions (`upstream-api-server`)
+
+Closes the gap M7E left open: `processing_fps` is now a first-class
+reliability grouping dimension, so "default FPS vs 5 FPS vs 1 FPS" is a clean
+comparison instead of an inference from config revisions.
+
+- **Migration** (`20260610120000_processing_fps_dimensions.sql`) — additive
+  nullable `requested_processing_fps` / `applied_processing_fps` int columns
+  on `snapshot_detection_metrics` and `detection_confidence_hourly_rollups`,
+  plus a re-key of the rollup unique index with the two FPS coalesce-sentinel
+  folds (same pattern, same deploy-order note as M9: migration → deploy →
+  rollup run; no backfill — old rows keep NULL FPS and group as the existing
+  NULL-dimension bucket).
+- **Dimensions** — the extractor reads `requested.processing_fps` /
+  `applied.processing_fps` from the M8 lineage block (valid int 1–30, else
+  NULL; never raises). Requested is stored alongside applied for FPS — unlike
+  the other M9 dimensions — because "asked for 5, got default" vs "asked for
+  nothing" is exactly the comparison FPS grouping exists for.
+- **Rollups** — the two FPS columns join the GROUP BY/conflict key: a
+  camera/hour spanning default-FPS and 5-FPS configs (or 5 vs 1) yields
+  separate rollup rows. The camera-level `confidence-trend` endpoint still
+  blends everything by default, byte-identical.
+- **By-config API** — groups now carry `requested_processing_fps` /
+  `applied_processing_fps` (nullable, additive), and an optional
+  `applied_processing_fps` filter param (1–30) joins the existing filters —
+  enabling labels like "All classes · confidence 0.10 · 5 FPS".
+
+Honest caveat carried through every layer: `processing_fps` is the M7E
+perception-snapshot **output cadence only** — it does not reduce DeepStream
+inference/GPU work, and the `processing_fps_output_cadence_only` warning rides
+in the grouped warnings.
+
 ## Not yet done
 
 - **Model switching at runtime** — the live processor still runs its
@@ -285,9 +317,8 @@ snapshot/observation regardless).
 - **Class-filtered line/ROI counts** — DeepStream nvdsanalytics aggregate
   counts remain all-class even when `selected_classes` is applied to
   per-object outputs (`selected_classes_analytics_counts_not_filtered`).
-- **M9 rollup fps dimension** — `applied_processing_fps` is not a dedicated
-  rollup grouping column (the lineage block on snapshots/observations carries
-  it; add the column if per-fps reliability grouping is wanted).
+- **Dashboard FPS labels (M10.1)** — the Reliability by Config cards do not
+  yet show the FPS dimension in group labels.
 
 ## Decisions (final)
 

@@ -170,6 +170,11 @@ class ConfidenceTrendConfigGroup(BaseModel):
     applied_model_key: str | None
     applied_selected_classes_key: str | None
     applied_confidence_threshold: float | None
+    # M9.1: dedicated FPS dimensions (M7E output-cadence apply). Honest scope:
+    # processing_fps is output cadence only — it does not reduce inference/GPU
+    # work, and these fields record what the processor stamped.
+    requested_processing_fps: int | None
+    applied_processing_fps: int | None
     processing_config_warnings: list[str] | None
     points: list[ConfidenceTrendPoint]
     summary: ConfidenceTrendSummary

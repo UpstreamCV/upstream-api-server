@@ -182,6 +182,7 @@ async def get_reliability_confidence_trend_by_config(
     applied_selected_classes_key: Annotated[str | None, Query(min_length=1, max_length=512)] = None,
     applied_confidence_threshold: Annotated[float | None, Query(ge=0.0, le=1.0)] = None,
     warning: Annotated[str | None, Query(min_length=1, max_length=128)] = None,
+    applied_processing_fps: Annotated[int | None, Query(ge=1, le=30)] = None,
 ) -> ConfidenceTrendByConfigResponse:
     """Hourly confidence history split per applied processing config (M9).
 
@@ -197,6 +198,8 @@ async def get_reliability_confidence_trend_by_config(
     - ``applied_confidence_threshold`` — the threshold actually applied.
     - ``warning`` — only groups whose warnings include this code, e.g.
       ``selected_classes_analytics_counts_not_filtered``.
+    - ``applied_processing_fps`` — the output-cadence FPS actually applied
+      (M7E; cadence only, not inference FPS).
 
     History recorded before the processor stamped applied_processing_config
     (pre-M8) appears as the all-``null``-dimension group. This is a pure read
@@ -222,4 +225,5 @@ async def get_reliability_confidence_trend_by_config(
             applied_selected_classes_key=applied_selected_classes_key,
             applied_confidence_threshold=applied_confidence_threshold,
             warning=warning,
+            applied_processing_fps=applied_processing_fps,
         )

@@ -174,7 +174,7 @@ class FakeReliabilityConn:
             and "applied_selected_classes_key" in query
         ):
             self.by_config_calls.append(args)
-            revision, status, classes_key, threshold, warning = args[5:10]
+            revision, status, classes_key, threshold, warning, applied_fps = args[5:11]
             rows = []
             for row in self.confidence_trend_by_config_rows:
                 if revision is not None and row["processing_config_revision"] != revision:
@@ -186,6 +186,8 @@ class FakeReliabilityConn:
                 if threshold is not None and row["applied_confidence_threshold"] != threshold:
                     continue
                 if warning is not None and warning not in (row["processing_config_warnings"] or []):
+                    continue
+                if applied_fps is not None and row.get("applied_processing_fps") != applied_fps:
                     continue
                 rows.append(row)
             return rows
@@ -1213,6 +1215,8 @@ def _by_config_trend_row(
     model_key: str | None = None,
     classes_key: str | None = None,
     threshold: float | None = None,
+    requested_fps: int | None = None,
+    applied_fps: int | None = None,
     warnings: list[str] | None = None,
 ) -> dict[str, Any]:
     """One by-config row: a trend point plus its dimension columns."""
@@ -1225,6 +1229,8 @@ def _by_config_trend_row(
             "applied_model_key": model_key,
             "applied_selected_classes_key": classes_key,
             "applied_confidence_threshold": threshold,
+            "requested_processing_fps": requested_fps,
+            "applied_processing_fps": applied_fps,
             "processing_config_warnings": warnings,
         }
     )
@@ -1256,7 +1262,9 @@ def _two_config_rows() -> list[dict[str, Any]]:
             model_key="trafficcamnet_v1",
             classes_key="person",
             threshold=0.2,
-            warnings=[_CLASSES_WARNING],
+            requested_fps=5,
+            applied_fps=5,
+            warnings=[_CLASSES_WARNING, "processing_fps_output_cadence_only"],
         ),
     ]
 
@@ -1331,7 +1339,14 @@ def test_by_config_returns_distinct_config_groups() -> None:
     assert r4["processing_config_status"] == "partially_applied"
     assert r4["applied_selected_classes_key"] == "person"
     assert r4["applied_confidence_threshold"] == 0.2
-    assert r4["processing_config_warnings"] == [_CLASSES_WARNING]
+    # M9.1: dedicated FPS dimensions ride in the group.
+    assert r4["requested_processing_fps"] == 5
+    assert r4["applied_processing_fps"] == 5
+    assert r3["applied_processing_fps"] is None
+    assert r4["processing_config_warnings"] == [
+        _CLASSES_WARNING,
+        "processing_fps_output_cadence_only",
+    ]
     assert [p["avg_confidence"] for p in r4["points"]] == [0.90]
     assert r4["summary"]["latest_avg_confidence"] == 0.90
 
@@ -1369,7 +1384,7 @@ def test_by_config_filter_by_revision() -> None:
     assert body["groups"][0]["processing_config_revision"] == 4
     # The filter rode into the SQL params (None for the unused filters).
     assert conn.by_config_calls[0][5] == 4
-    assert conn.by_config_calls[0][6:10] == (None, None, None, None)
+    assert conn.by_config_calls[0][6:11] == (None, None, None, None, None)
 
 
 def test_by_config_filter_by_selected_classes_key() -> None:
@@ -1412,7 +1427,32 @@ def test_by_config_filter_by_warning_code() -> None:
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["group_count"] == 1
-    assert body["groups"][0]["processing_config_warnings"] == [_CLASSES_WARNING]
+    assert _CLASSES_WARNING in body["groups"][0]["processing_config_warnings"]
+
+
+def test_by_config_filter_by_applied_processing_fps() -> None:
+    account, camera = uuid4(), uuid4()
+    conn = FakeReliabilityConn(
+        camera_account_id=account, confidence_trend_by_config_rows=_two_config_rows()
+    )
+    r = _caller_client(conn, account_id=account).get(
+        _BY_CONFIG_PATH.format(camera_id=camera) + "?applied_processing_fps=5"
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["group_count"] == 1
+    assert body["groups"][0]["applied_processing_fps"] == 5
+    # The filter rode into the SQL params as $11.
+    assert conn.by_config_calls[0][10] == 5
+
+
+def test_by_config_fps_filter_out_of_range_422() -> None:
+    account = uuid4()
+    conn = FakeReliabilityConn(camera_account_id=account)
+    r = _caller_client(conn, account_id=account).get(
+        _BY_CONFIG_PATH.format(camera_id=uuid4()) + "?applied_processing_fps=99"
+    )
+    assert r.status_code == 422
 
 
 def test_by_config_does_not_change_default_trend_endpoint() -> None:

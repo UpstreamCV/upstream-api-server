@@ -297,3 +297,73 @@ def test_has_processing_config_warning() -> None:
     assert not has_processing_config_warning(["other"], SELECTED_CLASSES_ANALYTICS_WARNING)
     assert not has_processing_config_warning(None, SELECTED_CLASSES_ANALYTICS_WARNING)
     assert not has_processing_config_warning("warnings", SELECTED_CLASSES_ANALYTICS_WARNING)
+
+
+# ---------------------------------------------------------------------------
+# M9.1: dedicated FPS dimensions.
+# ---------------------------------------------------------------------------
+
+
+def test_fps_extracted_from_valid_m7e_lineage() -> None:
+    block = _operator_block(warnings=["processing_fps_output_cadence_only"])
+    block["requested"]["processing_fps"] = 5
+    block["applied"]["processing_fps"] = 5
+    dims = extract_processing_config_dimensions(_snapshot_with_config(block))
+    assert dims.requested_processing_fps == 5
+    assert dims.applied_processing_fps == 5
+    assert dims.processing_config_warnings == ("processing_fps_output_cadence_only",)
+    # Existing dimensions are untouched by the FPS extraction.
+    assert dims.applied_selected_classes_key == "person"
+    assert dims.applied_confidence_threshold == 0.2
+
+
+def test_fps_requested_but_not_applied_extracts_request_only() -> None:
+    block = _operator_block(warnings=["processing_fps_requested_not_applied"])
+    block["requested"]["processing_fps"] = 5
+    block["applied"]["processing_fps"] = None
+    dims = extract_processing_config_dimensions(_snapshot_with_config(block))
+    assert dims.requested_processing_fps == 5
+    assert dims.applied_processing_fps is None
+
+
+def test_missing_fps_yields_null_dimensions() -> None:
+    dims = extract_processing_config_dimensions(_snapshot_with_config(_operator_block()))
+    assert dims.requested_processing_fps is None
+    assert dims.applied_processing_fps is None
+    # Pre-M8 snapshots stay all-None including FPS.
+    legacy = extract_processing_config_dimensions({"objects": []})
+    assert legacy.requested_processing_fps is None
+    assert legacy.applied_processing_fps is None
+
+
+def test_malformed_fps_yields_null() -> None:
+    block = _operator_block()
+    block["requested"]["processing_fps"] = "5"  # string rejected
+    block["applied"]["processing_fps"] = [5]  # list rejected
+    dims = extract_processing_config_dimensions(_snapshot_with_config(block))
+    assert dims.requested_processing_fps is None
+    assert dims.applied_processing_fps is None
+    block = _operator_block()
+    block["applied"]["processing_fps"] = True  # bool (int subclass) rejected
+    assert (
+        extract_processing_config_dimensions(_snapshot_with_config(block)).applied_processing_fps
+        is None
+    )
+
+
+def test_out_of_range_fps_yields_null() -> None:
+    for bad in (0, -1, 31, 1000):
+        block = _operator_block()
+        block["applied"]["processing_fps"] = bad
+        dims = extract_processing_config_dimensions(_snapshot_with_config(block))
+        assert dims.applied_processing_fps is None
+    # Boundary values survive.
+    for ok in (1, 30):
+        block = _operator_block()
+        block["applied"]["processing_fps"] = ok
+        assert (
+            extract_processing_config_dimensions(
+                _snapshot_with_config(block)
+            ).applied_processing_fps
+            == ok
+        )

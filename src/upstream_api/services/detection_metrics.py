@@ -70,6 +70,7 @@ insert into snapshot_detection_metrics (
     source,
     processing_config_source, processing_config_revision, processing_config_status,
     applied_model_key, applied_selected_classes_key, applied_confidence_threshold,
+    requested_processing_fps, applied_processing_fps,
     processing_config_warnings, selected_classes_analytics_counts_not_filtered
 )
 values (
@@ -81,7 +82,8 @@ values (
     $17,
     $18, $19, $20,
     $21, $22, $23,
-    $24, $25
+    $24, $25,
+    $26, $27
 )
 on conflict (camera_id, observed_at) do nothing
 returning id
@@ -172,6 +174,8 @@ async def write_detection_metrics_for_perception_snapshot(
         dimensions.applied_model_key,
         dimensions.applied_selected_classes_key,
         dimensions.applied_confidence_threshold,
+        dimensions.requested_processing_fps,
+        dimensions.applied_processing_fps,
         dimensions.warnings_list(),
         dimensions.selected_classes_analytics_counts_not_filtered,
     )

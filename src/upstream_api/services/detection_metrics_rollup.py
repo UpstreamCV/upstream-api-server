@@ -124,6 +124,7 @@ insert into detection_confidence_hourly_rollups (
     account_id, camera_id, stream_session_id, package_id,
     processing_config_source, processing_config_revision, processing_config_status,
     applied_model_key, applied_selected_classes_key, applied_confidence_threshold,
+    requested_processing_fps, applied_processing_fps,
     processing_config_warnings,
     bucket_start, bucket_end,
     metric_count, object_count_total, confidence_sample_count,
@@ -143,6 +144,8 @@ select
     nullif(coalesce(m.applied_selected_classes_key, ''), '') as applied_selected_classes_key,
     nullif(coalesce(m.applied_confidence_threshold, -1.0), -1.0)
                                                             as applied_confidence_threshold,
+    nullif(coalesce(m.requested_processing_fps, -1), -1)    as requested_processing_fps,
+    nullif(coalesce(m.applied_processing_fps, -1), -1)      as applied_processing_fps,
     nullif(coalesce(m.processing_config_warnings, '{}'::text[]), '{}'::text[])
                                                             as processing_config_warnings,
     date_trunc('hour', m.observed_at)                       as bucket_start,
@@ -175,6 +178,8 @@ select
           coalesce(m.applied_model_key, ''),
           coalesce(m.applied_selected_classes_key, ''),
           coalesce(m.applied_confidence_threshold, -1.0),
+          coalesce(m.requested_processing_fps, -1),
+          coalesce(m.applied_processing_fps, -1),
           coalesce(m.processing_config_warnings, '{}'::text[]),
           date_trunc('hour', m.observed_at)
 on conflict (account_id, camera_id, bucket_start, coalesce(package_id, ''),
@@ -184,6 +189,8 @@ on conflict (account_id, camera_id, bucket_start, coalesce(package_id, ''),
     coalesce(applied_model_key, ''),
     coalesce(applied_selected_classes_key, ''),
     coalesce(applied_confidence_threshold, -1.0),
+    coalesce(requested_processing_fps, -1),
+    coalesce(applied_processing_fps, -1),
     coalesce(processing_config_warnings, '{}'::text[])) do update set
     bucket_end                        = excluded.bucket_end,
     metric_count                      = excluded.metric_count,
@@ -327,6 +334,8 @@ class HourlyRollupBucket:
     applied_model_key: str | None
     applied_selected_classes_key: str | None
     applied_confidence_threshold: float | None
+    requested_processing_fps: int | None
+    applied_processing_fps: int | None
     processing_config_warnings: tuple[str, ...] | None
     bucket_start: datetime
     bucket_end: datetime
@@ -345,8 +354,9 @@ def _hour_floor(value: datetime) -> datetime:
     return value.replace(minute=0, second=0, microsecond=0)
 
 
-# The normalised M9 dimension tuple: (source, revision, status, model_key,
-# selected_classes_key, confidence_threshold, warnings).
+# The normalised M9/M9.1 dimension tuple: (source, revision, status,
+# model_key, selected_classes_key, confidence_threshold,
+# requested_processing_fps, applied_processing_fps, warnings).
 _ConfigDimensionKey = tuple[
     str | None,
     int | None,
@@ -354,6 +364,8 @@ _ConfigDimensionKey = tuple[
     str | None,
     str | None,
     float | None,
+    int | None,
+    int | None,
     tuple[str, ...] | None,
 ]
 
@@ -373,6 +385,8 @@ def _config_dimension_key(row: Mapping[str, Any]) -> _ConfigDimensionKey:
         row.get("applied_model_key") or None,
         row.get("applied_selected_classes_key") or None,
         row.get("applied_confidence_threshold"),
+        row.get("requested_processing_fps"),
+        row.get("applied_processing_fps"),
         tuple(warnings_raw) if warnings_raw else None,
     )
 
@@ -452,6 +466,8 @@ def compute_hourly_rollup_buckets(
             model_key,
             classes_key,
             threshold,
+            requested_fps,
+            applied_fps,
             warnings,
         ) = dims
         mins = [float(g["min_confidence"]) for g in grouped if g.get("min_confidence") is not None]
@@ -467,6 +483,8 @@ def compute_hourly_rollup_buckets(
                 applied_model_key=model_key,
                 applied_selected_classes_key=classes_key,
                 applied_confidence_threshold=threshold,
+                requested_processing_fps=requested_fps,
+                applied_processing_fps=applied_fps,
                 processing_config_warnings=warnings,
                 bucket_start=bucket_start,
                 bucket_end=bucket_start + timedelta(hours=1),

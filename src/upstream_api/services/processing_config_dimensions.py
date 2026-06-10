@@ -70,6 +70,13 @@ class ProcessingConfigDimensions:
     applied_model_key: str | None
     applied_selected_classes_key: str | None
     applied_confidence_threshold: float | None
+    # M9.1: dedicated FPS dimensions so reliability can compare default FPS vs
+    # an applied output-cadence cap (M7E). Requested is kept alongside applied
+    # here (unlike the other requested values) because "asked for 5, got
+    # default" vs "asked for nothing" is exactly the comparison FPS grouping
+    # exists to answer.
+    requested_processing_fps: int | None
+    applied_processing_fps: int | None
     processing_config_warnings: tuple[str, ...] | None
     selected_classes_analytics_counts_not_filtered: bool | None
 
@@ -88,6 +95,8 @@ EMPTY_PROCESSING_CONFIG_DIMENSIONS = ProcessingConfigDimensions(
     applied_model_key=None,
     applied_selected_classes_key=None,
     applied_confidence_threshold=None,
+    requested_processing_fps=None,
+    applied_processing_fps=None,
     processing_config_warnings=None,
     selected_classes_analytics_counts_not_filtered=None,
 )
@@ -107,6 +116,18 @@ def _coerce_revision(value: Any) -> int | None:
     if isinstance(value, bool):
         return None
     if isinstance(value, int) and value >= 0:
+        return value
+    return None
+
+
+def _coerce_fps(value: Any) -> int | None:
+    """A valid processing FPS: int in 1..30 (the API write-path bounds), else
+    ``None``. ``bool`` rejected (int subclass); floats/strings rejected; an
+    out-of-range int that somehow reached a snapshot degrades to ``None``
+    rather than polluting the grouping space."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int) and 1 <= value <= 30:
         return value
     return None
 
@@ -201,10 +222,17 @@ def extract_processing_config_dimensions(snapshot: Any) -> ProcessingConfigDimen
             applied.get("selected_classes")
         )
         applied_confidence_threshold = _coerce_threshold(applied.get("confidence_threshold"))
+        applied_processing_fps = _coerce_fps(applied.get("processing_fps"))
     else:
         applied_model_key = None
         applied_selected_classes_key = None
         applied_confidence_threshold = None
+        applied_processing_fps = None
+
+    requested = config_block.get("requested")
+    requested_processing_fps = (
+        _coerce_fps(requested.get("processing_fps")) if isinstance(requested, Mapping) else None
+    )
 
     warnings = _coerce_warnings(config_block.get("warnings"))
     return ProcessingConfigDimensions(
@@ -214,6 +242,8 @@ def extract_processing_config_dimensions(snapshot: Any) -> ProcessingConfigDimen
         applied_model_key=applied_model_key,
         applied_selected_classes_key=applied_selected_classes_key,
         applied_confidence_threshold=applied_confidence_threshold,
+        requested_processing_fps=requested_processing_fps,
+        applied_processing_fps=applied_processing_fps,
         processing_config_warnings=warnings,
         selected_classes_analytics_counts_not_filtered=has_processing_config_warning(
             warnings, SELECTED_CLASSES_ANALYTICS_WARNING

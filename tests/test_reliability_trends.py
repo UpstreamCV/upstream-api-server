@@ -147,13 +147,16 @@ def test_by_config_sql_groups_and_projects_dimension_columns() -> None:
         "applied_model_key",
         "applied_selected_classes_key",
         "applied_confidence_threshold",
+        "requested_processing_fps",
+        "applied_processing_fps",
         "processing_config_warnings",
     ):
         assert col in sql
     assert (
         "group by processing_config_source, processing_config_revision, "
         "processing_config_status, applied_model_key, applied_selected_classes_key, "
-        "applied_confidence_threshold, processing_config_warnings, bucket_start" in sql
+        "applied_confidence_threshold, requested_processing_fps, applied_processing_fps, "
+        "processing_config_warnings, bucket_start" in sql
     )
     # package_id stays blended (a config group can span packages) and tenant
     # columns are never projected.
@@ -171,6 +174,7 @@ def test_by_config_sql_pins_null_or_match_filters() -> None:
         "or applied_confidence_threshold = $9::double precision)" in sql
     )
     assert "and ($10::text is null or $10::text = any(processing_config_warnings))" in sql
+    assert "and ($11::int is null or applied_processing_fps = $11::int)" in sql
 
 
 def test_by_config_sql_weighting_mirrors_camera_level_query() -> None:
@@ -220,6 +224,8 @@ def _by_config_row(
     model_key: str | None = None,
     classes_key: str | None = None,
     threshold: float | None = None,
+    requested_fps: int | None = None,
+    applied_fps: int | None = None,
     warnings: list[str] | None = None,
 ) -> dict[str, Any]:
     start = _T0_SPLIT + timedelta(hours=hour)
@@ -230,6 +236,8 @@ def _by_config_row(
         "applied_model_key": model_key,
         "applied_selected_classes_key": classes_key,
         "applied_confidence_threshold": threshold,
+        "requested_processing_fps": requested_fps,
+        "applied_processing_fps": applied_fps,
         "processing_config_warnings": warnings,
         "bucket_start": start,
         "bucket_end": start + timedelta(hours=1),
@@ -375,3 +383,19 @@ def test_summary_single_rated_point() -> None:
     assert s.lowest_avg_confidence == 0.73
     assert s.highest_avg_confidence == 0.73
     assert s.total_confidence_samples == 42
+
+
+def test_split_fps_identity_distinguishes_groups() -> None:
+    """M9.1: same scalar dims but different applied FPS are different groups,
+    and both FPS fields round-trip into the group model."""
+    rows = [
+        _by_config_row(0, avg=0.7, samples=10, revision=5, requested_fps=5, applied_fps=5),
+        _by_config_row(0, avg=0.9, samples=10, revision=6, requested_fps=1, applied_fps=1),
+        _by_config_row(0, avg=0.5, samples=10),  # default-FPS (null) history
+    ]
+    groups = _split_rows_into_config_groups(rows)
+    assert len(groups) == 3
+    by_fps = {g.applied_processing_fps: g for g in groups}
+    assert set(by_fps) == {5, 1, None}
+    assert by_fps[5].requested_processing_fps == 5
+    assert by_fps[None].requested_processing_fps is None
