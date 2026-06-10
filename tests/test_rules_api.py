@@ -507,5 +507,7 @@ def test_enabled_rules_sql_pins_predicates() -> None:
 def test_insert_alert_sql_pins_cooldown_guard() -> None:
     sql = _INSERT_ALERT_SQL
     assert "where not exists" in sql
-    assert "make_interval(secs => $9)" in sql
+    assert "make_interval(secs => $10)" in sql
     assert "where rule_id = $3" in sql
+    # M2: every alert carries the workflow run that created it.
+    assert "workflow_run_id" in sql

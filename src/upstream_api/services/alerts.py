@@ -14,8 +14,8 @@ import asyncpg
 
 _LIST_ALERTS_SQL = """
 select
-    id, camera_id, rule_id, observation_id, severity, status,
-    title, message, payload, created_at, read_at, resolved_at
+    id, camera_id, rule_id, observation_id, workflow_run_id, severity,
+    status, title, message, payload, created_at, read_at, resolved_at
   from alerts
  where account_id = $1
    and ($2::text is null or status = $2)
@@ -30,8 +30,8 @@ update alerts
    set read_at = coalesce(read_at, now())
  where account_id = $1
    and id = $2
-returning id, camera_id, rule_id, observation_id, severity, status,
-          title, message, payload, created_at, read_at, resolved_at
+returning id, camera_id, rule_id, observation_id, workflow_run_id, severity,
+          status, title, message, payload, created_at, read_at, resolved_at
 """
 
 # Resolving also stamps read_at — a resolved-but-unread alert makes no sense
@@ -43,8 +43,8 @@ update alerts
        read_at     = coalesce(read_at, now())
  where account_id = $1
    and id = $2
-returning id, camera_id, rule_id, observation_id, severity, status,
-          title, message, payload, created_at, read_at, resolved_at
+returning id, camera_id, rule_id, observation_id, workflow_run_id, severity,
+          status, title, message, payload, created_at, read_at, resolved_at
 """
 
 

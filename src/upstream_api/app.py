@@ -36,6 +36,7 @@ from upstream_api.routers import (
     snapshots,
     stream_sessions,
     users,
+    workflow_runs,
 )
 from upstream_api.services.http_client import build_http_client
 
@@ -109,7 +110,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(users.router)
     app.include_router(accounts.router)
     app.include_router(dashboard.router)
-    app.include_router(rules.router)  # /v1/rules (Rules/Triggers M1)
-    app.include_router(alerts.router)  # /v1/alerts (Rules/Triggers M1)
+    app.include_router(rules.router)  # /v1/rules (Workflow Engine M1)
+    app.include_router(alerts.router)  # /v1/alerts (Workflow Engine M1)
+    app.include_router(workflow_runs.router)  # /v1/workflow-runs (Workflow Engine M2)
 
     return app

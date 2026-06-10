@@ -22,6 +22,10 @@ import asyncpg
 
 from upstream_api.schemas.rules import RuleCreateRequest
 from upstream_api.services.processor import coerce_jsonb
+from upstream_api.services.workflow_runs import (
+    finalize_workflow_run,
+    insert_workflow_run,
+)
 
 # Observation types this MVP evaluates, mapped to the rule_type they trigger.
 # processor.zone_exited / dwell_started / dwell_updated / roi heartbeats with
@@ -95,18 +99,19 @@ select id, name, rule_type, config, severity, cooldown_seconds
    and enabled
 """
 
-# Cooldown guard evaluated in the same statement as the insert.
+# Cooldown guard evaluated in the same statement as the insert. M2: the
+# alert carries the workflow_run_id of the run whose action step created it.
 _INSERT_ALERT_SQL = """
 insert into alerts (
-    account_id, camera_id, rule_id, observation_id,
+    account_id, camera_id, rule_id, observation_id, workflow_run_id,
     severity, title, message, payload
 )
-select $1, $2, $3, $4, $5, $6, $7, $8::jsonb
+select $1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb
  where not exists (
     select 1
       from alerts
      where rule_id = $3
-       and created_at > now() - make_interval(secs => $9)
+       and created_at > now() - make_interval(secs => $10)
  )
 returning id
 """
@@ -251,6 +256,13 @@ async def evaluate_observation(
 ) -> int:
     """Evaluate enabled rules for one just-ingested observation.
 
+    Workflow Engine M2: every MATCH produces a workflow_run — the system of
+    record — whether or not the action step sends an alert. The run opens
+    'active', the cooldown-guarded alert insert is the action step, and the
+    run is finalized 'completed' (alert_created) or 'suppressed'
+    (alert_suppressed_cooldown) in the same request. Non-matching and
+    disabled rules produce no run.
+
     Returns the number of alerts created (0 when no rule matches or every
     matching rule is inside its cooldown window).
     """
@@ -264,18 +276,56 @@ async def evaluate_observation(
         config = coerce_jsonb(row["config"])
         if not rule_matches(row["rule_type"], config, payload):
             continue
-        new_id = await conn.fetchval(
+        summary = build_alert_message(row["rule_type"], payload)
+        run_id = await insert_workflow_run(
+            conn,
+            account_id=account_id,
+            camera_id=camera_id,
+            rule_id=row["id"],
+            trigger_observation_id=observation_id,
+            workflow_type="simple_rule",
+            title=row["name"],
+            summary=summary,
+            trigger_type=observation_type,
+            evidence=payload,
+            # Snapshot the rule definition so the run stays interpretable
+            # after the rule is edited or deleted.
+            payload={
+                "rule": {
+                    "id": str(row["id"]),
+                    "rule_type": row["rule_type"],
+                    "config": config,
+                    "severity": row["severity"],
+                    "cooldown_seconds": row["cooldown_seconds"],
+                }
+            },
+        )
+        alert_id = await conn.fetchval(
             _INSERT_ALERT_SQL,
             account_id,
             camera_id,
             row["id"],
             observation_id,
+            run_id,
             row["severity"],
             row["name"],
-            build_alert_message(row["rule_type"], payload),
+            summary,
             json.dumps(payload),
             float(row["cooldown_seconds"]),
         )
-        if new_id is not None:
+        if alert_id is not None:
             created += 1
+            await finalize_workflow_run(
+                conn,
+                workflow_run_id=run_id,
+                status="completed",
+                action_result="alert_created",
+            )
+        else:
+            await finalize_workflow_run(
+                conn,
+                workflow_run_id=run_id,
+                status="suppressed",
+                action_result="alert_suppressed_cooldown",
+            )
     return created

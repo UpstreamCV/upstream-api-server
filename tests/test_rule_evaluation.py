@@ -133,7 +133,8 @@ def test_build_alert_message_uses_labels_over_ids() -> None:
 
 
 class FakeEvalConn:
-    """Backs the enabled-rules fetch + the cooldown-guarded alert insert.
+    """Backs the enabled-rules fetch, the workflow-run lifecycle, and the
+    cooldown-guarded alert insert (Workflow Engine M2 flow).
 
     ``recent_alert_rule_ids`` simulates rules whose latest alert is inside
     the cooldown window: the guarded insert returns no id for them, exactly
@@ -149,6 +150,10 @@ class FakeEvalConn:
         self.rules = rules or []
         self.recent_alert_rule_ids = recent_alert_rule_ids or set()
         self.alert_inserts: list[tuple[Any, ...]] = []
+        self.run_inserts: list[tuple[Any, ...]] = []
+        # (workflow_run_id, status, action_result) per finalize call.
+        self.run_finalizes: list[tuple[Any, ...]] = []
+        self.run_ids: list[UUID] = []
 
     async def fetch(self, query: str, *args: Any) -> list[dict[str, Any]]:
         assert "from rules" in query
@@ -163,12 +168,22 @@ class FakeEvalConn:
         ]
 
     async def fetchval(self, query: str, *args: Any) -> Any:
+        if "insert into workflow_runs" in query:
+            self.run_inserts.append(args)
+            run_id = uuid4()
+            self.run_ids.append(run_id)
+            return run_id
         assert "insert into alerts" in query
         rule_id = args[2]
         if rule_id in self.recent_alert_rule_ids:
             return None  # cooldown guard suppressed the insert
         self.alert_inserts.append(args)
         return uuid4()
+
+    async def execute(self, query: str, *args: Any) -> str:
+        assert "update workflow_runs" in query
+        self.run_finalizes.append(args)
+        return "UPDATE 1"
 
 
 def _eval_rule(
@@ -197,11 +212,12 @@ async def test_matching_rule_creates_alert() -> None:
     account, camera = uuid4(), uuid4()
     rule = _eval_rule(account_id=account, camera_id=camera, severity="critical")
     conn = FakeEvalConn(rules=[rule])
+    observation_id = uuid4()
     created = await evaluate_observation(
         conn,  # type: ignore[arg-type]
         account_id=account,
         camera_id=camera,
-        observation_id=uuid4(),
+        observation_id=observation_id,
         observation_type="processor.line_crossing",
         payload={"line_id": "line-1", "line_label": "Front door"},
     )
@@ -210,11 +226,46 @@ async def test_matching_rule_creates_alert() -> None:
     assert args[0] == account
     assert args[1] == camera
     assert args[2] == rule["id"]
-    assert args[4] == "critical"  # severity stamped from the rule
-    assert args[5] == "Rule"  # rule name becomes the alert title
-    assert "Front door" in args[6]
-    assert json.loads(args[7]) == {"line_id": "line-1", "line_label": "Front door"}
-    assert args[8] == 300.0
+    assert args[4] == conn.run_ids[0]  # alert linked to the workflow run
+    assert args[5] == "critical"  # severity stamped from the rule
+    assert args[6] == "Rule"  # rule name becomes the alert title
+    assert "Front door" in args[7]
+    assert json.loads(args[8]) == {"line_id": "line-1", "line_label": "Front door"}
+    assert args[9] == 300.0
+
+
+async def test_matching_rule_creates_workflow_run() -> None:
+    """M2: a match is recorded as a workflow run — the system of record —
+    with the rule snapshot in payload and the observation as evidence."""
+    account, camera = uuid4(), uuid4()
+    rule = _eval_rule(account_id=account, camera_id=camera, severity="critical")
+    conn = FakeEvalConn(rules=[rule])
+    observation_id = uuid4()
+    await evaluate_observation(
+        conn,  # type: ignore[arg-type]
+        account_id=account,
+        camera_id=camera,
+        observation_id=observation_id,
+        observation_type="processor.line_crossing",
+        payload={"line_id": "line-1", "line_label": "Front door"},
+    )
+    assert len(conn.run_inserts) == 1
+    args = conn.run_inserts[0]
+    assert args[0] == account
+    assert args[1] == camera
+    assert args[2] == rule["id"]
+    assert args[3] == observation_id
+    assert args[4] == "simple_rule"
+    assert args[5] == "Rule"  # rule name becomes the run title
+    assert "Front door" in args[6]  # summary
+    assert args[7] == "processor.line_crossing"  # trigger_type
+    assert json.loads(args[8]) == {"line_id": "line-1", "line_label": "Front door"}
+    rule_snapshot = json.loads(args[9])["rule"]
+    assert rule_snapshot["rule_type"] == "line_crossing"
+    assert rule_snapshot["severity"] == "critical"
+    assert rule_snapshot["cooldown_seconds"] == 300
+    # Finalized completed with the alert as the action outcome.
+    assert conn.run_finalizes == [(conn.run_ids[0], "completed", "alert_created")]
 
 
 async def test_unmapped_observation_type_is_a_noop() -> None:
@@ -244,9 +295,15 @@ async def test_non_matching_config_creates_nothing() -> None:
     )
     assert created == 0
     assert conn.alert_inserts == []
+    # Non-matching rules produce no workflow run either — runs record
+    # matches, not evaluations.
+    assert conn.run_inserts == []
 
 
-async def test_cooldown_suppresses_repeat_alert() -> None:
+async def test_cooldown_suppresses_repeat_alert_but_still_records_run() -> None:
+    """M2: cooldown suppression is itself a workflow outcome — the run is
+    still created (suppressed / alert_suppressed_cooldown), no duplicate
+    alert."""
     account, camera = uuid4(), uuid4()
     rule = _eval_rule(account_id=account, camera_id=camera)
     conn = FakeEvalConn(rules=[rule], recent_alert_rule_ids={rule["id"]})
@@ -260,6 +317,8 @@ async def test_cooldown_suppresses_repeat_alert() -> None:
     )
     assert created == 0
     assert conn.alert_inserts == []
+    assert len(conn.run_inserts) == 1
+    assert conn.run_finalizes == [(conn.run_ids[0], "suppressed", "alert_suppressed_cooldown")]
 
 
 async def test_two_matching_rules_create_two_alerts() -> None:
@@ -309,6 +368,8 @@ class FakeIngestConn:
         self.rules_fetch_raises = rules_fetch_raises
         self.observation_inserts: list[tuple[Any, ...]] = []
         self.alert_inserts: list[tuple[Any, ...]] = []
+        self.run_inserts: list[tuple[Any, ...]] = []
+        self.run_finalizes: list[tuple[Any, ...]] = []
 
     def transaction(self) -> FakeTransaction:
         return FakeTransaction()
@@ -333,10 +394,18 @@ class FakeIngestConn:
         if "insert into observations" in query:
             self.observation_inserts.append(args)
             return uuid4()
+        if "insert into workflow_runs" in query:
+            self.run_inserts.append(args)
+            return uuid4()
         if "insert into alerts" in query:
             self.alert_inserts.append(args)
             return uuid4()
         return None
+
+    async def execute(self, query: str, *args: Any) -> str:
+        assert "update workflow_runs" in query
+        self.run_finalizes.append(args)
+        return "UPDATE 1"
 
 
 class AcquireCtx:
@@ -422,9 +491,15 @@ def test_ingest_with_matching_rule_creates_alert() -> None:
     assert r.status_code == 200, r.text
     assert len(conn.observation_inserts) == 1
     assert len(conn.alert_inserts) == 1
+    # M2: the match is also recorded as a workflow run, finalized completed.
+    assert len(conn.run_inserts) == 1
+    assert len(conn.run_finalizes) == 1
+    assert conn.run_finalizes[0][1:] == ("completed", "alert_created")
     # Tenant columns derived from the session row, never the request.
     assert conn.alert_inserts[0][0] == account
     assert conn.alert_inserts[0][1] == camera
+    assert conn.run_inserts[0][0] == account
+    assert conn.run_inserts[0][1] == camera
 
 
 def test_ingest_with_no_rules_creates_no_alert() -> None:
@@ -457,6 +532,8 @@ def test_ingest_with_disabled_rule_creates_no_alert() -> None:
     r = _client(conn).post(_OBS_PATH, json=_observation_body(session_id), headers=_headers())
     assert r.status_code == 200, r.text
     assert conn.alert_inserts == []
+    # Disabled rules never reach the matcher, so no workflow run either.
+    assert conn.run_inserts == []
 
 
 def test_rule_evaluation_failure_never_fails_ingest() -> None:
