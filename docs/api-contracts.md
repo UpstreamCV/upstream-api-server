@@ -1590,3 +1590,137 @@ account; 404 `camera_not_found` on cross-account.
 
 `POST /v1/stream-sessions/start` rejects cameras with `agent_id IS NULL`
 with 409 `camera_unassigned` — claim before streaming.
+
+## Endpoints — Rules/Triggers M1 (auth: `current_user`)
+
+First milestone of the Rules/Triggers + Alerts product track (numbered
+separately from the reliability milestone sequence). Users author rules over
+processor observations; matched rules raise alerts into a dashboard inbox.
+
+Migration: `20260612120000_rules_and_alerts.sql` — creates `rules` and
+`alerts` (both RLS member-select + `GRANT SELECT TO authenticated`).
+`rules.rule_type` is open vocabulary at the DB layer (same posture as
+`observations.type`); the API schema layer enforces the currently-supported
+set, so new types ship without a migration.
+
+Evaluation runs inline on `POST /v1/internal/processor/observations`:
+after the observation insert, the evaluator fetches enabled rules for the
+camera matching the observation's rule type, runs a pure matcher per rule,
+and inserts alerts. The whole step is savepoint-isolated (mirroring the M5
+detection-metrics write) — it can NEVER fail observation ingest, including
+when the migration has not been applied yet. Tenant columns are derived
+from the session row, never the request.
+
+Rule types and per-type `config` keys (all optional unless noted):
+
+| `rule_type`      | fires on observation type   | config keys                          |
+|------------------|-----------------------------|--------------------------------------|
+| `line_crossing`  | `processor.line_crossing`   | `line_id`                            |
+| `roi_occupancy`  | `processor.roi_occupancy`   | `roi_id`, `min_total_count` (int ≥1) |
+| `zone_entered`   | `processor.zone_entered`    | `zone_id`                            |
+| `dwell_exceeded` | `processor.dwell_exceeded`  | `zone_id`, `min_duration_seconds` (>0) |
+
+Match semantics: a missing optional filter key means "match any"; a payload
+missing the field a filter needs does NOT match (a rule scoped to line A
+never fires on an observation that can't prove it came from line A).
+Unknown config keys are rejected at authoring time (422 `invalid_rule_config`)
+so typos surface immediately instead of as silently-never-matching rules.
+
+Flood control: `cooldown_seconds` (0–86400, default 300) is the minimum gap
+between two alerts from the same rule, enforced by a same-statement
+`NOT EXISTS` guard on insert. Worst case under concurrency is one duplicate
+alert across two connections (accepted for M1).
+
+Deferred (need a periodic evaluator that does not exist yet):
+`camera_offline`, `no_detections_for_n_minutes`; email/webhook delivery.
+
+### `POST /v1/rules`
+
+Auth: `current_user`, owner/admin on `account_id`. Camera must belong to the
+account (404 `camera_not_found` otherwise — anti-enumeration).
+
+Request:
+```json
+{
+  "account_id": "uuid",
+  "camera_id": "uuid",
+  "name": "Front door crossing",
+  "rule_type": "line_crossing",
+  "enabled": true,
+  "config": {"line_id": "line-1"},
+  "severity": "warning",
+  "cooldown_seconds": 300
+}
+```
+
+Response 201: the rule (no `account_id` echoed — same posture as the
+observations read path).
+```json
+{
+  "id": "uuid", "camera_id": "uuid", "name": "Front door crossing",
+  "rule_type": "line_crossing", "enabled": true,
+  "config": {"line_id": "line-1"}, "severity": "warning",
+  "cooldown_seconds": 300, "created_by": "uuid",
+  "created_at": "…", "updated_at": "…"
+}
+```
+
+Errors: 403 `forbidden` (viewer), 404 `camera_not_found`,
+422 `invalid_rule_config` (details.problems lists each issue),
+422 validation_error (unknown `rule_type`, bad `cooldown_seconds`).
+
+### `GET /v1/rules?account_id=…&camera_id=…`
+
+Auth: `current_user`, any member. `camera_id` optional filter. Newest first.
+Response 200: `{"rules": [RuleSummary, …]}`.
+
+### `GET /v1/rules/{rule_id}?account_id=…`
+
+Auth: `current_user`, any member. 404 `rule_not_found` for unknown or
+cross-tenant ids.
+
+### `PATCH /v1/rules/{rule_id}?account_id=…`
+
+Auth: `current_user`, owner/admin. Partial update of `name`, `enabled`,
+`config`, `severity`, `cooldown_seconds`. `rule_type` is immutable — delete
+and recreate to change it. A patched `config` is re-validated against the
+stored type. Response 200: the updated rule.
+
+### `DELETE /v1/rules/{rule_id}?account_id=…`
+
+Auth: `current_user`, owner/admin. 204 on success, 404 `rule_not_found`.
+Alerts the rule raised survive (their `rule_id` becomes null).
+
+### `GET /v1/alerts?account_id=…&status=…&camera_id=…&limit=…`
+
+Auth: `current_user`, any member. `status` ∈ {`open`, `resolved`} (optional),
+`camera_id` optional, `limit` 1–200 default 50. Newest first.
+
+Response 200:
+```json
+{
+  "alerts": [{
+    "id": "uuid", "camera_id": "uuid", "rule_id": "uuid",
+    "observation_id": "uuid", "severity": "warning", "status": "open",
+    "title": "Front door crossing",
+    "message": "Line crossing detected on Front door.",
+    "payload": {"line_id": "line-1", "count_delta": 1},
+    "created_at": "…", "read_at": null, "resolved_at": null
+  }]
+}
+```
+
+`payload` is the matched observation's payload (evidence snapshot).
+`observation_id` is a soft reference — the observations log may be pruned.
+
+### `POST /v1/alerts/{alert_id}/read`
+
+Auth: `current_user`, any member. Sets `read_at` once (idempotent — repeat
+calls return the same timestamp). Response 200: the alert.
+404 `alert_not_found` for unknown/cross-tenant ids.
+
+### `POST /v1/alerts/{alert_id}/resolve`
+
+Auth: `current_user`, owner/admin (resolution is a workflow decision, not a
+view state). Sets `status='resolved'`, `resolved_at`, and `read_at` if
+unset. Idempotent. Response 200: the alert.

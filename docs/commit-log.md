@@ -4,6 +4,80 @@ Reverse chronological. Newest at top. Every meaningful commit gets an entry foll
 
 ---
 
+## 2026-06-10 - Rules/Triggers M1: user-authored alert rules + alert inbox API
+
+### Summary
+First milestone of the Rules/Triggers + Alerts product track (numbered
+separately from the reliability milestone sequence). Users author per-camera
+rules over processor observations (`line_crossing`, `roi_occupancy`,
+`zone_entered`, `dwell_exceeded`); a matched rule raises an alert with a
+per-rule cooldown. Evaluation runs inline on the observation ingest path,
+savepoint-isolated exactly like the M5 detection-metrics write, so a failing
+(or not-yet-migrated) rules layer can never fail observation ingest. This
+closes the core MVP loop: connect camera → draw geometry → create rule →
+get alert.
+
+### Files touched
+- `supabase/migrations/20260612120000_rules_and_alerts.sql` — `rules` +
+  `alerts` tables; RLS member-select; `GRANT SELECT TO authenticated`;
+  `rule_type` open-vocab at the DB layer (CHECKs only on severity/status,
+  which the dashboard switches on); partial index on enabled rules per
+  camera for the evaluation hot path.
+- `src/upstream_api/schemas/rules.py` — `RuleType` Literal, create/patch/
+  summary models, pure `validate_rule_config` (per-type allowed keys +
+  value checks).
+- `src/upstream_api/schemas/alerts.py` — `AlertSummary`, list response.
+- `src/upstream_api/services/rules.py` — rule CRUD SQL + functions; pure
+  `rule_matches` / `build_alert_message`; `evaluate_observation` (enabled
+  rules fetch → matcher → cooldown-guarded alert insert via same-statement
+  `NOT EXISTS` + `make_interval`).
+- `src/upstream_api/services/alerts.py` — inbox list + idempotent
+  read/resolve transitions (coalesce-once timestamps).
+- `src/upstream_api/routers/rules.py` — `/v1/rules` CRUD; owner/admin
+  mutations, member reads; camera-ownership 404 (anti-enumeration);
+  `rule_type` immutable on PATCH (config re-validated against stored type);
+  422 `invalid_rule_config`.
+- `src/upstream_api/routers/alerts.py` — `/v1/alerts` list (status/camera/
+  limit filters), `POST {id}/read` (any member), `POST {id}/resolve`
+  (owner/admin).
+- `src/upstream_api/routers/processor.py` — `_evaluate_rules_safe` hook in
+  `post_observation` (own savepoint, scalar-id-only warning log).
+- `src/upstream_api/app.py` — register both routers.
+- `docs/api-contracts.md` — new "Endpoints — Rules/Triggers M1" section.
+
+### Functions/classes changed
+- `evaluate_observation` — maps observation type → rule type, fetches
+  enabled rules for the camera, inserts one alert per matching rule unless
+  the rule's latest alert is inside `cooldown_seconds`.
+- `rule_matches` — pure; missing optional filter = match-any; a payload
+  missing a filtered field never matches.
+- `post_observation` — unchanged contract; now best-effort evaluates rules
+  after the observation insert.
+
+### System interaction notes
+`current_processor → POST /v1/internal/processor/observations →
+insert_observation → savepoint[evaluate_observation → rules fetch →
+rule_matches → cooldown-guarded alerts insert]`. Dashboard reads/writes via
+`current_user`: `/v1/rules` (authoring) and `/v1/alerts` (inbox).
+
+### Testing/checks
+`make test` — 774 passed (88 new across `tests/test_rules_api.py`,
+`tests/test_rule_evaluation.py`, `tests/test_alerts_api.py`: CRUD + role
+gating + cross-tenant 404s + config validation; matcher truth table;
+service-level cooldown; route-level savepoint contract; SQL-pinning tests).
+`make lint` clean; `uv run mypy src` clean. Migration not applied to a live
+DB in this pass (no local Supabase running) — `db push` is a deploy step.
+
+### Follow-up TODOs
+- `camera_offline` / `no_detections_for_n_minutes` rule types need a
+  periodic evaluator (none exists; reliability evaluates on-read).
+- Email/webhook delivery (Module 6); the inbox is in-app only.
+- Cooldown guard can double-fire across two concurrent connections; a
+  unique time-bucket key tightens it without an API change.
+- Alert retention/pruning (same posture as heartbeats/observations).
+- Realtime publication for `alerts` if the dashboard wants push instead of
+  the 10s poll.
+
 ## 2026-06-10 - ci: fix mypy errors in reliability/model-config tests, bump Node 20 actions
 
 ### Summary

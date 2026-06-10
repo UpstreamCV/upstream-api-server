@@ -23,6 +23,7 @@ from upstream_api.routers import (
     accounts,
     admin,
     agents,
+    alerts,
     api_tokens,
     cameras,
     dashboard,
@@ -31,6 +32,7 @@ from upstream_api.routers import (
     models,
     processor,
     reliability,
+    rules,
     snapshots,
     stream_sessions,
     users,
@@ -107,5 +109,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(users.router)
     app.include_router(accounts.router)
     app.include_router(dashboard.router)
+    app.include_router(rules.router)  # /v1/rules (Rules/Triggers M1)
+    app.include_router(alerts.router)  # /v1/alerts (Rules/Triggers M1)
 
     return app

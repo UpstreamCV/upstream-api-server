@@ -48,6 +48,7 @@ from upstream_api.services.processor import (
     upsert_perception_snapshot,
     upsert_processor_status,
 )
+from upstream_api.services.rules import evaluate_observation
 from upstream_api.services.stream_validation import SessionStateRow, load_session_state
 
 _logger = get_logger("processor")
@@ -192,6 +193,41 @@ async def report_status(
     )
 
 
+async def _evaluate_rules_safe(
+    conn: asyncpg.Connection,
+    *,
+    session: SessionStateRow,
+    body: ProcessorObservationRequest,
+    observation_id: UUID,
+) -> None:
+    """Evaluate user-authored rules for the just-ingested observation
+    (Rules/Triggers M1).
+
+    Best-effort alerting: this must NEVER fail the observation ingest. It
+    runs in its own savepoint so any failure — including the rules/alerts
+    tables not existing yet (before the migration applies) — rolls back only
+    the alert writes and leaves the observation insert that already ran in
+    the parent transaction intact. We log the failure with scalar ids only
+    (never the observation payload or any secret).
+    """
+    try:
+        async with conn.transaction():
+            await evaluate_observation(
+                conn,
+                account_id=session.account_id,
+                camera_id=session.camera_id,
+                observation_id=observation_id,
+                observation_type=body.type,
+                payload=body.payload,
+            )
+    except Exception as exc:
+        _logger.warning(
+            "rule_evaluation_failed",
+            camera_id=str(session.camera_id),
+            error=type(exc).__name__,
+        )
+
+
 @router.post("/observations", response_model=ProcessorObservationResponse)
 async def post_observation(
     body: ProcessorObservationRequest,
@@ -213,6 +249,15 @@ async def post_observation(
             account_id=session.account_id,
             camera_id=session.camera_id,
             req=body,
+        )
+        # Rules/Triggers M1: evaluate user-authored rules against this
+        # observation. Best-effort — isolated in a savepoint so it can never
+        # break observation ingest.
+        await _evaluate_rules_safe(
+            conn,
+            session=session,
+            body=body,
+            observation_id=new_id,
         )
 
     return ProcessorObservationResponse(id=new_id, count=1)
