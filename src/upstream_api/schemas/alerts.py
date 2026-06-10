@@ -21,6 +21,9 @@ class AlertSummary(BaseModel):
     camera_id: UUID
     rule_id: UUID | None
     observation_id: UUID | None
+    # M2: the workflow run whose action step created this alert. Nullable —
+    # alerts written before the workflow_runs migration have no run.
+    workflow_run_id: UUID | None
     severity: str
     status: str
     title: str

@@ -4,6 +4,86 @@ Reverse chronological. Newest at top. Every meaningful commit gets an entry foll
 
 ---
 
+## 2026-06-10 - Workflow Engine M2: workflow runs + internal event history
+
+### Summary
+Second milestone of the Workflow Engine product track (NOT a reliability
+milestone, and not an alerts feature). M1 — originally labeled
+"Rules/Triggers M1", re-labeled "Workflow Engine M1 — Simple Rules + In-App
+Alerts" — made rules send alerts. M2 makes Upstream the system of record for
+camera workflows: every rule match now produces a `workflow_run` with
+evidence (the triggering observation payload), a rule-definition snapshot,
+status, and action outcome — recorded whether or not an alert was sent. A
+cooldown-suppressed match still produces a run
+(suppressed/alert_suppressed_cooldown); alerts are now one action/output of
+a run, linked via `alerts.workflow_run_id`. The rules table acts as the
+workflow definition layer (`workflow_type='simple_rule'`) — no separate
+workflows table, no M1 rename/refactor.
+
+### Files touched
+- `supabase/migrations/20260613120000_workflow_runs.sql` — `workflow_runs`
+  table (status CHECK incl. reserved 'failed'/'action_required'; open-vocab
+  workflow_type/trigger_type/action_result; nullable camera_id so future
+  account-wide workflows need no migration; RLS + grant) and
+  `alerts.workflow_run_id` (FK on alerts side — insert-run → insert-alert →
+  finalize-run, no circular reference).
+- `src/upstream_api/schemas/workflow_runs.py` — run summary/list models +
+  `WorkflowRunAlertRef`; read fields are plain `str` where the column is
+  open vocabulary.
+- `src/upstream_api/services/workflow_runs.py` — run lifecycle SQL
+  (insert/finalize, used only by the evaluator) + history reads (left join
+  to the related alert).
+- `src/upstream_api/services/rules.py` — `evaluate_observation` now wraps
+  the alert action in a run: insert run (active) → cooldown-guarded alert
+  insert carrying workflow_run_id → finalize (completed/alert_created or
+  suppressed/alert_suppressed_cooldown). Alert insert SQL renumbered for the
+  new column. Non-matching and disabled rules produce no run.
+- `src/upstream_api/services/alerts.py`, `schemas/alerts.py`,
+  `routers/alerts.py` — alert responses expose `workflow_run_id`.
+- `src/upstream_api/routers/workflow_runs.py` — `GET /v1/workflow-runs`
+  (status/camera/rule/limit filters) + `GET /v1/workflow-runs/{id}`; any
+  member; read-path only.
+- `src/upstream_api/app.py` — register router; M1 router comments
+  re-labeled Workflow Engine M1.
+- `docs/api-contracts.md` — M1 section re-label note + new
+  "Endpoints — Workflow Engine M2" section.
+
+### Functions/classes changed
+- `evaluate_observation` — same matcher, same return value (alerts
+  created); now records a run per match and finalizes it with the action
+  outcome.
+- `insert_workflow_run` / `finalize_workflow_run` — two-step lifecycle so
+  the alert can reference the run id, and so future multi-step workflows
+  can hold runs open across requests.
+
+### System interaction notes
+`current_processor → POST /v1/internal/processor/observations →
+insert_observation → savepoint[rules fetch → rule_matches →
+insert_workflow_run → cooldown-guarded alert insert (workflow_run_id) →
+finalize_workflow_run]`. The M1 savepoint contract is untouched: run and
+alert writes roll back together, and a failing/unmigrated workflow layer
+can never fail observation ingest (route-level test pins this). Dashboard
+reads via `current_user`: `/v1/workflow-runs`.
+
+### Testing/checks
+`make test` — 788 passed (14 new in `tests/test_workflow_runs_api.py`:
+filters, tenancy, member access, invalid status/limit 422s, response shape,
+SQL pinning; `tests/test_rule_evaluation.py` extended: run created with
+evidence + rule snapshot, alert linked to run, cooldown still records a
+suppressed run with no duplicate alert, non-matching/disabled rules record
+nothing, savepoint contract). `make lint` clean; `uv run mypy src` clean.
+Migration not applied to a live DB in this pass — `db push` is a deploy
+step; until then the savepoint absorbs the missing tables.
+
+### Follow-up TODOs
+- `workflow_run_events` step table when multi-step sequencing lands
+  (deferred; evidence/payload jsonb covers M2).
+- Review/acknowledge mutation (`action_required` is reserved in the CHECK
+  but nothing produces it; reviewed_at/reviewed_by columns deferred with it).
+- Multi-step sequencing, multi-camera/account-wide workflows, visual
+  builder, delivery channels — all still deferred by design.
+- Run retention/pruning (same posture as alerts/observations).
+
 ## 2026-06-10 - Rules/Triggers M1: user-authored alert rules + alert inbox API
 
 ### Summary

@@ -1591,11 +1591,16 @@ account; 404 `camera_not_found` on cross-account.
 `POST /v1/stream-sessions/start` rejects cameras with `agent_id IS NULL`
 with 409 `camera_unassigned` — claim before streaming.
 
-## Endpoints — Rules/Triggers M1 (auth: `current_user`)
+## Endpoints — Workflow Engine M1 (auth: `current_user`)
 
-First milestone of the Rules/Triggers + Alerts product track (numbered
-separately from the reliability milestone sequence). Users author rules over
-processor observations; matched rules raise alerts into a dashboard inbox.
+> Originally shipped as "Rules/Triggers M1"; re-labeled when the Workflow
+> Engine track was named. Same endpoints, same numbering position: this is
+> the first milestone of the Workflow Engine product track (separate from
+> the reliability milestone sequence). M1 = simple rules + in-app alerts;
+> M2 (below) reframes every rule match as a workflow run.
+
+Users author rules over processor observations; matched rules raise alerts
+into a dashboard inbox.
 
 Migration: `20260612120000_rules_and_alerts.sql` — creates `rules` and
 `alerts` (both RLS member-select + `GRANT SELECT TO authenticated`).
@@ -1724,3 +1729,88 @@ calls return the same timestamp). Response 200: the alert.
 Auth: `current_user`, owner/admin (resolution is a workflow decision, not a
 view state). Sets `status='resolved'`, `resolved_at`, and `read_at` if
 unset. Idempotent. Response 200: the alert.
+
+## Endpoints — Workflow Engine M2 (auth: `current_user`)
+
+Workflow Runs + Internal Event History. The product premise: Upstream is a
+camera **workflow engine**, not an alerts product. M1 added simple rules +
+in-app alerts; M2 makes every rule match a **workflow run** — the internal
+system of record — recorded WHETHER OR NOT an alert was sent. Alerts are now
+one action/output of a run: a cooldown-suppressed match still produces a run
+(`status='suppressed'`, `action_result='alert_suppressed_cooldown'`) with
+the evidence that triggered it.
+
+Still deferred (the schema deliberately leaves room, but none of this is
+built): multi-step sequencing (event A then B, time windows, waits),
+multi-camera / account-wide workflows (camera_id is already nullable),
+visual workflow builder, delivery channels (email/webhook/Slack), a
+`workflow_run_events` step table, and review/acknowledge mutations
+(`status='action_required'` is reserved but nothing produces it yet).
+
+Migration: `20260613120000_workflow_runs.sql` — creates `workflow_runs`
+(RLS member-select + grant) and adds `alerts.workflow_run_id` (FK,
+on delete set null). The FK lives on alerts so the write path is
+insert-run → insert-alert → finalize-run with no circular reference.
+
+For M2 the existing `rules` table acts as the workflow definition layer
+(`workflow_type = 'simple_rule'`); no separate workflows table. Run
+creation happens inside the existing `_evaluate_rules_safe` savepoint on
+`POST /v1/internal/processor/observations` — the M1 contract is unchanged:
+a failing (or not-yet-migrated) workflow layer can NEVER fail observation
+ingest.
+
+Run lifecycle per matching rule: insert run (`status='active'`, evidence =
+observation payload, payload = rule snapshot at match time) → cooldown-
+guarded alert insert carrying `workflow_run_id` → finalize run
+(`completed`/`alert_created` or `suppressed`/`alert_suppressed_cooldown`,
+`ended_at` stamped). Non-matching and disabled rules produce no run.
+
+Open vocabulary at the DB layer: `workflow_type`, `trigger_type`,
+`action_result`. CHECK-constrained (dashboard switches on it): `status` ∈
+{`active`, `completed`, `failed`, `action_required`, `suppressed`}.
+
+### `GET /v1/workflow-runs?account_id=…&status=…&camera_id=…&rule_id=…&limit=…`
+
+Auth: `current_user`, any member. All filters optional; `status` validated
+against the known set (422 otherwise); `limit` 1–200 default 50. Newest
+first. `alert` is the related alert (left join via
+`alerts.workflow_run_id`) or null — suppressed runs have none.
+
+Response 200:
+```json
+{
+  "runs": [{
+    "id": "uuid", "camera_id": "uuid", "rule_id": "uuid",
+    "trigger_observation_id": "uuid",
+    "workflow_type": "simple_rule", "status": "completed",
+    "title": "Front door crossing",
+    "summary": "Line crossing detected on Front door.",
+    "trigger_type": "processor.line_crossing",
+    "action_result": "alert_created",
+    "evidence": {"line_id": "line-1", "count_delta": 1},
+    "payload": {"rule": {"id": "uuid", "rule_type": "line_crossing",
+                          "config": {}, "severity": "warning",
+                          "cooldown_seconds": 300}},
+    "alert": {"id": "uuid", "status": "open", "severity": "warning"},
+    "started_at": "…", "ended_at": "…",
+    "created_at": "…", "updated_at": "…"
+  }]
+}
+```
+
+`account_id` is never echoed (same posture as the observations read path).
+`evidence` is the triggering observation's payload; `payload.rule` is the
+rule definition snapshot at match time, so runs stay interpretable after
+the rule is edited or deleted.
+
+### `GET /v1/workflow-runs/{workflow_run_id}?account_id=…`
+
+Auth: `current_user`, any member. Same shape as a list item (evidence,
+action result, related alert included). 404 `workflow_run_not_found` for
+unknown or cross-tenant ids (anti-enumeration).
+
+### Alert responses gain `workflow_run_id`
+
+`GET /v1/alerts` items (and the read/resolve responses) now include
+`workflow_run_id` (uuid | null) — null for alerts written before the M2
+migration. M2 is otherwise read-path only: no workflow-run mutation APIs.

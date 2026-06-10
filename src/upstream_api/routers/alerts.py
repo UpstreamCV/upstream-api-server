@@ -48,6 +48,7 @@ def _summary(row: dict[str, Any]) -> AlertSummary:
         camera_id=row["camera_id"],
         rule_id=row["rule_id"],
         observation_id=row["observation_id"],
+        workflow_run_id=row["workflow_run_id"],
         severity=row["severity"],
         status=row["status"],
         title=row["title"],
