@@ -4,6 +4,45 @@ Reverse chronological. Newest at top. Every meaningful commit gets an entry foll
 
 ---
 
+## 2026-06-10 - feat(admin): platform_admins + admin_audit_log tables, cross-account indexes
+
+### Summary
+Foundations for the platform admin panel (new `upstream-admin-panel` repo,
+plus a `/v1/admin/*` surface landing in follow-up commits). Adds the
+`platform_admins` user-id allowlist that will back a fifth identity class
+(`CurrentPlatformAdmin`), an append-only `admin_audit_log` for every mutating
+admin call, and three indexes for the panel's cross-account queries (global
+usage windows, latest-heartbeat-per-session lateral joins, global recent
+sessions).
+
+### Files touched
+- `supabase/migrations/20260610130000_platform_admins.sql` — new tables
+  `platform_admins` (user_id pk, note, created_by; RLS enabled, zero policies
+  so PostgREST exposes nothing) and `admin_audit_log` (admin_user_id, dotted
+  `action` vocabulary, target_type/target_id, `{before, after}` payload,
+  request_id; three read indexes). Replaces unordered `heartbeats_session_idx`
+  with `heartbeats_session_recent_idx (session_id, reported_at desc)`, adds
+  `usage_events_occurred_idx (occurred_at desc)` and
+  `stream_sessions_created_idx (created_at desc)`.
+
+### Functions/classes changed
+None (schema only).
+
+### System interaction notes
+Both new tables are written and read only by the API through the service
+role; no PostgREST/Realtime exposure. `platform_admins` rows are managed
+manually (seed script locally, SQL editor in prod) — no self-service path.
+
+### Testing/checks
+`make db-reset` applies cleanly through the new migration on the local stack.
+
+### Follow-up TODOs
+- `current_platform_admin` dep + `/v1/admin/*` routers (next commits).
+- Prod seeding of `platform_admins` documented in README when the seed
+  script lands.
+
+---
+
 ## 2026-06-10 - ci: fix mypy errors in reliability/model-config tests, bump Node 20 actions
 
 ### Summary
