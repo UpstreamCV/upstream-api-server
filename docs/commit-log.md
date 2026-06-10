@@ -4,6 +4,47 @@ Reverse chronological. Newest at top. Every meaningful commit gets an entry foll
 
 ---
 
+## 2026-06-10 - feat(admin): current_platform_admin identity dep (fifth identity class)
+
+### Summary
+Adds the FastAPI dependency behind the platform admin panel:
+`current_platform_admin` verifies the same Supabase JWT as a dashboard user,
+then requires the user_id to appear in the `platform_admins` allowlist.
+Valid-token-but-not-allowlisted is a 403 `not_platform_admin` (vs 401 for a
+bad token) so the panel can distinguish "log in again" from "not an admin".
+
+### Files touched
+- `src/upstream_api/security/deps.py` — new `PlatformAdminAuth` dataclass +
+  `current_platform_admin` dep + `CurrentPlatformAdmin` annotated alias;
+  module docstring now says five identity classes.
+- `tests/test_platform_admin_auth.py` — new; six tests covering allowlisted
+  resolve, 403 non-allowlisted, 401 invalid/expired/missing token (no DB
+  lookup on a bad token), and aal/amr carriage.
+- `docs/architecture.md` — identity class table extended to five rows + a
+  paragraph on how the admin dep deliberately differs from `current_user`.
+
+### Functions/classes changed
+- `PlatformAdminAuth` — frozen dataclass: user_id, email, aal, amr.
+- `current_platform_admin` — verify_supabase_token → `select 1 from
+  platform_admins where user_id = $1`. No membership lookup, no TTL cache
+  (revocation is instant), never sets `account_id_var` (cross-tenant calls;
+  target accounts belong in admin_audit_log).
+
+### System interaction notes
+`Authorization: Bearer <Supabase JWT> → current_platform_admin →
+platform_admins lookup → PlatformAdminAuth` — consumed by the upcoming
+`/v1/admin/*` routers.
+
+### Testing/checks
+`uv run pytest tests/test_platform_admin_auth.py` (6 passed), `ruff check`,
+`ruff format --check`, `mypy src tests` (0 errors).
+
+### Follow-up TODOs
+- `/v1/admin/*` router package (next commit).
+- Optional `aal == "aal2"` MFA gate once an MFA policy exists.
+
+---
+
 ## 2026-06-10 - feat(admin): platform_admins + admin_audit_log tables, cross-account indexes
 
 ### Summary

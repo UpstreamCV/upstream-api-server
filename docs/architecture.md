@@ -41,7 +41,7 @@ upstream-agent                  upstream-streaming-server
 
 `upstream-api` owns the Supabase database. All other services either consume API endpoints or (for the streaming server) call back via signed webhooks.
 
-## Three identity classes
+## Five identity classes
 
 | Caller | Header scheme | Verified by | Used on |
 |---|---|---|---|
@@ -49,8 +49,11 @@ upstream-agent                  upstream-streaming-server
 | Dashboard user | `Authorization: Bearer <Supabase access token>` | HS256 against `UPSTREAM_SUPABASE_JWT_SECRET` + `account_members` lookup | dashboard reads, `/v1/api-tokens` |
 | Streaming server | `X-Upstream-Webhook-Secret: <secret>` | constant-time compare against `UPSTREAM_MEDIAMTX_WEBHOOK_SECRET` | `/v1/ingest/*` (Phase 2) |
 | Processor | `X-Upstream-Webhook-Secret: <secret>` | constant-time compare against `UPSTREAM_PROCESSOR_WEBHOOK_SECRET` | `/v1/internal/processor/*` (M8.0) |
+| Platform admin | `Authorization: Bearer <Supabase access token>` | same JWT verification as a dashboard user + `platform_admins` allowlist lookup | `/v1/admin/*` (admin panel) |
 
-Each identity class has its own FastAPI dep in `security/deps.py`: `current_agent`, `current_user`, `current_ingest`, `current_processor`. Routers ask only for the dep they need; account scoping comes from the auth context, never from the request body.
+Each identity class has its own FastAPI dep in `security/deps.py`: `current_agent`, `current_user`, `current_ingest`, `current_processor`, `current_platform_admin`. Routers ask only for the dep they need; account scoping comes from the auth context, never from the request body.
+
+The platform-admin dep differs from `current_user` deliberately: no membership lookup and no TTL cache (allowlist revocation is instant), and it never sets `account_id_var` — admin requests are cross-tenant, so target accounts are recorded in `admin_audit_log` instead of the logging context. A miss on the allowlist is a 403 `not_platform_admin` (vs 401 for a bad token) so the admin panel can distinguish "log in again" from "not an admin".
 
 ## Canonical request flow — session creation
 

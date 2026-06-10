@@ -1,4 +1,4 @@
-"""FastAPI dependencies for the four identity classes.
+"""FastAPI dependencies for the five identity classes.
 
 Importable as ``Annotated`` aliases so handlers can write
 ``def handler(agent: CurrentAgent): ...`` without restating Depends.
@@ -152,6 +152,63 @@ async def current_user(
 
 
 CurrentUser = Annotated[UserAuth, Depends(current_user)]
+
+
+@dataclass(frozen=True, slots=True)
+class PlatformAdminAuth:
+    """Fifth identity class: internal staff operating across ALL tenants.
+
+    Backed by the ``platform_admins`` allowlist table. Same Supabase JWT as a
+    dashboard user, but deliberately different posture from ``current_user``:
+    no membership lookup and no TTL cache (admin traffic is tiny; an uncached
+    lookup makes allowlist revocation instant), and ``account_id_var`` is
+    never set — admin requests are cross-tenant, so per-request target
+    accounts belong in the admin_audit_log, not the logging context.
+    """
+
+    user_id: UUID
+    email: str | None
+    # Carried so an `aal == "aal2"` MFA gate can be added without a
+    # signature change.
+    aal: str
+    amr: tuple[str, ...]
+
+
+async def current_platform_admin(
+    pool: PoolDep,
+    settings: SettingsDep,
+    authorization: Annotated[str | None, Header()] = None,
+) -> PlatformAdminAuth:
+    token = _extract_bearer(authorization)
+    try:
+        claims = verify_supabase_token(
+            token,
+            secret=settings.supabase_jwt_secret.get_secret_value(),
+            supabase_url=settings.supabase_url,
+        )
+    except SupabaseJwtError as exc:
+        raise UnauthorizedError(str(exc), code="invalid_user_token") from exc
+
+    async with pool.acquire() as conn:
+        allowed = await conn.fetchval(
+            "select 1 from platform_admins where user_id = $1",
+            claims.user_id,
+        )
+    if allowed is None:
+        # 403, not 401: the token is valid, the user just isn't on the
+        # allowlist — lets the panel distinguish "log in again" from
+        # "this account is not a platform admin".
+        raise ForbiddenError("Not a platform admin.", code="not_platform_admin")
+
+    return PlatformAdminAuth(
+        user_id=claims.user_id,
+        email=claims.email,
+        aal=claims.aal,
+        amr=claims.amr,
+    )
+
+
+CurrentPlatformAdmin = Annotated[PlatformAdminAuth, Depends(current_platform_admin)]
 
 
 @dataclass(frozen=True, slots=True)
