@@ -27,6 +27,7 @@ class AccountLimitsResponse(BaseModel):
     max_height: int
     max_bitrate_kbps: int
     allowed_codecs: list[str]
+    allowed_stream_types: list[str]
     monthly_minutes_quota: int
     snapshot_storage_mb: int
     created_at: datetime
