@@ -186,3 +186,84 @@ class ConfidenceTrendByConfigResponse(BaseModel):
     bucket_size: Literal["1h"]
     group_count: int
     groups: list[ConfidenceTrendConfigGroup]
+
+
+# ---------------------------------------------------------------------------
+# Config comparison report card (model-config M11) — a small, read-side,
+# DESCRIPTIVE synthesis over the M9/M9.1 by-config groups: pick a baseline and
+# a candidate config group in the window and report what changed between them.
+# This is a report card, NOT a recommender: no verdicts, no "better/worse", no
+# "recommended config", no causal claims — only factual directions ("lower",
+# "higher", "unchanged"), comparability notes (a changed threshold or class
+# set changes the measured population), and standing caveats.
+# ---------------------------------------------------------------------------
+
+ConfigComparisonStatus = Literal["comparable", "mixed_metrics", "inconclusive", "no_data"]
+ConfigComparisonMode = Literal["explicit", "latest_vs_previous", "recent_vs_prior", "none"]
+
+
+class ConfigComparisonGroup(BaseModel):
+    """One side of the comparison: a config group's identity plus its window
+    aggregates (sample-count-weighted over the group's hourly points)."""
+
+    group_key: str
+    label: str
+    processing_config_source: str | None
+    processing_config_revision: int | None
+    processing_config_status: str | None
+    applied_model_key: str | None
+    applied_selected_classes_key: str | None
+    applied_confidence_threshold: float | None
+    requested_processing_fps: int | None
+    applied_processing_fps: int | None
+    warnings: list[str]
+    sample_count: int
+    avg_confidence: float | None
+    low_confidence_ratio: float | None
+    latest_bucket_start: datetime | None
+
+
+class ConfigComparisonDeltas(BaseModel):
+    """Candidate minus baseline. ``None`` when either side lacks the metric.
+    Descriptive only — a delta's sign is a direction, not a judgment."""
+
+    avg_confidence_delta: float | None
+    avg_confidence_percent_delta: float | None
+    low_confidence_ratio_delta: float | None
+    sample_count_delta: int
+    applied_processing_fps_delta: int | None
+
+
+class ConfigComparisonSummaryResponse(BaseModel):
+    """The report card. ``comparison_status`` semantics:
+
+    - ``comparable`` — both groups have enough samples AND the population-
+      defining settings (confidence threshold, selected classes) match, so the
+      metric deltas describe the same measured population.
+    - ``mixed_metrics`` — both groups have enough samples but the threshold or
+      class set changed, so metrics moved AND the measured population moved;
+      ``comparability_notes`` explains why numbers aren't directly comparable.
+    - ``inconclusive`` — fewer than two groups, missing aggregates, or a side
+      below ``min_samples``.
+    - ``no_data`` — no config-aware data in the window at all.
+
+    ``metric_directions`` is a flat, factual vocabulary for the dashboard:
+    ``avg_confidence_higher|lower|unchanged``,
+    ``low_confidence_ratio_higher|lower|unchanged``,
+    ``samples_higher|lower|unchanged``.
+    """
+
+    camera_id: UUID
+    range: ConfidenceTrendRange
+    generated_at: datetime
+    comparison_mode: ConfigComparisonMode
+    min_samples: int
+    baseline: ConfigComparisonGroup | None
+    candidate: ConfigComparisonGroup | None
+    metric_deltas: ConfigComparisonDeltas | None
+    comparison_status: ConfigComparisonStatus
+    metric_directions: list[str]
+    summary: str
+    bullets: list[str]
+    comparability_notes: list[str]
+    caveats: list[str]

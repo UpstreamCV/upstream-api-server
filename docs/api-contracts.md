@@ -1349,6 +1349,32 @@ confidence threshold and selected classes are applied only where supported;
 model switching, tracker, processing FPS, and class-filtered line/ROI counts
 remain not live-applied.
 
+`GET /v1/cameras/{camera_id}/reliability/config-comparison-summary`
+(model-config M11) — a **descriptive report card** comparing two applied-config
+groups from the M9/M9.1 by-config data. NOT a recommender: no verdicts, no
+"better/worse/best/recommended", no causal claims — factual metric directions
+and deltas only. Same auth/scoping and `range` semantics as the other
+reliability reads. Query params: `baseline_revision` / `candidate_revision`
+(both → explicit selection; otherwise latest config revision vs previous, or
+the two most recent groups for revision-less pre-M8 history) and `min_samples`
+(int ≥ 1, default 30 — either side below it → `inconclusive`). Response:
+`{camera_id, range, generated_at, comparison_mode:
+"explicit"|"latest_vs_previous"|"recent_vs_prior"|"none", min_samples,
+baseline, candidate, metric_deltas:{avg_confidence_delta,
+avg_confidence_percent_delta, low_confidence_ratio_delta, sample_count_delta,
+applied_processing_fps_delta}, comparison_status:
+"comparable"|"mixed_metrics"|"inconclusive"|"no_data", metric_directions:
+["avg_confidence_higher|lower|unchanged", ...], summary, bullets,
+comparability_notes, caveats}` — baseline/candidate carry the group identity
+(label matching the dashboard format, e.g. "All classes · confidence 0.10 ·
+5 FPS"), window aggregates (sample-count-weighted avg confidence /
+low-confidence ratio), and warnings. `comparable` means the population-defining
+settings (threshold, classes) match; `mixed_metrics` means they changed, so the
+numbers describe a different measured population (the notes say so). Standing
+caveats always include "Directional comparison only, not causal proof", plus
+the FPS output-cadence-only and line/ROI all-class caveats when relevant. Pure
+read over rollups; no migration, no new write path.
+
 ### Intentionally deferred (not in M8.0)
 
 - `upstream-processor` repo, DeepStream runtime, YOLO/person detection, Triton

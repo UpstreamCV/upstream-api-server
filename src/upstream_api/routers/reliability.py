@@ -28,11 +28,16 @@ from upstream_api.errors import NotFoundError
 from upstream_api.schemas.reliability import (
     ConfidenceTrendByConfigResponse,
     ConfidenceTrendResponse,
+    ConfigComparisonSummaryResponse,
     ProcessingConfigStatus,
     ReliabilityFindingsResponse,
     ReliabilitySummaryResponse,
 )
 from upstream_api.security.deps import CurrentCaller, PoolDep, SettingsDep
+from upstream_api.services.reliability_config_comparison import (
+    DEFAULT_MIN_SAMPLES,
+    get_config_comparison_summary,
+)
 from upstream_api.services.reliability_service import (
     get_findings_for_camera,
     get_summary_for_camera,
@@ -226,4 +231,56 @@ async def get_reliability_confidence_trend_by_config(
             applied_confidence_threshold=applied_confidence_threshold,
             warning=warning,
             applied_processing_fps=applied_processing_fps,
+        )
+
+
+@router.get(
+    "/v1/cameras/{camera_id}/reliability/config-comparison-summary",
+    response_model=ConfigComparisonSummaryResponse,
+)
+async def get_reliability_config_comparison_summary(
+    camera_id: UUID,
+    caller: CurrentCaller,
+    pool: PoolDep,
+    settings: SettingsDep,
+    account_id: Annotated[UUID | None, Query()] = None,
+    range_: Annotated[Literal["24h", "7d"], Query(alias="range")] = "24h",
+    baseline_revision: Annotated[int | None, Query(ge=0)] = None,
+    candidate_revision: Annotated[int | None, Query(ge=0)] = None,
+    min_samples: Annotated[int, Query(ge=1, le=100_000)] = DEFAULT_MIN_SAMPLES,
+) -> ConfigComparisonSummaryResponse:
+    """Config comparison report card (model-config M11).
+
+    A DESCRIPTIVE before/after comparison of two applied-config groups from
+    the M9/M9.1 by-config data: baseline vs candidate window aggregates,
+    factual metric directions/deltas, comparability notes (a changed
+    confidence threshold or class set changes the measured population), and
+    standing caveats. It is a report card, not a recommender: no verdicts, no
+    "best config", no causal claims — and processing FPS remains output
+    cadence only (never a GPU/inference claim).
+
+    Baseline/candidate selection: explicit ``baseline_revision`` +
+    ``candidate_revision`` when both are provided; otherwise latest config
+    revision vs previous; for revision-less (pre-M8) history, the two most
+    recent groups. Fewer than two groups, or either side under
+    ``min_samples``, reports ``inconclusive``; an empty window reports
+    ``no_data``. Pure read — no evaluator, rollups only.
+    """
+    scope_account = caller.resolve_account(account_id)
+    async with pool.acquire() as conn, conn.transaction():
+        owner_row = await conn.fetchrow(
+            "select account_id from cameras where id = $1",
+            camera_id,
+        )
+        if owner_row is None or owner_row["account_id"] != scope_account:
+            raise NotFoundError("Camera not found.", code="camera_not_found")
+
+        return await get_config_comparison_summary(
+            conn,
+            account_id=scope_account,
+            camera_id=camera_id,
+            range_=range_,
+            baseline_revision=baseline_revision,
+            candidate_revision=candidate_revision,
+            min_samples=min_samples,
         )

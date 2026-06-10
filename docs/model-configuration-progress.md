@@ -305,6 +305,25 @@ perception-snapshot **output cadence only** — it does not reduce DeepStream
 inference/GPU work, and the `processing_fps_output_cadence_only` warning rides
 in the grouped warnings.
 
+### M11 — Config comparison report card (`upstream-api-server` + `upstream-dashboard`)
+
+A descriptive before/after comparison over the M9/M9.1 config groups — a
+report card, **not a recommender**. New endpoint
+`GET /v1/cameras/{id}/reliability/config-comparison-summary` picks a baseline
+and candidate group (explicit revisions, else latest-vs-previous, else
+recency for pre-M8 history), aggregates each over the window
+(sample-count-weighted), and returns factual `metric_directions`
+(higher/lower/unchanged), `metric_deltas`, a neutral `comparison_status`
+(`comparable` / `mixed_metrics` / `inconclusive` / `no_data`),
+plain-language bullets, `comparability_notes` (a changed confidence threshold
+or class set changes the measured population — averages are not directly
+comparable), and standing caveats ("directional comparison only, not causal
+proof"; FPS is output cadence only; line/ROI counts may still include all
+classes). Conservative gates: one group or either side under `min_samples`
+(default 30) → `inconclusive`. No judgment vocabulary anywhere — tests pin
+that the generated text never contains "better/worse/best/recommend/caused".
+Read-side only: rollup data, no migration, no runtime change.
+
 ## Not yet done
 
 - **Model switching at runtime** — the live processor still runs its
