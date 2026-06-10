@@ -342,6 +342,74 @@ plaintext `.env` secrets (SSM still a follow-up).
   match shipped state (Phases 1-5 done; Phase 6 + deployment partial).
 - `docs/commit-log.md` — this entry.
 
+## 2026-06-10 - Agent smart flow: bootstrap endpoint, stream types, web-managed cameras
+
+### Summary
+Three additions so the agent can be account-aware and the web can own
+camera config. (1) `GET /v1/agents/bootstrap` (agent-token auth) returns
+account, token metadata, agents, limits, usage (camera/session counts +
+approximate monthly minutes from `session_ended` usage events), cameras,
+and active sessions in one call — with a hard no-secrets guarantee (no
+srt_url/streamid/tokens/passphrases/prefix/hash; sessions use a reduced
+shape for exactly this reason). (2) `account_limits.allowed_stream_types`
+(default `{webcam,rtsp}`) + `cameras.source_type`, enforced at camera
+register, dashboard create/edit, and session start via
+`check_stream_type_allowed` (403 `limit_exceeded.stream_type_not_allowed`;
+NULL source_type is default-allowed for pre-existing agents/cameras).
+(3) Dashboard camera management: `POST /v1/cameras` + `PATCH
+/v1/cameras/{id}` (owner/admin users; merged config re-validated against
+limits) create/edit cameras with `agent_id = NULL`; agents take ownership
+via `POST /v1/cameras/{id}/claim` (race-safe conditional update, 409
+`camera_claimed_by_other_agent`); session start rejects unclaimed cameras
+with 409 `camera_unassigned`.
+
+### Files touched
+- `supabase/migrations/20260611120000_stream_types_and_web_cameras.sql` —
+  additive columns + `cameras.agent_id` DROP NOT NULL.
+- `services/limits.py` — `AccountLimits.allowed_stream_types`,
+  `check_stream_type_allowed`, optional `camera_source_type` param on
+  `check_session_start`.
+- `services/session_lifecycle.py` — selects `source_type`, rejects
+  unassigned cameras, threads source type into the session-start check.
+- `schemas/bootstrap.py` (new), `schemas/cameras.py` (source_type,
+  nullable agent_id, Create/Update/Claim requests), `schemas/accounts.py`.
+- `routers/agents.py` — bootstrap handler (declared before `/{agent_id}`
+  so the literal path wins), `routers/cameras.py` (source_type wiring +
+  coalesce on re-register + three new endpoints), `routers/accounts.py`.
+- Tests: `tests/test_bootstrap.py`, `tests/test_stream_types.py`,
+  `tests/test_camera_management.py` (new); fake-row updates in
+  `test_session_lifecycle.py`, `test_stream_sessions_router.py`.
+- `docs/api-contracts.md` — new "Agent smart flow" section.
+
+### Functions/classes changed
+- `check_stream_type_allowed(limits, source_type)` — case-insensitive
+  allow-list; `None` is default-allowed.
+- `bootstrap()` — read-only, one pool acquire, every query bound to the
+  token's account; usage block mirrors the dashboard summary
+  scalar-subquery pattern.
+- `create_camera`/`update_camera` — `CurrentCaller` user-only
+  (`forbidden.user_required` for agent tokens) + `require_account_role`
+  owner/admin; `claim_camera` — `CurrentAgent`, idempotent for the same
+  agent, conditional `where agent_id is null` update closes the race.
+
+### System interaction notes
+`current_agent -> routers.agents.bootstrap -> asyncpg (7 reads) ->
+BootstrapResponse`. Deploy order matters: the new code selects the new
+columns, so the migration must apply before restart (old code on a
+migrated DB is fine). Rollback caveat: once a web-created camera exists
+(`agent_id IS NULL`), old code's `CameraResponse` (non-nullable agent_id)
+500s on that account's camera reads.
+
+### Testing/checks
+- `uv run pytest` — 686 passed (31 new). No-secrets test asserts the
+  bootstrap body contains no srt/passphrase/streamid/hash/prefix strings;
+  route-shadowing test guards `/bootstrap` vs `/{agent_id}`.
+
+### Follow-up TODOs
+- Enforce `monthly_minutes_quota` at session start (bootstrap only
+  reports it).
+- Cross-account negative-test matrix for the remaining routers.
+
 ---
 
 ## 2026-06-01 - Model config M7B: carry processing_config on eligible-sessions (api-server, stamp-only)

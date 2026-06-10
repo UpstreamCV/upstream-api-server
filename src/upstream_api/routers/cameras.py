@@ -6,11 +6,14 @@ from uuid import UUID
 
 from fastapi import APIRouter, Query
 
-from upstream_api.errors import ConflictError, NotFoundError
+from upstream_api.errors import ConflictError, ForbiddenError, NotFoundError
 from upstream_api.schemas.cameras import (
+    CameraClaimRequest,
+    CameraCreateRequest,
     CameraListResponse,
     CameraRegisterRequest,
     CameraResponse,
+    CameraUpdateRequest,
 )
 from upstream_api.schemas.geometry import (
     GeometryConfigResponse,
@@ -28,7 +31,12 @@ from upstream_api.schemas.processor import (
     ProcessorStatusRecord,
     RecentObservationsResponse,
 )
-from upstream_api.security.deps import CurrentAgent, CurrentCaller, PoolDep
+from upstream_api.security.deps import (
+    CurrentAgent,
+    CurrentCaller,
+    PoolDep,
+    require_account_role,
+)
 from upstream_api.services.geometry import (
     default_geometry_config_record,
     fetch_geometry_config,
@@ -38,6 +46,7 @@ from upstream_api.services.limits import (
     RequestedStream,
     check_camera_defaults,
     check_camera_slot_available,
+    check_stream_type_allowed,
     load_account_limits,
 )
 from upstream_api.services.processing_config_camera import (
@@ -63,6 +72,7 @@ def _camera_to_response(row: dict) -> CameraResponse:  # type: ignore[type-arg]
         name=row["name"],
         external_id=row["external_id"],
         device_path=row["device_path"],
+        source_type=row["source_type"],
         default_width=row["default_width"],
         default_height=row["default_height"],
         default_fps=row["default_fps"],
@@ -79,7 +89,7 @@ def _camera_to_response(row: dict) -> CameraResponse:  # type: ignore[type-arg]
 
 
 _CAMERA_COLUMNS = (
-    "id, account_id, agent_id, name, external_id, device_path, "
+    "id, account_id, agent_id, name, external_id, device_path, source_type, "
     "default_width, default_height, default_fps, default_codec, "
     "default_bitrate_kbps, default_latency_mode, metadata, status, "
     "created_at, updated_at"
@@ -117,6 +127,7 @@ async def register_camera(
                 bitrate_kbps=body.default_bitrate_kbps,
             ),
         )
+        check_stream_type_allowed(limits, body.source_type)
 
         # Look up by (agent_id, external_id) for idempotent re-register.
         existing = None
@@ -138,11 +149,11 @@ async def register_camera(
             row = await conn.fetchrow(
                 f"""
                 insert into cameras (
-                  account_id, agent_id, name, external_id, device_path,
+                  account_id, agent_id, name, external_id, device_path, source_type,
                   default_width, default_height, default_fps, default_codec, default_bitrate_kbps,
                   default_latency_mode, metadata
                 )
-                values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb)
+                values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::jsonb)
                 returning {_CAMERA_COLUMNS}
                 """,
                 auth.account_id,
@@ -150,6 +161,7 @@ async def register_camera(
                 body.name,
                 body.external_id,
                 body.device_path,
+                body.source_type,
                 body.default_width,
                 body.default_height,
                 body.default_fps,
@@ -159,18 +171,21 @@ async def register_camera(
                 json.dumps(body.metadata),
             )
         else:
+            # coalesce keeps a previously declared source_type when an older
+            # agent re-registers without sending one.
             row = await conn.fetchrow(
                 f"""
                 update cameras
                    set name = $3,
                        device_path = $4,
-                       default_width = $5,
-                       default_height = $6,
-                       default_fps = $7,
-                       default_codec = $8,
-                       default_bitrate_kbps = $9,
-                       default_latency_mode = $10,
-                       metadata = $11::jsonb
+                       source_type = coalesce($5, source_type),
+                       default_width = $6,
+                       default_height = $7,
+                       default_fps = $8,
+                       default_codec = $9,
+                       default_bitrate_kbps = $10,
+                       default_latency_mode = $11,
+                       metadata = $12::jsonb
                  where id = $1 and account_id = $2
                 returning {_CAMERA_COLUMNS}
                 """,
@@ -178,6 +193,7 @@ async def register_camera(
                 auth.account_id,
                 body.name,
                 body.device_path,
+                body.source_type,
                 body.default_width,
                 body.default_height,
                 body.default_fps,
@@ -188,6 +204,212 @@ async def register_camera(
             )
 
     assert row is not None
+    return _camera_to_response(row)
+
+
+@router.post("", response_model=CameraResponse, status_code=201)
+async def create_camera(
+    body: CameraCreateRequest,
+    caller: CurrentCaller,
+    pool: PoolDep,
+    account_id: Annotated[UUID | None, Query()] = None,
+) -> CameraResponse:
+    """Dashboard-authored camera. Owner/admin users only.
+
+    Created with ``agent_id = NULL`` — an agent claims it via
+    ``POST /v1/cameras/{id}/claim`` before it can stream. Defaults are
+    validated against account limits exactly like agent registration, so a
+    camera can never be configured beyond what the account allows.
+    """
+    if caller.user is None:
+        raise ForbiddenError(
+            "Camera creation requires a user session; agents register cameras "
+            "via /v1/cameras/register.",
+            code="forbidden.user_required",
+        )
+    scope_account = caller.resolve_account(account_id)
+    require_account_role(caller.user, scope_account, "owner", "admin")
+
+    async with pool.acquire() as conn, conn.transaction():
+        limits = await load_account_limits(conn, scope_account)
+        check_camera_defaults(
+            limits,
+            RequestedStream(
+                width=body.default_width,
+                height=body.default_height,
+                fps=body.default_fps,
+                codec=body.default_codec,
+                bitrate_kbps=body.default_bitrate_kbps,
+            ),
+        )
+        check_stream_type_allowed(limits, body.source_type)
+        await check_camera_slot_available(
+            conn,
+            account_id=scope_account,
+            is_new_camera=True,
+        )
+        row = await conn.fetchrow(
+            f"""
+            insert into cameras (
+              account_id, agent_id, name, device_path, source_type,
+              default_width, default_height, default_fps, default_codec, default_bitrate_kbps,
+              default_latency_mode, metadata
+            )
+            values ($1, null, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb)
+            returning {_CAMERA_COLUMNS}
+            """,
+            scope_account,
+            body.name,
+            body.device_path,
+            body.source_type,
+            body.default_width,
+            body.default_height,
+            body.default_fps,
+            body.default_codec,
+            body.default_bitrate_kbps,
+            body.default_latency_mode,
+            json.dumps(body.metadata),
+        )
+    assert row is not None
+    return _camera_to_response(row)
+
+
+@router.patch("/{camera_id}", response_model=CameraResponse)
+async def update_camera(
+    camera_id: UUID,
+    body: CameraUpdateRequest,
+    caller: CurrentCaller,
+    pool: PoolDep,
+    account_id: Annotated[UUID | None, Query()] = None,
+) -> CameraResponse:
+    """Partial dashboard edit of a camera's config. Owner/admin users only.
+
+    The merged result (current row + provided fields) is re-validated
+    against account limits, so an edit can't push a camera over caps.
+    """
+    if caller.user is None:
+        raise ForbiddenError(
+            "Camera editing requires a user session.",
+            code="forbidden.user_required",
+        )
+    scope_account = caller.resolve_account(account_id)
+    require_account_role(caller.user, scope_account, "owner", "admin")
+
+    async with pool.acquire() as conn, conn.transaction():
+        current = await conn.fetchrow(
+            f"select {_CAMERA_COLUMNS} from cameras where id = $1",
+            camera_id,
+        )
+        if current is None or current["account_id"] != scope_account:
+            raise NotFoundError("Camera not found.", code="camera_not_found")
+
+        merged_width = body.default_width or current["default_width"] or 1280
+        merged_height = body.default_height or current["default_height"] or 720
+        merged_fps = body.default_fps or current["default_fps"] or 30
+        merged_codec = body.default_codec or current["default_codec"] or "h264"
+        merged_bitrate = body.default_bitrate_kbps or current["default_bitrate_kbps"] or 3000
+        merged_source_type = body.source_type or current["source_type"]
+
+        limits = await load_account_limits(conn, scope_account)
+        check_camera_defaults(
+            limits,
+            RequestedStream(
+                width=merged_width,
+                height=merged_height,
+                fps=merged_fps,
+                codec=merged_codec,
+                bitrate_kbps=merged_bitrate,
+            ),
+        )
+        check_stream_type_allowed(limits, merged_source_type)
+
+        row = await conn.fetchrow(
+            f"""
+            update cameras
+               set name = coalesce($3, name),
+                   device_path = coalesce($4, device_path),
+                   source_type = coalesce($5, source_type),
+                   default_width = coalesce($6, default_width),
+                   default_height = coalesce($7, default_height),
+                   default_fps = coalesce($8, default_fps),
+                   default_codec = coalesce($9, default_codec),
+                   default_bitrate_kbps = coalesce($10, default_bitrate_kbps),
+                   default_latency_mode = coalesce($11, default_latency_mode)
+             where id = $1 and account_id = $2
+            returning {_CAMERA_COLUMNS}
+            """,
+            camera_id,
+            scope_account,
+            body.name,
+            body.device_path,
+            body.source_type,
+            body.default_width,
+            body.default_height,
+            body.default_fps,
+            body.default_codec,
+            body.default_bitrate_kbps,
+            body.default_latency_mode,
+        )
+    assert row is not None
+    return _camera_to_response(row)
+
+
+@router.post("/{camera_id}/claim", response_model=CameraResponse)
+async def claim_camera(
+    camera_id: UUID,
+    body: CameraClaimRequest,
+    auth: CurrentAgent,
+    pool: PoolDep,
+) -> CameraResponse:
+    """Assign an unassigned (dashboard-created) camera to an agent.
+
+    Idempotent when the camera is already assigned to the same agent;
+    409 ``camera_claimed_by_other_agent`` when another agent holds it —
+    reassignment is a dashboard/operator decision, not an agent race.
+    """
+    async with pool.acquire() as conn, conn.transaction():
+        agent_row = await conn.fetchrow(
+            "select account_id from agents where id = $1",
+            body.agent_id,
+        )
+        if agent_row is None:
+            raise NotFoundError("Agent not found.", code="agent_not_found")
+        if agent_row["account_id"] != auth.account_id:
+            raise ConflictError(
+                "Agent does not belong to this account.", code="agent_account_mismatch"
+            )
+
+        camera = await conn.fetchrow(
+            f"select {_CAMERA_COLUMNS} from cameras where id = $1",
+            camera_id,
+        )
+        if camera is None or camera["account_id"] != auth.account_id:
+            raise NotFoundError("Camera not found.", code="camera_not_found")
+        if camera["agent_id"] is not None and camera["agent_id"] != body.agent_id:
+            raise ConflictError(
+                "Camera is already claimed by another agent.",
+                code="camera_claimed_by_other_agent",
+            )
+        if camera["agent_id"] == body.agent_id:
+            return _camera_to_response(camera)
+
+        row = await conn.fetchrow(
+            f"""
+            update cameras
+               set agent_id = $3
+             where id = $1 and account_id = $2 and agent_id is null
+            returning {_CAMERA_COLUMNS}
+            """,
+            camera_id,
+            auth.account_id,
+            body.agent_id,
+        )
+    if row is None:
+        # Lost a claim race between the read and the conditional update.
+        raise ConflictError(
+            "Camera is already claimed by another agent.",
+            code="camera_claimed_by_other_agent",
+        )
     return _camera_to_response(row)
 
 

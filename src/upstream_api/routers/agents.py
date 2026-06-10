@@ -15,7 +15,17 @@ from upstream_api.schemas.agents import (
     AgentRegisterResponse,
     AgentResponse,
 )
+from upstream_api.schemas.bootstrap import (
+    BootstrapAccount,
+    BootstrapAgent,
+    BootstrapLimits,
+    BootstrapResponse,
+    BootstrapSession,
+    BootstrapToken,
+    BootstrapUsage,
+)
 from upstream_api.security.deps import CurrentAgent, CurrentCaller, PoolDep
+from upstream_api.services.limits import load_account_limits
 
 router = APIRouter(prefix="/v1/agents", tags=["agents"])
 
@@ -79,6 +89,152 @@ async def register_agent(
     agent_id_var.set(row["id"])
 
     return AgentRegisterResponse(agent=_row_to_agent(row), server_time=datetime.now(tz=UTC))
+
+
+# NOTE: declared before GET /{agent_id} so "/bootstrap" isn't parsed as a UUID.
+@router.get("/bootstrap", response_model=BootstrapResponse)
+async def bootstrap(auth: CurrentAgent, pool: PoolDep) -> BootstrapResponse:
+    """Server-side context for an agent holding nothing but its API token.
+
+    One call answers: which account am I, what limits apply, which cameras
+    exist (and their server-controlled config), what sessions are running,
+    and how much of the account's capacity is in use. Everything is scoped
+    to the token's account; no secret-bearing fields are returned (see
+    ``schemas/bootstrap.py``).
+    """
+    # Local import to avoid a routers<->routers cycle if cameras ever imports
+    # from this module; reuses the camera column list + response mapper.
+    from upstream_api.routers.cameras import _CAMERA_COLUMNS, _camera_to_response
+
+    async with pool.acquire() as conn:
+        account_row = await conn.fetchrow(
+            "select id, name, slug, plan, status from accounts where id = $1",
+            auth.account_id,
+        )
+        if account_row is None:
+            raise NotFoundError("Account not found.", code="account_not_found")
+
+        token_row = await conn.fetchrow(
+            "select name, scopes, last_four, expires_at from api_tokens where id = $1",
+            auth.token_id,
+        )
+        if token_row is None:
+            raise NotFoundError("Token not found.", code="token_not_found")
+
+        agent_rows = await conn.fetch(
+            """
+            select id, name, status, version, last_seen_at
+              from agents
+             where account_id = $1
+             order by last_seen_at desc nulls last, created_at desc
+            """,
+            auth.account_id,
+        )
+
+        limits = await load_account_limits(conn, auth.account_id)
+
+        usage_row = await conn.fetchrow(
+            """
+            select
+              (select count(*)::int from cameras
+                where account_id = $1 and status <> 'disabled') as camera_count,
+              (select count(*)::int from stream_sessions
+                where account_id = $1
+                  and state in ('approved', 'streaming')) as active_session_count,
+              (select coalesce(sum(quantity), 0)::bigint from usage_events
+                where account_id = $1
+                  and event_type = 'session_ended'
+                  and occurred_at >= date_trunc('month', now())) as monthly_seconds_used
+            """,
+            auth.account_id,
+        )
+
+        camera_rows = await conn.fetch(
+            f"""
+            select {_CAMERA_COLUMNS}
+              from cameras
+             where account_id = $1 and status <> 'disabled'
+             order by created_at desc
+            """,
+            auth.account_id,
+        )
+
+        session_rows = await conn.fetch(
+            """
+            select id, camera_id, agent_id, state, created_at, expires_at, started_at,
+                   lim_width, lim_height, lim_fps, lim_codec, lim_bitrate_kbps,
+                   lim_latency_mode
+              from stream_sessions
+             where account_id = $1 and state in ('approved', 'streaming')
+             order by created_at desc
+            """,
+            auth.account_id,
+        )
+
+    return BootstrapResponse(
+        account=BootstrapAccount(
+            id=account_row["id"],
+            name=account_row["name"],
+            slug=account_row["slug"],
+            plan=account_row["plan"],
+            status=account_row["status"],
+        ),
+        token=BootstrapToken(
+            name=token_row["name"],
+            scopes=list(token_row["scopes"]),
+            last_four=token_row["last_four"],
+            expires_at=token_row["expires_at"],
+        ),
+        agents=[
+            BootstrapAgent(
+                id=r["id"],
+                name=r["name"],
+                status=r["status"],
+                version=r["version"],
+                last_seen_at=r["last_seen_at"],
+            )
+            for r in agent_rows
+        ],
+        limits=BootstrapLimits(
+            max_cameras=limits.max_cameras,
+            max_concurrent_sessions=limits.max_concurrent_sessions,
+            max_fps=limits.max_fps,
+            max_width=limits.max_width,
+            max_height=limits.max_height,
+            max_bitrate_kbps=limits.max_bitrate_kbps,
+            allowed_codecs=sorted(limits.allowed_codecs),
+            allowed_stream_types=sorted(limits.allowed_stream_types),
+            monthly_minutes_quota=limits.monthly_minutes_quota,
+            snapshot_storage_mb=limits.snapshot_storage_mb,
+        ),
+        usage=BootstrapUsage(
+            camera_count=usage_row["camera_count"],
+            active_session_count=usage_row["active_session_count"],
+            monthly_minutes_used=int(usage_row["monthly_seconds_used"]) // 60,
+        ),
+        cameras=[_camera_to_response(r) for r in camera_rows],
+        active_sessions=[
+            BootstrapSession(
+                id=r["id"],
+                camera_id=r["camera_id"],
+                agent_id=r["agent_id"],
+                state=r["state"],
+                created_at=r["created_at"],
+                expires_at=r["expires_at"],
+                started_at=r["started_at"],
+                approved={
+                    "width": r["lim_width"],
+                    "height": r["lim_height"],
+                    "fps": r["lim_fps"],
+                    "codec": r["lim_codec"],
+                    "bitrate_kbps": r["lim_bitrate_kbps"],
+                    "latency_mode": r["lim_latency_mode"],
+                },
+            )
+            for r in session_rows
+        ],
+        server_time=datetime.now(tz=UTC),
+    )
 
 
 @router.get("", response_model=AgentListResponse)
