@@ -1934,3 +1934,37 @@ confident person detections in the pick zone after hours" is now two rules:
 
 Still deferred (honestly): all line_crossing conditions beyond `line_id` +
 `schedule`, and periodic-evaluation rule types.
+
+## Workflow Engine — per-object line crossing unlock
+
+The processor side task "Per-Object Line Crossing Producer" added a second
+line-crossing observation type, `processor.line_crossing_object`: per-OBJECT
+crossing evidence (track/class/confidence attribution, payload
+`event_mode: "object_crossing"`), emitted ALONGSIDE the unchanged aggregate
+`processor.line_crossing` count events.
+
+**The partition rule (prevents double-fire).** One physical crossing reaches
+this server as TWO observations. Both types map to the `line_crossing` rule
+family, and the matcher partitions on the payload:
+
+- a rule with ANY per-object condition (`object_classes`,
+  `require_track_id`, `min_confidence`) matches ONLY per-object events;
+- a plain rule (at most `line_id` + `schedule`) matches ONLY aggregate
+  events — exactly its pre-existing behavior.
+
+So each rule fires at most once per physical crossing, legacy rules are
+untouched, and a per-object-conditioned rule never falls back to aggregate
+events (an untracked crossing can't satisfy it — counted, not attributed).
+
+**Unlocked `line_crossing` config keys:** `object_classes`,
+`require_track_id`, `min_confidence` — same semantics and validation as on
+zone/dwell rules; missing payload fields still mean no match.
+
+**Still deferred:** `direction`. The per-object payload may carry
+`analytics_direction_label` (a raw nvdsanalytics direction-rule name), but
+that is NOT a geometry-relative a_to_b/b_to_a crossing direction, so
+direction filters remain rejected at authoring time.
+
+No migration; `ProcessorObservationType` widened in lock-step with the
+processor. Workflow runs record `trigger_type:
+"processor.line_crossing_object"` for per-object matches.

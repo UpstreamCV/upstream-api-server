@@ -34,6 +34,11 @@ from upstream_api.services.workflow_runs import (
 # no matching rule simply evaluate to zero rules — never an error.
 OBSERVATION_TYPE_TO_RULE_TYPE: dict[str, str] = {
     "processor.line_crossing": "line_crossing",
+    # Per-object crossing evidence maps to the SAME rule type; the matcher
+    # partitions on payload event_mode so one physical crossing (which
+    # produces BOTH an aggregate and a per-object observation) fires a
+    # given rule at most once.
+    "processor.line_crossing_object": "line_crossing",
     "processor.roi_occupancy": "roi_occupancy",
     "processor.zone_entered": "zone_entered",
     "processor.dwell_exceeded": "dwell_exceeded",
@@ -240,7 +245,27 @@ def rule_matches(rule_type: str, config: dict[str, Any], payload: dict[str, Any]
     """
     if rule_type == "line_crossing":
         line_id = config.get("line_id")
-        return line_id is None or payload.get("line_id") == line_id
+        if line_id is not None and payload.get("line_id") != line_id:
+            return False
+        # Partition (per-object line crossing side task): one physical
+        # crossing produces BOTH an aggregate event and a per-object event
+        # (payload event_mode == "object_crossing"). A rule with per-object
+        # conditions matches ONLY per-object events; a plain rule matches
+        # ONLY aggregate events. Without this, every plain line rule would
+        # double-fire per crossing.
+        has_object_conditions = any(
+            key in config for key in ("object_classes", "require_track_id", "min_confidence")
+        )
+        is_object_event = payload.get("event_mode") == "object_crossing"
+        if has_object_conditions != is_object_event:
+            return False
+        if not is_object_event:
+            return True
+        return (
+            _classes_allowed(config, payload)
+            and _track_ok(config, payload)
+            and _confidence_ok(config, payload)
+        )
     if rule_type == "roi_occupancy":
         roi_id = config.get("roi_id")
         if roi_id is not None and payload.get("roi_id") != roi_id:

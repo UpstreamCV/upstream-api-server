@@ -48,18 +48,16 @@ RuleSeverity = Literal["info", "warning", "critical"]
 # whose production observation payloads actually carry the field it needs —
 # a rule that can never match is worse than a 422 at authoring time:
 #
-# - object_classes / require_track_id: zone_entered + dwell_exceeded only.
-#   The DeepStream worker stamps class_label / track_id on per-track zone
-#   and dwell events, but line crossings come from nvdsanalytics CUMULATIVE
-#   line counters (no per-object attribution), and ROI occupancy counts are
-#   cross-class aggregates (M7D). Extending these to line_crossing needs a
-#   processor change (per-object crossing attribution) — documented
-#   follow-up, not faked here.
+# - object_classes / require_track_id: zone_entered, dwell_exceeded, and
+#   (per-object line crossing side task) line_crossing — the processor's
+#   per-object producer attributes crossings to tracked objects. ROI
+#   occupancy stays excluded (cross-class aggregate counts; use
+#   object_class instead).
 # - min_confidence: zone_entered + dwell_exceeded — the processor's
 #   payload-enrichment side task stamps per-object detection confidence
 #   onto zone/dwell events (omitted when the track wasn't detected in the
 #   triggering frame, so the no-match-on-missing posture still applies).
-#   Still unavailable on line_crossing (no per-object attribution).
+#   The per-object line-crossing producer extends it to line_crossing.
 # - object_class (roi_occupancy): the same side task populates
 #   ``class_counts`` from object-attributed ROI membership; when set, the
 #   min/max count bounds apply to that class's count instead of
@@ -71,7 +69,20 @@ RuleSeverity = Literal["info", "warning", "critical"]
 #   timestamp, no periodic evaluator involved.
 _SCHEDULE_KEY = "schedule"
 _ALLOWED_CONFIG_KEYS: dict[str, frozenset[str]] = {
-    "line_crossing": frozenset({"line_id", _SCHEDULE_KEY}),
+    # Per-object line crossing side task: the processor now emits
+    # processor.line_crossing_object with track/class/confidence
+    # attribution, unlocking the three per-object conditions here. A rule
+    # using ANY of them matches only per-object events; a plain rule keeps
+    # matching only aggregate count events (see services/rules.py).
+    "line_crossing": frozenset(
+        {
+            "line_id",
+            "object_classes",
+            "require_track_id",
+            "min_confidence",
+            _SCHEDULE_KEY,
+        }
+    ),
     "roi_occupancy": frozenset(
         {"roi_id", "min_total_count", "max_total_count", "object_class", _SCHEDULE_KEY}
     ),

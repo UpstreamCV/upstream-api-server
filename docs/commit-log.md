@@ -4,6 +4,38 @@ Reverse chronological. Newest at top. Every meaningful commit gets an entry foll
 
 ---
 
+## 2026-06-10 - Per-object line crossing: accept new type, partition matcher, unlock line conditions
+
+### Summary
+Consumer half of the processor side task "Per-Object Line Crossing
+Producer". Accepts `processor.line_crossing_object` (lock-step Literal
+widening), maps it to the `line_crossing` rule family, and partitions the
+matcher on payload `event_mode` so one physical crossing — which now
+produces BOTH an aggregate count event and a per-object evidence event —
+fires any given rule at most once: per-object-conditioned rules
+(`object_classes` / `require_track_id` / `min_confidence`, newly allowed on
+line_crossing) match only per-object events; plain rules keep their exact
+pre-existing aggregate behavior. Direction filters stay deferred
+(`analytics_direction_label` is a direction-rule name, not a_to_b).
+
+### Files touched
+- `src/upstream_api/schemas/processor.py` — ProcessorObservationType +=
+  processor.line_crossing_object.
+- `src/upstream_api/services/rules.py` — observation-type mapping; matcher
+  partition + per-object condition checks on the line_crossing branch.
+- `src/upstream_api/schemas/rules.py` — line_crossing allowed keys +=
+  the three per-object conditions; availability comments updated.
+- `tests/test_rule_evaluation.py` — +15: partition truth table (plain vs
+  conditioned x aggregate vs object events, missing-field no-match),
+  validation moves, and two integration tests: one physical crossing
+  (both observations) against both rule styles → exactly one run + alert
+  per rule; a conditioned rule alone ignores aggregate events entirely.
+- `docs/api-contracts.md` — "per-object line crossing unlock" section.
+
+### Testing/checks
+`make test` — 900 passed. `make lint` + `uv run mypy src` clean. No
+migration; savepoint ingest contract untouched (still test-pinned).
+
 ## 2026-06-10 - Payload-enrichment unlock: min_confidence + object_class count bounds
 
 ### Summary
