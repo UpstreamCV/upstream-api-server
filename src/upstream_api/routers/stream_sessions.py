@@ -12,6 +12,7 @@ from upstream_api.errors import (
     BadGatewayError,
     BadRequestError,
     ConflictError,
+    LimitExceeded,
     NotFoundError,
     UnsupportedMediaTypeError,
 )
@@ -29,6 +30,7 @@ from upstream_api.schemas.stream_validations import (
 )
 from upstream_api.security.deps import CurrentAgent, CurrentCaller, PoolDep, SettingsDep
 from upstream_api.security.streamid import extract_stream_key
+from upstream_api.services.account_audit import try_record_account_audit_log
 from upstream_api.services.http_client import HttpClientDep
 from upstream_api.services.limits import LimitsSnapshot, RequestedStream
 from upstream_api.services.mediamtx_provisioning import (
@@ -139,21 +141,41 @@ async def start(
     settings: SettingsDep,
     http: HttpClientDep,
 ) -> StreamSessionStartResponse:
-    async with pool.acquire() as conn, conn.transaction():
-        result = await start_session(
-            conn,
-            settings=settings,
-            account_id=auth.account_id,
-            camera_id=body.camera_id,
-            requested=RequestedStream(
-                width=body.requested.width,
-                height=body.requested.height,
-                fps=body.requested.fps,
-                codec=body.requested.codec,
-                bitrate_kbps=body.requested.bitrate_kbps,
-                latency_mode=body.requested.latency_mode,
-            ),
-        )
+    try:
+        async with pool.acquire() as conn, conn.transaction():
+            result = await start_session(
+                conn,
+                settings=settings,
+                account_id=auth.account_id,
+                camera_id=body.camera_id,
+                requested=RequestedStream(
+                    width=body.requested.width,
+                    height=body.requested.height,
+                    fps=body.requested.fps,
+                    codec=body.requested.codec,
+                    bitrate_kbps=body.requested.bitrate_kbps,
+                    latency_mode=body.requested.latency_mode,
+                ),
+            )
+    except LimitExceeded as exc:
+        # The rejected transaction rolled back, so the audit row needs its
+        # own connection. Best-effort: the rejection is returned either way.
+        async with pool.acquire() as audit_conn:
+            await try_record_account_audit_log(
+                audit_conn,
+                account_id=auth.account_id,
+                actor_type="system",
+                event_type="stream_session.limit_rejected",
+                resource_type="stream_session",
+                resource_id=None,
+                summary=f"Stream session start rejected: {exc.code}.",
+                metadata={
+                    "limit_code": exc.code,
+                    "camera_id": str(body.camera_id),
+                    **(exc.details or {}),
+                },
+            )
+        raise
 
     session_id_var.set(result.session.id)
 

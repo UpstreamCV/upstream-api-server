@@ -2325,3 +2325,56 @@ Every event id is recorded in `stripe_events` first; duplicates ack
 `status` is derived (`none|active|trialing|past_due|canceled`; every
 payment-trouble Stripe status maps to `past_due`). Stripe IDs are never
 exposed to the dashboard.
+
+## Module 7 M3 — Tenant Audit Logs
+
+ACCOUNT-FACING audit history in the customer dashboard: who created this
+camera, who revoked that token, what changed our plan. This is NOT the
+platform-admin trail (`admin_audit_log`, internal admin panel) — different
+audience, table, and RLS. Deliberately absent: compliance exports, SIEM
+integration, high-volume runtime events (observations, heartbeats,
+workflow runs, alert creation).
+
+Migration `20260618120000_account_audit_logs.sql`: `account_audit_logs`
+(account-scoped, RLS member SELECT only — clients can never insert;
+indexes on account+created, account+event_type, account+resource).
+
+### Writing (services/account_audit.py)
+
+`try_record_account_audit_log(conn, ...)` — best-effort: a `to_regclass`
+probe lets code deploy before the migration (write skipped, never an
+error) and unexpected insert errors are logged, not raised. Metadata
+passes a recursive sanitizer that drops any key containing token/secret/
+password/authorization/api_key/signature/recovery/card/credential
+(exact allowances: token_id, token_name). Never sent here in the first
+place: raw tokens, auth headers, Stripe secrets, card data, raw webhook
+payloads, recovery links.
+
+### Event taxonomy (open vocabulary; current emitters)
+
+- billing.checkout_started / portal_opened (actor: user)
+- billing.subscription_synced / subscription_canceled / payment_failed /
+  plan_changed / limits_updated (actor: stripe; plan_changed only when
+  the plan actually changes, limits_updated on every plan-mapping apply)
+- camera.created / updated / claimed (agent-driven register/claim log as
+  actor system; web create/update as the user; idempotent agent
+  re-register is NOT logged)
+- api_token.created / revoked (metadata: token_name + scopes only)
+- rule.created / updated / deleted
+- workflow.created / updated / deleted / enabled / disabled (explicit
+  enabled flips get their own event type)
+- stream_session.limit_rejected (actor system; metadata: limit_code +
+  the rejection's details — quota/concurrency/stream-type/codec/fps/
+  resolution/bitrate all flow through the same LimitExceeded catch).
+  Recorded on a fresh connection because the rejected transaction rolls
+  back.
+
+### `GET /v1/audit-logs` (auth: `current_user`, any member)
+
+Account configuration is member-readable everywhere else in the API, so
+audit reads are too. Params: `account_id`, `limit` (default 50, max 100),
+`before` (created_at keyset cursor), `event_type`, `resource_type`,
+`resource_id`. Response: `{items: [{id, created_at, actor: {type,
+user_id}, event_type, resource_type, resource_id, summary, metadata}],
+next_cursor}`. `next_cursor` = last item's created_at when the page is
+full. Stored `ip_address`/`user_agent` are never returned.

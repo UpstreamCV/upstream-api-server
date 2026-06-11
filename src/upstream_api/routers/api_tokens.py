@@ -19,6 +19,7 @@ from upstream_api.security.deps import (
     SettingsDep,
     require_account_role,
 )
+from upstream_api.services.account_audit import try_record_account_audit_log
 
 router = APIRouter(prefix="/v1/api-tokens", tags=["api-tokens"])
 
@@ -121,6 +122,17 @@ async def create_token(
             body.expires_at,
             user.user_id,
         )
+        assert row is not None
+        await try_record_account_audit_log(
+            conn,
+            account_id=body.account_id,
+            actor_user_id=user.user_id,
+            event_type="api_token.created",
+            resource_type="api_token",
+            resource_id=str(row["id"]),
+            summary=f"API token {body.name!r} created.",
+            metadata={"token_name": body.name, "scopes": list(body.scopes)},
+        )
     assert row is not None
 
     summary = ApiTokenSummary(
@@ -150,7 +162,7 @@ async def revoke_token(
     async with pool.acquire() as conn, conn.transaction():
         row = await conn.fetchrow(
             """
-            select t.revoked_at
+            select t.revoked_at, t.account_id, t.name
               from api_tokens t
               join account_members m
                 on m.account_id = t.account_id
@@ -168,4 +180,14 @@ async def revoke_token(
         await conn.execute(
             "update api_tokens set revoked_at = now() where id = $1",
             token_id,
+        )
+        await try_record_account_audit_log(
+            conn,
+            account_id=row["account_id"],
+            actor_user_id=user.user_id,
+            event_type="api_token.revoked",
+            resource_type="api_token",
+            resource_id=str(token_id),
+            summary=f"API token {row['name']!r} revoked.",
+            metadata={"token_name": row["name"]},
         )
