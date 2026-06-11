@@ -2182,3 +2182,84 @@ minutes this period reach `account_limits.monthly_minutes_quota`:
 - A quota of 0 blocks all session starts (no 0-means-unlimited convention
   in this codebase). All pre-existing checks (concurrent sessions, stream
   type, codec/fps/resolution/bitrate) are unchanged and run as before.
+
+## Module 7 M2 — Stripe Checkout + Customer Portal
+
+Stripe-HOSTED checkout and billing management — Upstream never renders a
+card form and stores only customer/subscription/price identifiers.
+Deliberately deferred: metered billing, usage invoices, coupons, invoice
+history UI, plans table.
+
+Migration `20260616120000_account_billing.sql`: `account_billing` (1:1
+with accounts; nullable Stripe refs + subscription state; RLS member
+select) and `stripe_events` (webhook idempotency ledger; id = Stripe
+event id; RLS enabled with no policies — service-role only).
+
+### Env (all optional — unset ⇒ 503 `billing_not_configured` and the
+dashboard's "coming soon" fallback)
+
+- `UPSTREAM_STRIPE_SECRET_KEY` — sk_test_/sk_live_
+- `UPSTREAM_STRIPE_WEBHOOK_SECRET` — whsec_ for the endpoint below
+- `UPSTREAM_STRIPE_PRICE_STARTER_MONTHLY` / `UPSTREAM_STRIPE_PRICE_PRO_MONTHLY`
+  — price_ IDs from the Stripe dashboard
+- `UPSTREAM_DASHBOARD_BASE_URL` — Checkout/Portal return base (no slash)
+
+### `POST /v1/billing/checkout` (user auth, owner/admin)
+
+Body `{"account_id": "...", "plan": "starter"|"pro"}` → `{"url": "https://checkout.stripe.com/..."}`.
+Creates (or reuses) the account's Stripe customer, then a subscription-mode
+Checkout Session with `account_id`/`plan_key` stamped in both session AND
+subscription metadata. Plan keys map to price IDs via env; limits per plan
+live in `services/plans.py` (PLACEHOLDER values — pricing is configurable,
+not final). Errors: 403 role/tenancy, 422 unknown plan, 503 unconfigured.
+
+### `POST /v1/billing/portal` (user auth, owner/admin)
+
+Body `{"account_id": "..."}` → `{"url": "https://billing.stripe.com/..."}`.
+409 `billing_no_customer` before any checkout has created a customer.
+
+### `POST /v1/webhooks/stripe`
+
+No user auth — authentication is the `Stripe-Signature` check against the
+RAW request body (400 `invalid_webhook_signature` on failure/missing).
+Every event id is recorded in `stripe_events` first; duplicates ack
+`{"received": true, "duplicate": true}` without reprocessing. Handled:
+
+- `checkout.session.completed` — links customer/subscription to
+  metadata.account_id, then RETRIEVES the subscription from Stripe (the
+  session payload's copy is incomplete) and syncs.
+- `customer.subscription.created/updated/deleted` — sync status, price,
+  period (reads item-level current_period_* with top-level fallback —
+  both Stripe API shapes), cancel_at_period_end.
+- `invoice.payment_failed` — records past_due immediately; plan/limits
+  untouched.
+- Anything else: recorded + acked, unprocessed.
+
+### Subscription sync contract
+
+- `active`/`trialing` + known price → `accounts.plan` and the WHOLE
+  `account_limits` row are overwritten from the plan mapping (hand-tuned
+  limits don't survive a plan change). Unknown price → state recorded,
+  limits untouched (logged `stripe_price_unmapped`).
+- `cancel_at_period_end` → flag recorded, nothing downgrades until Stripe
+  deletes the subscription at period end.
+- deleted/`canceled` → downgrade to `free` plan + free limits. Cameras /
+  workflows / rules are never deleted; free limits just gate new activity.
+- `past_due`/`unpaid`/`incomplete*` → status recorded, plan/limits kept
+  (grace; Stripe dunning decides when it actually cancels).
+- `accounts.status` is NEVER touched — it stays account lifecycle state.
+
+### Usage summary `billing` block
+
+`GET /v1/usage/summary` responses now include:
+
+```json
+"billing": {"provider": "stripe", "configured": true, "status": "active",
+             "subscription_status": "active",
+             "current_period_start": "...", "current_period_end": "...",
+             "cancel_at_period_end": false, "management_available": true}
+```
+
+`status` is derived (`none|active|trialing|past_due|canceled`; every
+payment-trouble Stripe status maps to `past_due`). Stripe IDs are never
+exposed to the dashboard.

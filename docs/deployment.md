@@ -120,3 +120,30 @@ After teardown, update this file (and `commit-log.md`) so the next agent doesn't
 ## Streaming server (separate, not yet provisioned)
 
 When `upstream-streaming-server` lands it will need its own EC2 instance with **UDP** ports open in the security group for SRT ingest. Plan for a second t4g.small (or larger, depending on bitrate × camera count) — do not bolt it onto this box, the concerns are different and the resource needs scale differently.
+
+## Stripe (Module 7 M2)
+
+Optional — with no Stripe env vars the billing endpoints return 503 and
+the dashboard shows "Billing management coming soon". To enable:
+
+1. In the Stripe Dashboard create two recurring monthly prices (Starter,
+   Pro) and copy their `price_...` IDs.
+2. Set on the api-server:
+   `UPSTREAM_STRIPE_SECRET_KEY`, `UPSTREAM_STRIPE_PRICE_STARTER_MONTHLY`,
+   `UPSTREAM_STRIPE_PRICE_PRO_MONTHLY`,
+   `UPSTREAM_DASHBOARD_BASE_URL=https://<your dashboard origin>`.
+3. Add a webhook endpoint in Stripe (Developers → Webhooks) pointing at
+   `https://<api host>/v1/webhooks/stripe` with events:
+   `checkout.session.completed`, `customer.subscription.created`,
+   `customer.subscription.updated`, `customer.subscription.deleted`,
+   `invoice.payment_failed`. Copy the signing secret into
+   `UPSTREAM_STRIPE_WEBHOOK_SECRET`.
+4. Apply the `account_billing` migration (`supabase db push`) and deploy.
+5. Customer Portal: enable it once at
+   Stripe Dashboard → Settings → Billing → Customer portal.
+
+Local testing: `stripe listen --forward-to localhost:4000/v1/webhooks/stripe`
+prints a `whsec_...` to use as the webhook secret; pay with card
+4242 4242 4242 4242 in test mode. Caddy note: the webhook path must pass
+the raw body through untouched (no buffering rewrites) — default reverse
+proxying is fine.
