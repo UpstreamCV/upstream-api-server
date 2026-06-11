@@ -55,9 +55,16 @@ RuleSeverity = Literal["info", "warning", "critical"]
 #   cross-class aggregates (M7D). Extending these to line_crossing needs a
 #   processor change (per-object crossing attribution) — documented
 #   follow-up, not faked here.
-# - min_confidence: deferred entirely — no observation payload carries
-#   confidence today (the processor has it internally on detection objects;
-#   follow-up is to stamp it onto zone/dwell payloads).
+# - min_confidence: zone_entered + dwell_exceeded — the processor's
+#   payload-enrichment side task stamps per-object detection confidence
+#   onto zone/dwell events (omitted when the track wasn't detected in the
+#   triggering frame, so the no-match-on-missing posture still applies).
+#   Still unavailable on line_crossing (no per-object attribution).
+# - object_class (roi_occupancy): the same side task populates
+#   ``class_counts`` from object-attributed ROI membership; when set, the
+#   min/max count bounds apply to that class's count instead of
+#   total_count. Pre-enrichment events carry an empty breakdown, which
+#   counts as zero — safe because min_total_count's floor is 1.
 # - direction: deferred — in the line_crossing payload contract but never
 #   produced (cumulative counters are direction-blind).
 # - schedule: all rule types — evaluated inline from the observation
@@ -65,14 +72,19 @@ RuleSeverity = Literal["info", "warning", "critical"]
 _SCHEDULE_KEY = "schedule"
 _ALLOWED_CONFIG_KEYS: dict[str, frozenset[str]] = {
     "line_crossing": frozenset({"line_id", _SCHEDULE_KEY}),
-    "roi_occupancy": frozenset({"roi_id", "min_total_count", "max_total_count", _SCHEDULE_KEY}),
-    "zone_entered": frozenset({"zone_id", "object_classes", "require_track_id", _SCHEDULE_KEY}),
+    "roi_occupancy": frozenset(
+        {"roi_id", "min_total_count", "max_total_count", "object_class", _SCHEDULE_KEY}
+    ),
+    "zone_entered": frozenset(
+        {"zone_id", "object_classes", "require_track_id", "min_confidence", _SCHEDULE_KEY}
+    ),
     "dwell_exceeded": frozenset(
         {
             "zone_id",
             "min_duration_seconds",
             "object_classes",
             "require_track_id",
+            "min_confidence",
             _SCHEDULE_KEY,
         }
     ),
@@ -170,6 +182,14 @@ def validate_rule_config(rule_type: str, config: dict[str, Any]) -> list[str]:
             )
     if "require_track_id" in config and not isinstance(config["require_track_id"], bool):
         problems.append("config.require_track_id must be a boolean.")
+    if "min_confidence" in config:
+        value = config["min_confidence"]
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or not (0 < value <= 1):
+            problems.append("config.min_confidence must be a number in (0, 1].")
+    if "object_class" in config and not (
+        isinstance(config["object_class"], str) and config["object_class"].strip()
+    ):
+        problems.append("config.object_class must be a non-empty string.")
     if _SCHEDULE_KEY in config:
         _validate_schedule(config[_SCHEDULE_KEY], problems)
     return problems

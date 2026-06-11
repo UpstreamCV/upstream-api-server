@@ -1841,20 +1841,21 @@ against the DeepStream analytics worker:
 | `max_total_count`    | roi_occupancy                   | `total_count`        |
 | `schedule`           | all four types                  | observation time     |
 
-**Deferred (documented processor follow-ups, not faked):**
+**Deferred at M3 (processor follow-ups):**
 
-- `min_confidence` — NO observation payload carries confidence today. The
-  processor has per-detection confidence internally (`metadata_models`
-  detection objects); the follow-up is stamping it onto zone/dwell payloads
-  (and line crossings once per-object attribution exists).
+> Update: the processor's payload-enrichment side task later unlocked
+> `min_confidence` (zone/dwell) and per-class ROI counts — see the
+> "Payload-enrichment unlock" section below. The rest stay deferred.
+
 - `direction` — in the line_crossing payload contract but never produced:
   production line crossings come from nvdsanalytics CUMULATIVE line
   counters, which are direction-blind aggregates.
-- `object_classes` / `require_track_id` on line_crossing — same root cause:
-  cumulative counters have no per-object attribution.
-- per-class ROI counts — ROI occupancy counts are cross-class aggregates
-  (M7D); `class_counts` in the payload contract is not populated per-class
-  by the production worker.
+- `object_classes` / `require_track_id` / `min_confidence` on
+  line_crossing — same root cause: cumulative counters have no per-object
+  attribution. Per-object `lcStatus` labels exist in the processor's object
+  metadata, so a per-object line-crossing producer is feasible, but it
+  replaces the cumulative-counter state machine (idempotency/dedupe
+  semantics) — a documented processor follow-up.
 - "no detections for N minutes" — needs a periodic evaluator (still none).
 
 ### Match semantics
@@ -1897,3 +1898,39 @@ no workflow run, no alert. A malformed stored schedule degrades to
 { "roi_id": "roi-1", "min_total_count": 2, "max_total_count": 10,
   "schedule": {"start_time": "22:00", "end_time": "06:00", "timezone": "UTC"} }
 ```
+
+
+## Workflow Engine — payload-enrichment unlock (post-M3)
+
+The processor side task "Workflow Condition Payload Enrichment" enriched
+observation payloads with provable fields, unlocking two previously-deferred
+rule conditions. No migration, no new endpoints — `config` vocabulary and
+matcher only. Missing fields still mean NO match (the processor omits
+`confidence` when the track wasn't detected in the triggering frame, and
+pre-enrichment events carry an empty `class_counts`).
+
+| condition        | rule types                   | payload field            |
+|------------------|------------------------------|--------------------------|
+| `min_confidence` | zone_entered, dwell_exceeded | `confidence` (per-object detection confidence in the triggering frame; inclusive threshold, number in (0, 1]) |
+| `object_class`   | roi_occupancy                | `class_counts` (object-attributed per-class ROI counts) |
+
+`object_class` (single class name) scopes the existing
+`min_total_count` / `max_total_count` bounds to that class's count instead
+of the aggregate `total_count`. A class absent from the breakdown counts as
+zero; a payload with no `class_counts` dict can't prove anything and never
+matches. Because `min_total_count`'s floor is 1, pre-enrichment events
+(empty breakdown) can never match a class-scoped rule.
+
+Example: "alert when more than 3 cars are in the loading ROI, but only with
+confident person detections in the pick zone after hours" is now two rules:
+
+```json
+{ "roi_id": "loading", "object_class": "car", "min_total_count": 4 }
+```
+```json
+{ "zone_id": "pick", "object_classes": ["person"], "min_confidence": 0.75,
+  "schedule": {"start_time": "18:00", "end_time": "08:00", "timezone": "America/New_York"} }
+```
+
+Still deferred (honestly): all line_crossing conditions beyond `line_id` +
+`schedule`, and periodic-evaluation rule types.

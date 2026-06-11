@@ -215,15 +215,28 @@ def _track_ok(config: dict[str, Any], payload: dict[str, Any]) -> bool:
     return isinstance(track, str) and track != ""
 
 
+def _confidence_ok(config: dict[str, Any], payload: dict[str, Any]) -> bool:
+    """min_confidence (unlocked by the processor payload-enrichment side
+    task). The processor omits ``confidence`` when the track wasn't
+    detected in the triggering frame — a confidence-filtered rule never
+    matches an observation that can't prove it."""
+    min_confidence = config.get("min_confidence")
+    if min_confidence is None:
+        return True
+    confidence = payload.get("confidence")
+    return isinstance(confidence, (int, float)) and confidence >= min_confidence
+
+
 def rule_matches(rule_type: str, config: dict[str, Any], payload: dict[str, Any]) -> bool:
     """Pure match decision for one rule against one observation payload.
 
     A missing optional filter key means "match any". A payload missing the
     field a filter needs does NOT match (a rule scoped to line A must never
     fire on an observation that can't prove it came from line A — and a
-    class-filtered rule must never fire on an observation that can't prove
-    its object class). Time-window gating is separate (``schedule_allows``)
-    because it needs the observation timestamp, not the payload.
+    class- or confidence-filtered rule must never fire on an observation
+    that can't prove its class/confidence). Time-window gating is separate
+    (``schedule_allows``) because it needs the observation timestamp, not
+    the payload.
     """
     if rule_type == "line_crossing":
         line_id = config.get("line_id")
@@ -232,24 +245,45 @@ def rule_matches(rule_type: str, config: dict[str, Any], payload: dict[str, Any]
         roi_id = config.get("roi_id")
         if roi_id is not None and payload.get("roi_id") != roi_id:
             return False
-        total = payload.get("total_count")
-        if not isinstance(total, (int, float)):
+        # object_class (payload-enrichment unlock): when set, the count
+        # bounds apply to that class's object-attributed count instead of
+        # the aggregate total. A payload without a class_counts dict can't
+        # prove anything — no match. An empty/partial breakdown counts as
+        # zero for absent classes, which is safe: min_total_count's floor
+        # is 1, so pre-enrichment events (always {}) can never match.
+        object_class = config.get("object_class")
+        if object_class is not None:
+            class_counts = payload.get("class_counts")
+            if not isinstance(class_counts, dict):
+                return False
+            counted = class_counts.get(object_class, 0)
+        else:
+            counted = payload.get("total_count")
+        if not isinstance(counted, (int, float)):
             return False
         min_count = config.get("min_total_count", 1)
-        if total < min_count:
+        if counted < min_count:
             return False
         max_count = config.get("max_total_count")
-        return max_count is None or total <= max_count
+        return max_count is None or counted <= max_count
     if rule_type == "zone_entered":
         zone_id = config.get("zone_id")
         if zone_id is not None and payload.get("zone_id") != zone_id:
             return False
-        return _classes_allowed(config, payload) and _track_ok(config, payload)
+        return (
+            _classes_allowed(config, payload)
+            and _track_ok(config, payload)
+            and _confidence_ok(config, payload)
+        )
     if rule_type == "dwell_exceeded":
         zone_id = config.get("zone_id")
         if zone_id is not None and payload.get("zone_id") != zone_id:
             return False
-        if not _classes_allowed(config, payload) or not _track_ok(config, payload):
+        if (
+            not _classes_allowed(config, payload)
+            or not _track_ok(config, payload)
+            or not _confidence_ok(config, payload)
+        ):
             return False
         min_duration = config.get("min_duration_seconds")
         if min_duration is None:
