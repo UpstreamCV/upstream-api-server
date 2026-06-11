@@ -78,10 +78,15 @@ class FakeConn:
 
     async def fetchrow(self, query: str, *args: Any) -> dict[str, Any] | None:
         self.fetches.append((query, args))
-        if "select plan, status from accounts" in query:
+        if "from accounts where id = $1 for update" in query:
             if self.account_row is None:
                 return None
-            return {"plan": self.account_row["plan"], "status": self.account_row["status"]}
+            return {
+                "name": self.account_row["name"],
+                "slug": self.account_row["slug"],
+                "plan": self.account_row["plan"],
+                "status": self.account_row["status"],
+            }
         if "update account_limits" in query:
             assert self.limits_row is not None
             return self.limits_row

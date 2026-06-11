@@ -7,6 +7,7 @@ from uuid import UUID
 from fastapi import APIRouter, Query
 
 from upstream_api.errors import NotFoundError
+from upstream_api.observability.logging import get_logger
 from upstream_api.schemas.platform_admin import (
     AdminHeartbeat,
     AdminProcessorStatus,
@@ -17,9 +18,19 @@ from upstream_api.schemas.platform_admin import (
     AdminStreamsSummaryResponse,
     AdminStreamValidation,
 )
-from upstream_api.security.deps import CurrentPlatformAdmin, PoolDep
+from upstream_api.security.deps import CurrentPlatformAdmin, PoolDep, SettingsDep
+from upstream_api.security.streamid import extract_stream_key
+from upstream_api.services.admin_audit import record_admin_action
+from upstream_api.services.http_client import HttpClientDep
+from upstream_api.services.mediamtx_provisioning import (
+    MediaMTXProvisioningFailure,
+    deprovision_path,
+)
+from upstream_api.services.session_lifecycle import stop_session
 
 router = APIRouter()
+
+_log = get_logger("platform_admin.streams")
 
 _SESSION_ITEM_SELECT = """
     select s.id, s.account_id, a.name as account_name, a.slug::text as account_slug,
@@ -308,3 +319,60 @@ async def get_stream(
             for r in processor_rows
         ],
     )
+
+
+@router.post("/streams/{session_id}/stop", response_model=AdminStreamItem)
+async def force_stop_stream(
+    session_id: UUID,
+    admin: CurrentPlatformAdmin,
+    pool: PoolDep,
+    settings: SettingsDep,
+    http: HttpClientDep,
+) -> AdminStreamItem:
+    """Force-end a stuck session: ``approved|streaming`` -> ``ended`` with
+    end_reason ``admin_forced``, mirrors the camera back to idle, records the
+    usage event, best-effort deprovisions the MediaMTX path. Audited."""
+    async with pool.acquire() as conn, conn.transaction():
+        owner = await conn.fetchrow(
+            "select account_id, state::text as state from stream_sessions where id = $1",
+            session_id,
+        )
+        if owner is None:
+            raise NotFoundError("Stream session not found.", code="session_not_found")
+        stopped = await stop_session(
+            conn,
+            account_id=owner["account_id"],
+            session_id=session_id,
+            reason="admin_forced",
+        )
+        await record_admin_action(
+            conn,
+            admin_user_id=admin.user_id,
+            action="stream.force_stop",
+            target_type="stream_session",
+            target_id=session_id,
+            before={"state": owner["state"]},
+            after={"state": stopped.state, "end_reason": "admin_forced"},
+        )
+
+    # Best-effort MediaMTX deprovision — same posture as the agent stop route.
+    try:
+        await deprovision_path(
+            http,
+            base_url=settings.mediamtx_api_base_url,
+            path=extract_stream_key(stopped.streamid),
+        )
+    except (MediaMTXProvisioningFailure, ValueError) as exc:
+        _log.warning(
+            "admin_mediamtx_deprovision_failed",
+            session_id=str(session_id),
+            reason=str(exc),
+        )
+
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            _SESSION_ITEM_SELECT + _SESSION_ITEM_JOINS + " where s.id = $1",
+            session_id,
+        )
+    assert row is not None
+    return _item_from_row(dict(row))

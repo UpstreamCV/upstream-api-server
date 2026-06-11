@@ -1535,6 +1535,28 @@ All mutations write an `admin_audit_log` row (`{before, after}` diff,
 | GET | `/v1/admin/usage/summary?days=30` | Per-account totals over the trailing window (`days` 1–365). |
 | GET | `/v1/admin/audit-log?admin_user_id=&target_id=&limit=&offset=` | `{items, total}`, newest first. |
 
+### Editing endpoints (added 2026-06-11)
+
+| Method | Path | Notes |
+|---|---|---|
+| POST | `/v1/admin/accounts` | Provision a tenant: `{name, slug?, plan?, owner_email?, owner_password?}`. Slug derived from name when omitted (signup-trigger recipe); limits row gets the trigger's permissive defaults. Unknown owner email without password → `400 owner_not_found`; duplicate slug → `409 slug_taken`. Audited (`account.create`). |
+| PATCH | `/v1/admin/accounts/{id}` | Extended: also accepts `{name?, slug?}` (slug `^[a-z0-9][a-z0-9-]*$`; conflict → `409 slug_taken`). |
+| POST | `/v1/admin/accounts/{id}/members` | `{email, role, password?}` — attaches an existing auth user, or creates one (confirmed, via GoTrue Admin API) when `password` given. `400 member_user_not_found`, `409 member_exists`. Audited. |
+| PATCH | `/v1/admin/accounts/{id}/members/{user_id}` | `{role}`. Demoting the only owner → `409 last_owner`. Audited. |
+| DELETE | `/v1/admin/accounts/{id}/members/{user_id}` | Removing the only owner → `409 last_owner`. Audited. |
+| POST | `/v1/admin/accounts/{id}/api-tokens` | `{name}` → issues an agent token; `plaintext` returned exactly once, never stored/audited. Audited (`account.api_token.create`, prefix only). |
+| DELETE | `/v1/admin/accounts/{id}/api-tokens/{token_id}` | Idempotent soft-revoke. Audited. |
+| POST | `/v1/admin/streams/{session_id}/stop` | Force-stop: `approved\|streaming` → `ended` (`end_reason=admin_forced`), camera mirrored to idle, usage event recorded, best-effort MediaMTX deprovision. Audited (`stream.force_stop`). |
+| POST | `/v1/admin/users/recovery-link` | `{email}` → one-time GoTrue recovery `action_link` for out-of-band delivery. Link NOT audited (event is, without the link). `404 user_not_found`. |
+| GET | `/v1/admin/platform-admins` | Allowlist with emails. |
+| POST | `/v1/admin/platform-admins` | `{email, note?}` — grants an EXISTING auth user admin access (`400 user_not_found`, `409 already_admin`). Audited. |
+| DELETE | `/v1/admin/platform-admins/{user_id}` | Revokes; self-removal → `409 cannot_remove_self`. Audited. |
+
+GoTrue admin calls (`services/supabase_admin.py`) use the service-role key
+against `<supabase_url>/auth/v1/admin/*` through the shared httpx client;
+failures surface as `502 auth_admin_unreachable` / `auth_admin_error` or
+`400 auth_user_invalid`.
+
 **Suspension enforcement:** `POST /v1/stream-sessions/start` now rejects with
 `403 account_suspended` when `accounts.status != 'active'` (checked in
 `services/limits.check_account_active` before the limits load). Suspension
