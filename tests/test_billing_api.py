@@ -608,3 +608,90 @@ def test_billing_block_canceled() -> None:
     )
     assert block.status == "canceled"
     assert block.management_available is True  # portal still reachable
+
+
+# ---------------------------------------------------------------------------
+# Real-SDK conversion regression (found in production, 2026-06-11): a live
+# stripe.Event is dict-LIKE but not a dict — dict(event) raises KeyError: 0
+# and StripeObject has no .get(). The gateway must hand plain recursive
+# dicts to the webhook handlers.
+# ---------------------------------------------------------------------------
+
+
+def test_construct_event_returns_plain_recursive_dicts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import stripe
+
+    from upstream_api.services.stripe_gateway import StripeGateway
+
+    real_event = stripe.Event.construct_from(
+        {
+            "id": "evt_real",
+            "type": "customer.subscription.updated",
+            "data": {
+                "object": {
+                    "id": "sub_1",
+                    "customer": "cus_1",
+                    "status": "active",
+                    "cancel_at_period_end": False,
+                    "metadata": {"account_id": str(uuid4())},
+                    "items": {
+                        "data": [
+                            {
+                                "price": {"id": _PRICE_STARTER},
+                                "current_period_start": 1_765_000_000,
+                                "current_period_end": 1_767_592_000,
+                            }
+                        ]
+                    },
+                }
+            },
+        },
+        "sk_test_dummy",
+    )
+    monkeypatch.setattr(stripe.Webhook, "construct_event", lambda *a, **k: real_event)
+    gateway = StripeGateway(secret_key="sk_test_dummy", webhook_secret="whsec_x")
+    event = gateway.construct_event(b"{}", "sig")
+    # The exact downstream access pattern the webhook router uses:
+    assert type(event) is dict
+    obj = dict((event.get("data") or {}).get("object") or {})
+    assert obj["id"] == "sub_1"
+    items = obj.get("items") or {}
+    assert type(items) is dict  # recursion reached nested objects
+    assert items["data"][0]["price"]["id"] == _PRICE_STARTER
+
+
+async def test_retrieve_subscription_returns_plain_dict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import stripe
+
+    from upstream_api.services.billing import _subscription_fields
+    from upstream_api.services.stripe_gateway import StripeGateway
+
+    real_sub = stripe.Subscription.construct_from(
+        {
+            "id": "sub_2",
+            "customer": "cus_2",
+            "status": "active",
+            "cancel_at_period_end": False,
+            "items": {
+                "data": [
+                    {
+                        "price": {"id": _PRICE_PRO},
+                        "current_period_start": 1_765_000_000,
+                        "current_period_end": 1_767_592_000,
+                    }
+                ]
+            },
+        },
+        "sk_test_dummy",
+    )
+    monkeypatch.setattr(stripe.Subscription, "retrieve", lambda *a, **k: real_sub)
+    gateway = StripeGateway(secret_key="sk_test_dummy", webhook_secret=None)
+    sub = await gateway.retrieve_subscription("sub_2")
+    assert type(sub) is dict
+    fields = _subscription_fields(sub)
+    assert fields["price_id"] == _PRICE_PRO
+    assert fields["period_end"] is not None

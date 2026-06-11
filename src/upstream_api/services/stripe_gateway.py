@@ -108,7 +108,11 @@ class StripeGateway:
             raise InvalidWebhookSignatureError(
                 "Stripe webhook signature verification failed."
             ) from exc
-        return dict(event)
+        # StripeObject is dict-LIKE but not a dict (no keys()/get();
+        # dict(event) falls into the sequence protocol and raises
+        # KeyError: 0). to_dict() converts recursively to plain dicts.
+        data: dict[str, Any] = event.to_dict()
+        return data
 
 
 def get_stripe_gateway() -> StripeGateway:
