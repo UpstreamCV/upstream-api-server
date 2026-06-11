@@ -198,11 +198,34 @@ class AdminAccountDetailResponse(BaseModel):
 
 
 class AdminAccountUpdate(BaseModel):
-    """PATCH body for plan/status. `deleted` is deliberately not settable
-    from the panel — account deletion stays a manual, considered operation."""
+    """PATCH body for identity/plan/status. `deleted` is deliberately not
+    settable from the panel — account deletion stays a manual, considered
+    operation."""
 
+    name: str | None = Field(default=None, min_length=1, max_length=200)
+    slug: str | None = Field(
+        default=None, min_length=2, max_length=80, pattern=r"^[a-z0-9][a-z0-9-]*$"
+    )
     plan: Literal["free", "pro", "enterprise"] | None = None
     status: Literal["active", "suspended"] | None = None
+
+
+class AdminAccountCreate(BaseModel):
+    """POST body for provisioning a tenant directly from the panel.
+
+    `slug` is derived from the name when omitted (same recipe as the signup
+    trigger: lowercased, dashed, uuid suffix). `owner_email` optionally
+    attaches a first owner — an existing auth user, or a new one when
+    `owner_password` is also given.
+    """
+
+    name: str = Field(min_length=1, max_length=200)
+    slug: str | None = Field(
+        default=None, min_length=2, max_length=80, pattern=r"^[a-z0-9][a-z0-9-]*$"
+    )
+    plan: Literal["free", "pro", "enterprise"] = "free"
+    owner_email: str | None = Field(default=None, max_length=320)
+    owner_password: str | None = Field(default=None, min_length=8, max_length=200)
 
 
 class AdminAccountLimitsUpdate(BaseModel):
@@ -222,6 +245,56 @@ class AdminAccountMember(BaseModel):
     role: str
     email: str | None
     created_at: datetime
+
+
+class AdminMemberAdd(BaseModel):
+    """POST body for attaching a member. When the email has no auth user yet,
+    `password` must be provided so the user can be created (confirmed) via
+    the GoTrue Admin API."""
+
+    email: str = Field(max_length=320)
+    role: Literal["owner", "admin", "viewer"]
+    password: str | None = Field(default=None, min_length=8, max_length=200)
+
+
+class AdminMemberUpdate(BaseModel):
+    role: Literal["owner", "admin", "viewer"]
+
+
+class AdminRecoveryLinkRequest(BaseModel):
+    email: str = Field(max_length=320)
+
+
+class AdminRecoveryLinkResponse(BaseModel):
+    email: str
+    action_link: str
+
+
+class AdminApiTokenCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+
+
+class AdminApiTokenCreateResponse(BaseModel):
+    """`plaintext` is shown exactly once; it is never stored or audited."""
+
+    token: AdminApiToken
+    plaintext: str
+
+
+class AdminPlatformAdminEntry(BaseModel):
+    user_id: UUID
+    email: str | None
+    note: str | None
+    created_at: datetime
+
+
+class AdminPlatformAdminsResponse(BaseModel):
+    admins: list[AdminPlatformAdminEntry]
+
+
+class AdminPlatformAdminAdd(BaseModel):
+    email: str = Field(max_length=320)
+    note: str | None = Field(default=None, max_length=300)
 
 
 class AdminAccountMembersResponse(BaseModel):

@@ -4,6 +4,57 @@ Reverse chronological. Newest at top. Every meaningful commit gets an entry foll
 
 ---
 
+## 2026-06-11 - feat(admin): editing surface — account create/edit, members, tokens, force-stop, platform-admins
+
+### Summary
+The platform-admin panel goes read-write across the account lifecycle:
+provision tenants, edit identity (name/slug), manage members (attach by
+email or create the auth user via GoTrue Admin API; last-owner guards),
+issue/revoke agent tokens cross-tenant (one-time plaintext), force-stop
+stuck stream sessions, mint password-recovery links, and manage the
+platform_admins allowlist from the panel (self-removal blocked). Every
+mutation writes an admin_audit_log row; plaintext secrets and recovery
+links are never stored or audited.
+
+### Files touched
+- `src/upstream_api/services/supabase_admin.py` — new GoTrue Admin REST
+  client (create confirmed user, generate recovery link) over the shared
+  httpx client; typed 400/502 error mapping.
+- `src/upstream_api/routers/platform_admin/accounts.py` — POST /accounts
+  (slug derivation mirrors the signup trigger; optional owner attach/create),
+  PATCH extended to name/slug (409 slug_taken), member POST/PATCH/DELETE
+  (409 last_owner / member_exists), token POST/DELETE.
+- `src/upstream_api/routers/platform_admin/streams.py` — POST
+  /streams/{id}/stop reusing services/session_lifecycle.stop_session with
+  reason=admin_forced + best-effort MediaMTX deprovision (same posture as
+  the agent stop route).
+- `src/upstream_api/routers/platform_admin/users.py` — new: recovery-link +
+  platform-admins CRUD.
+- `src/upstream_api/schemas/platform_admin.py` — request/response models
+  (Literal role/plan vocabularies, slug pattern, password min length).
+- `tests/test_platform_admin_editing.py` — 21 tests incl. guards, audit
+  capture, plaintext-never-in-SQL assertion, GoTrue MockTransport tests.
+- `tests/test_platform_admin_accounts.py` — PATCH fake updated for the
+  widened before-row query.
+- `docs/api-contracts.md`, `docs/module-map.md` — endpoint table + module
+  entries.
+
+### System interaction notes
+`panel proxy → current_platform_admin → handler → (GoTrue Admin API via
+app.state.http_client where users are created) → row changes + audit insert
+in one transaction`. Force-stop fans out to MediaMTX after commit.
+
+### Testing/checks
+`pytest` 1129 passed; `ruff check`/`format` clean; mypy clean on all new
+files (the 47 pre-existing errors in five Module-7/Workflow test files
+remain, untouched).
+
+### Strict non-goals
+- No account deletion (`deleted` stays unreachable from the panel).
+- No impersonation.
+
+---
+
 ## 2026-06-11 - merge: main into feat/platform-admin-panel (admin surface rebased onto Module 7 + Workflow Engine)
 
 ### Summary

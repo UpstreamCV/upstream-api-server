@@ -16,6 +16,7 @@ from upstream_api.routers.platform_admin import (
     streams,
     system,
     usage,
+    users,
 )
 
 router = APIRouter(prefix="/v1/admin", tags=["platform-admin"])
@@ -25,3 +26,4 @@ router.include_router(streams.router)
 router.include_router(accounts.router)
 router.include_router(usage.router)
 router.include_router(audit.router)
+router.include_router(users.router)
