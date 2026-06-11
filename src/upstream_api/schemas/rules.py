@@ -12,9 +12,11 @@ deferred — they need a periodic evaluator, which does not exist yet.
 
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from typing import Any, Literal
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -41,12 +43,87 @@ RuleSeverity = Literal["info", "warning", "critical"]
 
 # Per-type allowed config keys. Unknown keys are rejected so typos surface at
 # authoring time, not as silently-never-matching rules.
+#
+# M3 (richer conditions) deliberately allows a condition ONLY on rule types
+# whose production observation payloads actually carry the field it needs —
+# a rule that can never match is worse than a 422 at authoring time:
+#
+# - object_classes / require_track_id: zone_entered + dwell_exceeded only.
+#   The DeepStream worker stamps class_label / track_id on per-track zone
+#   and dwell events, but line crossings come from nvdsanalytics CUMULATIVE
+#   line counters (no per-object attribution), and ROI occupancy counts are
+#   cross-class aggregates (M7D). Extending these to line_crossing needs a
+#   processor change (per-object crossing attribution) — documented
+#   follow-up, not faked here.
+# - min_confidence: deferred entirely — no observation payload carries
+#   confidence today (the processor has it internally on detection objects;
+#   follow-up is to stamp it onto zone/dwell payloads).
+# - direction: deferred — in the line_crossing payload contract but never
+#   produced (cumulative counters are direction-blind).
+# - schedule: all rule types — evaluated inline from the observation
+#   timestamp, no periodic evaluator involved.
+_SCHEDULE_KEY = "schedule"
 _ALLOWED_CONFIG_KEYS: dict[str, frozenset[str]] = {
-    "line_crossing": frozenset({"line_id"}),
-    "roi_occupancy": frozenset({"roi_id", "min_total_count"}),
-    "zone_entered": frozenset({"zone_id"}),
-    "dwell_exceeded": frozenset({"zone_id", "min_duration_seconds"}),
+    "line_crossing": frozenset({"line_id", _SCHEDULE_KEY}),
+    "roi_occupancy": frozenset({"roi_id", "min_total_count", "max_total_count", _SCHEDULE_KEY}),
+    "zone_entered": frozenset({"zone_id", "object_classes", "require_track_id", _SCHEDULE_KEY}),
+    "dwell_exceeded": frozenset(
+        {
+            "zone_id",
+            "min_duration_seconds",
+            "object_classes",
+            "require_track_id",
+            _SCHEDULE_KEY,
+        }
+    ),
 }
+
+SCHEDULE_DAYS: tuple[str, ...] = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+_ALLOWED_SCHEDULE_KEYS = frozenset({"days", "start_time", "end_time", "timezone"})
+_HHMM_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
+MAX_OBJECT_CLASSES = 20
+
+
+def _validate_schedule(schedule: object, problems: list[str]) -> None:
+    if not isinstance(schedule, dict):
+        problems.append("config.schedule must be an object.")
+        return
+    unknown = sorted(set(schedule) - _ALLOWED_SCHEDULE_KEYS)
+    if unknown:
+        problems.append(f"Unknown schedule keys: {', '.join(unknown)}.")
+    for key in ("start_time", "end_time"):
+        value = schedule.get(key)
+        if not isinstance(value, str) or not _HHMM_RE.match(value):
+            problems.append(f'config.schedule.{key} must be an "HH:MM" string.')
+    if (
+        isinstance(schedule.get("start_time"), str)
+        and isinstance(schedule.get("end_time"), str)
+        and schedule.get("start_time") == schedule.get("end_time")
+    ):
+        problems.append(
+            "config.schedule start_time and end_time must differ "
+            "(a zero-length window never matches)."
+        )
+    tz = schedule.get("timezone")
+    if not isinstance(tz, str) or not tz.strip():
+        problems.append("config.schedule.timezone must be a non-empty IANA name.")
+    else:
+        try:
+            ZoneInfo(tz)
+        except Exception:
+            problems.append(f"config.schedule.timezone is not a known IANA zone: {tz!r}.")
+    if "days" in schedule:
+        days = schedule["days"]
+        if (
+            not isinstance(days, list)
+            or not days
+            or len(days) != len(set(days))
+            or any(d not in SCHEDULE_DAYS for d in days)
+        ):
+            problems.append(
+                "config.schedule.days must be a non-empty list of unique "
+                f"day keys from {list(SCHEDULE_DAYS)}."
+            )
 
 
 def validate_rule_config(rule_type: str, config: dict[str, Any]) -> list[str]:
@@ -61,14 +138,40 @@ def validate_rule_config(rule_type: str, config: dict[str, Any]) -> list[str]:
     for key in ("line_id", "roi_id", "zone_id"):
         if key in config and not (isinstance(config[key], str) and config[key].strip()):
             problems.append(f"config.{key} must be a non-empty string.")
-    if "min_total_count" in config:
-        value = config["min_total_count"]
-        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
-            problems.append("config.min_total_count must be an integer >= 1.")
+    for key in ("min_total_count", "max_total_count"):
+        if key in config:
+            value = config[key]
+            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                problems.append(f"config.{key} must be an integer >= 1.")
+    if (
+        isinstance(config.get("min_total_count"), int)
+        and isinstance(config.get("max_total_count"), int)
+        and not isinstance(config.get("min_total_count"), bool)
+        and not isinstance(config.get("max_total_count"), bool)
+        and config["max_total_count"] < config["min_total_count"]
+    ):
+        problems.append("config.max_total_count must be >= min_total_count.")
     if "min_duration_seconds" in config:
         value = config["min_duration_seconds"]
         if not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0:
             problems.append("config.min_duration_seconds must be a number > 0.")
+    if "object_classes" in config:
+        classes = config["object_classes"]
+        if (
+            not isinstance(classes, list)
+            or not classes
+            or len(classes) > MAX_OBJECT_CLASSES
+            or len(classes) != len({c for c in classes if isinstance(c, str)})
+            or any(not (isinstance(c, str) and c.strip()) for c in classes)
+        ):
+            problems.append(
+                "config.object_classes must be a non-empty list of up to "
+                f"{MAX_OBJECT_CLASSES} unique non-empty strings."
+            )
+    if "require_track_id" in config and not isinstance(config["require_track_id"], bool):
+        problems.append("config.require_track_id must be a boolean.")
+    if _SCHEDULE_KEY in config:
+        _validate_schedule(config[_SCHEDULE_KEY], problems)
     return problems
 
 

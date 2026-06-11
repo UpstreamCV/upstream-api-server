@@ -15,12 +15,14 @@ later without an API change).
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 import asyncpg
 
-from upstream_api.schemas.rules import RuleCreateRequest
+from upstream_api.schemas.rules import SCHEDULE_DAYS, RuleCreateRequest
 from upstream_api.services.processor import coerce_jsonb
 from upstream_api.services.workflow_runs import (
     finalize_workflow_run,
@@ -194,12 +196,34 @@ async def delete_rule(
     return bool(status == "DELETE 1")
 
 
+def _classes_allowed(config: dict[str, Any], payload: dict[str, Any]) -> bool:
+    """M3 object-class filter. A payload that can't prove its class
+    (missing/odd ``class_label``) never matches a class-filtered rule."""
+    classes = config.get("object_classes")
+    if classes is None:
+        return True
+    label = payload.get("class_label")
+    return isinstance(label, str) and isinstance(classes, list) and label in classes
+
+
+def _track_ok(config: dict[str, Any], payload: dict[str, Any]) -> bool:
+    """M3 require_track_id. The observation must be tied to a tracked
+    object; this is single-event only — NOT same-object sequencing."""
+    if not config.get("require_track_id"):
+        return True
+    track = payload.get("track_id")
+    return isinstance(track, str) and track != ""
+
+
 def rule_matches(rule_type: str, config: dict[str, Any], payload: dict[str, Any]) -> bool:
     """Pure match decision for one rule against one observation payload.
 
     A missing optional filter key means "match any". A payload missing the
     field a filter needs does NOT match (a rule scoped to line A must never
-    fire on an observation that can't prove it came from line A).
+    fire on an observation that can't prove it came from line A — and a
+    class-filtered rule must never fire on an observation that can't prove
+    its object class). Time-window gating is separate (``schedule_allows``)
+    because it needs the observation timestamp, not the payload.
     """
     if rule_type == "line_crossing":
         line_id = config.get("line_id")
@@ -208,15 +232,24 @@ def rule_matches(rule_type: str, config: dict[str, Any], payload: dict[str, Any]
         roi_id = config.get("roi_id")
         if roi_id is not None and payload.get("roi_id") != roi_id:
             return False
-        min_count = config.get("min_total_count", 1)
         total = payload.get("total_count")
-        return isinstance(total, (int, float)) and total >= min_count
+        if not isinstance(total, (int, float)):
+            return False
+        min_count = config.get("min_total_count", 1)
+        if total < min_count:
+            return False
+        max_count = config.get("max_total_count")
+        return max_count is None or total <= max_count
     if rule_type == "zone_entered":
         zone_id = config.get("zone_id")
-        return zone_id is None or payload.get("zone_id") == zone_id
+        if zone_id is not None and payload.get("zone_id") != zone_id:
+            return False
+        return _classes_allowed(config, payload) and _track_ok(config, payload)
     if rule_type == "dwell_exceeded":
         zone_id = config.get("zone_id")
         if zone_id is not None and payload.get("zone_id") != zone_id:
+            return False
+        if not _classes_allowed(config, payload) or not _track_ok(config, payload):
             return False
         min_duration = config.get("min_duration_seconds")
         if min_duration is None:
@@ -224,6 +257,53 @@ def rule_matches(rule_type: str, config: dict[str, Any], payload: dict[str, Any]
         duration = payload.get("duration_seconds")
         return isinstance(duration, (int, float)) and duration >= min_duration
     return False
+
+
+def schedule_allows(config: dict[str, Any], observed_at: datetime) -> bool:
+    """M3 time-window gate, evaluated inline from the observation timestamp
+    (no periodic evaluator). Pure and non-raising — it runs inside the
+    ingest savepoint, so a malformed stored schedule degrades to "no match"
+    rather than an exception.
+
+    Semantics: the observation time is converted to the schedule's IANA
+    timezone. ``days`` (default: every day) names the LOCAL day the window
+    STARTS on. ``start_time < end_time`` is a same-day window matching
+    ``start <= t < end``; ``start_time > end_time`` wraps midnight — e.g.
+    22:00-06:00 on ["fri"] matches Friday 22:00 through Saturday 05:59.
+    A naive ``observed_at`` is treated as UTC.
+    """
+    schedule = config.get("schedule")
+    if schedule is None:
+        return True
+    if not isinstance(schedule, dict):
+        return False
+    try:
+        tz = ZoneInfo(str(schedule["timezone"]))
+        start_h, start_m = str(schedule["start_time"]).split(":")
+        end_h, end_m = str(schedule["end_time"]).split(":")
+        start = int(start_h) * 60 + int(start_m)
+        end = int(end_h) * 60 + int(end_m)
+    except Exception:
+        return False
+    if not (0 <= start <= 1439 and 0 <= end <= 1439) or start == end:
+        return False
+    days_raw = schedule.get("days")
+    if days_raw is None:
+        allowed_days = set(SCHEDULE_DAYS)
+    elif isinstance(days_raw, list):
+        allowed_days = {d for d in days_raw if isinstance(d, str)}
+    else:
+        return False
+    if observed_at.tzinfo is None:
+        observed_at = observed_at.replace(tzinfo=UTC)
+    local = observed_at.astimezone(tz)
+    minute = local.hour * 60 + local.minute
+    day = SCHEDULE_DAYS[local.weekday()]
+    if start < end:
+        return day in allowed_days and start <= minute < end
+    # Overnight wrap: tonight's tail belongs to the day the window started.
+    prev_day = SCHEDULE_DAYS[(local.weekday() - 1) % 7]
+    return (day in allowed_days and minute >= start) or (prev_day in allowed_days and minute < end)
 
 
 def build_alert_message(rule_type: str, payload: dict[str, Any]) -> str:
@@ -253,6 +333,7 @@ async def evaluate_observation(
     observation_id: UUID,
     observation_type: str,
     payload: dict[str, Any],
+    observed_at: datetime,
 ) -> int:
     """Evaluate enabled rules for one just-ingested observation.
 
@@ -262,6 +343,11 @@ async def evaluate_observation(
     run is finalized 'completed' (alert_created) or 'suppressed'
     (alert_suppressed_cooldown) in the same request. Non-matching and
     disabled rules produce no run.
+
+    Workflow Engine M3: a rule outside its schedule window, or whose richer
+    conditions (object class, track, count bounds) don't hold, is a
+    NON-MATCH — no run, no alert. Schedule gating uses ``observed_at``
+    inline; there is no periodic evaluator.
 
     Returns the number of alerts created (0 when no rule matches or every
     matching rule is inside its cooldown window).
@@ -274,6 +360,8 @@ async def evaluate_observation(
     created = 0
     for row in rows:
         config = coerce_jsonb(row["config"])
+        if not schedule_allows(config, observed_at):
+            continue
         if not rule_matches(row["rule_type"], config, payload):
             continue
         summary = build_alert_message(row["rule_type"], payload)

@@ -219,6 +219,7 @@ async def _evaluate_rules_safe(
                 observation_id=observation_id,
                 observation_type=body.type,
                 payload=body.payload,
+                observed_at=body.observed_at,
             )
     except Exception as exc:
         _logger.warning(
