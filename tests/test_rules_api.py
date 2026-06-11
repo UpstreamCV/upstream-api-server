@@ -301,6 +301,66 @@ def test_create_rule_cooldown_out_of_range_422() -> None:
     assert r.status_code == 422
 
 
+def test_create_timer_rule_happy_path() -> None:
+    account, camera = uuid4(), uuid4()
+    conn = FakeConn(cameras={camera: account})
+    r = _client(conn, _user(account)).post(
+        "/v1/rules",
+        json=_create_body(
+            account,
+            camera,
+            rule_type="camera_offline",
+            config={"offline_for_seconds": 300},
+        ),
+    )
+    assert r.status_code == 201, r.text
+    assert r.json()["rule_type"] == "camera_offline"
+
+
+def test_create_timer_rule_rejects_zero_cooldown() -> None:
+    """Timer rules re-fire per cooldown — cooldown 0 would fire on every
+    evaluator tick, so the API rejects it at authoring time."""
+    account, camera = uuid4(), uuid4()
+    conn = FakeConn(cameras={camera: account})
+    r = _client(conn, _user(account)).post(
+        "/v1/rules",
+        json=_create_body(
+            account,
+            camera,
+            rule_type="camera_offline",
+            config={"offline_for_seconds": 300},
+            cooldown_seconds=0,
+        ),
+    )
+    assert r.status_code == 422
+    assert r.json()["error"]["code"] == "invalid_rule_config"
+    assert conn.rules == []
+
+
+def test_patch_timer_rule_rejects_zero_cooldown() -> None:
+    account = uuid4()
+    row = _rule_row(account_id=account, camera_id=uuid4(), rule_type="camera_offline")
+    row["config"] = {"offline_for_seconds": 300}
+    conn = FakeConn(rules=[row])
+    r = _client(conn, _user(account)).patch(
+        f"/v1/rules/{row['id']}",
+        params={"account_id": str(account)},
+        json={"cooldown_seconds": 0},
+    )
+    assert r.status_code == 422
+    assert r.json()["error"]["code"] == "invalid_rule_config"
+
+
+def test_event_rules_still_allow_zero_cooldown() -> None:
+    account, camera = uuid4(), uuid4()
+    conn = FakeConn(cameras={camera: account})
+    r = _client(conn, _user(account)).post(
+        "/v1/rules",
+        json=_create_body(account, camera, cooldown_seconds=0),
+    )
+    assert r.status_code == 201, r.text
+
+
 def test_create_rule_unauthenticated_401() -> None:
     account, camera = uuid4(), uuid4()
     conn = FakeConn(cameras={camera: account})
