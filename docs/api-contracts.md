@@ -1968,3 +1968,77 @@ direction filters remain rejected at authoring time.
 No migration; `ProcessorObservationType` widened in lock-step with the
 processor. Workflow runs record `trigger_type:
 "processor.line_crossing_object"` for per-object matches.
+
+## Workflow Engine M4 — Time-Based Evaluator
+
+M1 = simple rules + alerts; M2 = workflow runs/history; M3 = richer
+conditions; the payload side tasks enriched processor evidence. M4 adds the
+first PERIODIC evaluation path — rules that describe the ABSENCE of
+activity, which no single incoming observation can prove. Still deferred:
+multi-step sequencing, visual builder, delivery channels,
+`occupancy_above_for` (needs continuous state tracking).
+
+No migration. Two new rule types on the existing `/v1/rules` API:
+
+### `camera_offline`
+
+```json
+{ "offline_for_seconds": 300,
+  "schedule": {"days": ["mon","tue","wed","thu","fri"],
+                "start_time": "08:00", "end_time": "18:00",
+                "timezone": "America/Denver"} }
+```
+
+Matched when the camera has NO active streaming session AND no heartbeat
+within `offline_for_seconds` (60–604800). A camera that has never
+heartbeated matches; disabled cameras are never evaluated. Schedule is the
+M3 shape (optional = always active).
+
+### `no_detections_for`
+
+```json
+{ "quiet_for_seconds": 1800,
+  "observation_types": ["processor.zone_entered", "processor.line_crossing_object"],
+  "object_classes": ["person"] }
+```
+
+Evaluated ONLY while the camera has an active streaming session ("up but
+quiet" is the anomaly; a down camera is camera_offline's job — gating
+prevents double-alerting). The quiet clock anchors at max(last matching
+observation, session started_at) so a fresh session never instant-fires.
+`observation_types` (optional) must be known processor types; when omitted
+it defaults to all types — or to the class-attributing subset when
+`object_classes` is set (a class filter over class-blind types is rejected
+at authoring).
+
+### Firing semantics (differs from event rules — by design)
+
+A timer condition is continuous, so the workflow-run INSERT itself carries
+the re-fire guard: NOT EXISTS a run for the same rule within
+`cooldown_seconds`. The cooldown is the RE-FIRE interval while the
+condition persists; evaluator ticks inside the window create NOTHING (no
+suppressed-run-per-tick flooding — the fired run is the episode marker).
+Because of this, timer rules require `cooldown_seconds >= 60` (422
+otherwise). Fired runs: `workflow_type = 'time_based_rule'`,
+`trigger_type = 'timer.<rule_type>'`, evidence carrying
+last_seen/threshold/quiet-window facts, alert linked as usual (or run
+finalized suppressed if the alert guard races).
+
+### `POST /v1/internal/workflow-evaluator/run`
+
+Auth: processor shared secret (`X-Upstream-Webhook-Secret`) — internal
+infrastructure surface. Safe to call repeatedly; returns
+`{evaluated_rules, schedule_skipped, matched_rules, workflow_runs_created,
+alerts_created, suppressed_by_cooldown, errors}`.
+
+### Operational notes
+
+The in-process loop is gated by
+`UPSTREAM_WORKFLOW_EVALUATOR_INTERVAL_SECONDS` (default 60; 0 disables —
+drive the endpoint from external cron instead). Single-instance
+deployments only: with replicas, disable the loop on all but one. Overlap
+safety is best-effort (the single-statement NOT EXISTS guard — same
+posture as the M1 alert guard); no advisory locks. One rule's evaluation
+failure is logged with scalar ids and never stops a tick; evaluator
+failures never touch the observation-ingest path (separate code path
+entirely).

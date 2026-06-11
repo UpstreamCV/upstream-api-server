@@ -4,6 +4,59 @@ Reverse chronological. Newest at top. Every meaningful commit gets an entry foll
 
 ---
 
+## 2026-06-10 - Workflow Engine M4: time-based evaluator (camera_offline, no_detections_for)
+
+### Summary
+First periodic evaluation path. Two new rule types on the existing rules
+system — `camera_offline` (no active session + no heartbeat within
+threshold; never-heartbeated cameras match; disabled cameras skipped) and
+`no_detections_for` (gated on an active streaming session; quiet clock
+anchored at max(last matching observation, session start) so fresh
+sessions never instant-fire; optional observation_types/object_classes
+with the class-attributing constraint). Evaluated by
+services/workflow_evaluator.py — a service function driven by an optional
+in-process lifespan loop (UPSTREAM_WORKFLOW_EVALUATOR_INTERVAL_SECONDS,
+default 60, 0 disables) and an internal endpoint
+POST /v1/internal/workflow-evaluator/run (processor shared-secret auth).
+
+Firing semantics deliberately differ from event rules: the run INSERT
+carries a NOT EXISTS re-fire guard keyed on (rule_id, cooldown window) —
+cooldown is the re-fire interval while the condition persists, ticks
+inside the window create nothing (no suppressed-run flooding), and timer
+rules require cooldown >= 60s at authoring. Duplicate prevention is the
+same best-effort single-statement posture as the M1 alert guard
+(single-instance deployment; documented). Fired runs:
+workflow_type='time_based_rule', trigger_type='timer.<rule_type>',
+evidence with last_seen/threshold/quiet facts, linked alert as usual. No
+migration. The observation-ingest path is untouched (no observation type
+maps to timer rules — test-pinned).
+
+### Files touched
+- `src/upstream_api/schemas/rules.py` — new types, duration bounds
+  (60..604800), observation_types whitelist + class-attributing
+  constraint, validate_rule_cooldown (timer floor 60s).
+- `src/upstream_api/services/workflow_evaluator.py` — condition checks
+  (fail closed on anything unprovable), guarded run insert, alert + run
+  finalize reuse, EvaluatorStats, workflow_evaluator_loop.
+- `src/upstream_api/routers/workflow_evaluator.py` + `app.py` — internal
+  endpoint + config-gated lifespan task (cancelled on shutdown).
+- `src/upstream_api/routers/rules.py` — cooldown floor on create/patch.
+- `src/upstream_api/config.py` — workflow_evaluator_interval_seconds.
+- tests: `tests/test_workflow_evaluator.py` (23: conditions, firing,
+  re-fire guard, schedule gating, per-rule error isolation, endpoint auth
+  + stats shape, SQL pinning); test_rule_evaluation.py (+validation,
+  ingest isolation); test_rules_api.py (+timer create, cooldown floor).
+
+### Testing/checks
+`make test` — 948 passed (+48). `make lint` + `uv run mypy src` clean.
+
+### Follow-up TODOs
+- occupancy_above_for (needs continuous state tracking) — deferred.
+- Multi-instance evaluator leadership (advisory lock) if the deployment
+  ever scales past one api-server replica.
+- Auto-resolve: a run/alert when the condition CLEARS (camera back
+  online) — natural M5 candidate alongside sequencing.
+
 ## 2026-06-10 - Per-object line crossing: accept new type, partition matcher, unlock line conditions
 
 ### Summary

@@ -20,6 +20,7 @@ from upstream_api.schemas.rules import (
     RulePatchRequest,
     RuleSummary,
     validate_rule_config,
+    validate_rule_cooldown,
 )
 from upstream_api.security.deps import CurrentUser, PoolDep, require_account_role
 from upstream_api.services.processor import coerce_jsonb
@@ -69,6 +70,15 @@ def _check_config(rule_type: str, config: dict[str, Any]) -> None:
         )
 
 
+def _check_cooldown(rule_type: str, cooldown_seconds: int) -> None:
+    problems = validate_rule_cooldown(rule_type, cooldown_seconds)
+    if problems:
+        raise InvalidRuleConfigError(
+            "Rule config is invalid.",
+            details={"problems": problems},
+        )
+
+
 async def _require_owned_camera(
     conn: asyncpg.Connection, *, account_id: UUID, camera_id: UUID
 ) -> None:
@@ -106,6 +116,7 @@ async def create_rule(
 ) -> RuleSummary:
     require_account_role(user, body.account_id, "owner", "admin")
     _check_config(body.rule_type, body.config)
+    _check_cooldown(body.rule_type, body.cooldown_seconds)
 
     async with pool.acquire() as conn, conn.transaction():
         await _require_owned_camera(conn, account_id=body.account_id, camera_id=body.camera_id)
@@ -164,6 +175,8 @@ async def patch_rule(
         if body.config is not None:
             # Validate against the stored (immutable) type, not client input.
             _check_config(existing["rule_type"], body.config)
+        if body.cooldown_seconds is not None:
+            _check_cooldown(existing["rule_type"], body.cooldown_seconds)
         row = await update_rule(
             conn,
             account_id=scope_account,

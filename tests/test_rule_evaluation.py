@@ -382,6 +382,38 @@ def test_rule_matches(
             "line_crossing",
             {"line_id": "line-1", "object_classes": ["person"], "min_confidence": 0.7},
         ),
+        # --- M4 time-based rules ---------------------------------------------
+        ("camera_offline", {"offline_for_seconds": 300}),
+        ("camera_offline", {"offline_for_seconds": 604800}),
+        (
+            "camera_offline",
+            {
+                "offline_for_seconds": 300,
+                "schedule": {
+                    "days": ["mon", "tue", "wed", "thu", "fri"],
+                    "start_time": "08:00",
+                    "end_time": "18:00",
+                    "timezone": "America/Denver",
+                },
+            },
+        ),
+        ("no_detections_for", {"quiet_for_seconds": 1800}),
+        (
+            "no_detections_for",
+            {"quiet_for_seconds": 1800, "object_classes": ["person"]},
+        ),
+        (
+            "no_detections_for",
+            {
+                "quiet_for_seconds": 1800,
+                "observation_types": ["processor.zone_entered", "processor.line_crossing_object"],
+                "object_classes": ["person"],
+            },
+        ),
+        (
+            "no_detections_for",
+            {"quiet_for_seconds": 1800, "observation_types": ["processor.roi_occupancy"]},
+        ),
     ],
 )
 def test_valid_configs_pass(rule_type: str, config: dict[str, Any]) -> None:
@@ -413,6 +445,37 @@ def test_valid_configs_pass(rule_type: str, config: dict[str, Any]) -> None:
         ("roi_occupancy", {"object_class": ""}),
         ("roi_occupancy", {"object_class": 7}),
         ("zone_entered", {"object_class": "person"}),  # roi-only key
+        # --- M4 time-based rules ---------------------------------------------
+        ("camera_offline", {}),  # duration required
+        ("camera_offline", {"offline_for_seconds": 30}),  # below 60s floor
+        ("camera_offline", {"offline_for_seconds": 604801}),  # above 7d cap
+        ("camera_offline", {"offline_for_seconds": "300"}),
+        ("camera_offline", {"offline_for_seconds": True}),
+        ("camera_offline", {"offline_for_seconds": 300, "quiet_for_seconds": 60}),
+        ("camera_offline", {"offline_for_seconds": 300, "object_classes": ["person"]}),
+        ("no_detections_for", {}),  # duration required
+        ("no_detections_for", {"quiet_for_seconds": 0}),
+        ("no_detections_for", {"quiet_for_seconds": 1800, "observation_types": []}),
+        (
+            "no_detections_for",
+            {"quiet_for_seconds": 1800, "observation_types": ["processor.mock_detection"]},
+        ),
+        (
+            "no_detections_for",
+            {
+                "quiet_for_seconds": 1800,
+                "observation_types": ["processor.zone_entered", "processor.zone_entered"],
+            },
+        ),
+        # Class filter over a type that can't prove class.
+        (
+            "no_detections_for",
+            {
+                "quiet_for_seconds": 1800,
+                "observation_types": ["processor.roi_occupancy"],
+                "object_classes": ["person"],
+            },
+        ),
         # --- M3: value validation -------------------------------------------
         ("zone_entered", {"object_classes": []}),
         ("zone_entered", {"object_classes": ["person", "person"]}),
@@ -484,6 +547,18 @@ def test_valid_configs_pass(rule_type: str, config: dict[str, Any]) -> None:
 )
 def test_invalid_configs_fail(rule_type: str, config: dict[str, Any]) -> None:
     assert validate_rule_config(rule_type, config) != []
+
+
+def test_timer_rule_types_never_ride_the_ingest_path() -> None:
+    """M4 timer rules are evaluated ONLY by the periodic evaluator: no
+    observation type maps to them, and the event matcher never matches
+    them — the smoke-tested ingest path is untouched."""
+    from upstream_api.services.rules import OBSERVATION_TYPE_TO_RULE_TYPE
+
+    assert "camera_offline" not in OBSERVATION_TYPE_TO_RULE_TYPE.values()
+    assert "no_detections_for" not in OBSERVATION_TYPE_TO_RULE_TYPE.values()
+    assert rule_matches("camera_offline", {"offline_for_seconds": 300}, {}) is False
+    assert rule_matches("no_detections_for", {"quiet_for_seconds": 60}, {}) is False
 
 
 def test_build_alert_message_uses_labels_over_ids() -> None:

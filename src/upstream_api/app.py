@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import contextlib
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -36,9 +38,11 @@ from upstream_api.routers import (
     snapshots,
     stream_sessions,
     users,
+    workflow_evaluator,
     workflow_runs,
 )
 from upstream_api.services.http_client import build_http_client
+from upstream_api.services.workflow_evaluator import workflow_evaluator_loop
 
 _logger = get_logger("app")
 
@@ -49,11 +53,28 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     pool = await create_pool(settings)
     app.state.db_pool = pool
     app.state.http_client = build_http_client()
+    # Workflow Engine M4: in-process time-based rule evaluator. Gated by
+    # config (0 disables — external cron can drive the internal endpoint
+    # instead). Single-instance deployments only; see
+    # services/workflow_evaluator.py for the duplicate-prevention posture.
+    evaluator_task: asyncio.Task[None] | None = None
+    if settings.workflow_evaluator_interval_seconds > 0:
+        evaluator_task = asyncio.create_task(
+            workflow_evaluator_loop(pool, settings.workflow_evaluator_interval_seconds)
+        )
+        _logger.info(
+            "workflow_evaluator_loop_started",
+            interval_seconds=settings.workflow_evaluator_interval_seconds,
+        )
     _logger.info("startup", environment=settings.environment, port=settings.port)
     try:
         yield
     finally:
         _logger.info("shutdown")
+        if evaluator_task is not None:
+            evaluator_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await evaluator_task
         await app.state.http_client.aclose()
         await pool.close()
 
@@ -113,5 +134,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(rules.router)  # /v1/rules (Workflow Engine M1)
     app.include_router(alerts.router)  # /v1/alerts (Workflow Engine M1)
     app.include_router(workflow_runs.router)  # /v1/workflow-runs (Workflow Engine M2)
+    app.include_router(workflow_evaluator.router)  # /v1/internal/workflow-evaluator (M4)
 
     return app

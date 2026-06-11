@@ -30,6 +30,16 @@ RuleType = Literal[
     # Fires on processor.dwell_exceeded (optionally one zone_id and/or a
     # higher min_duration_seconds than the processor threshold).
     "dwell_exceeded",
+    # --- M4 time-based rules: evaluated by the periodic workflow
+    # evaluator (services/workflow_evaluator.py), NOT the observation
+    # ingest path. No observation type maps to them.
+    # Fires when a camera has no active streaming session AND no heartbeat
+    # within offline_for_seconds.
+    "camera_offline",
+    # Fires when a STREAMING camera has produced no matching observation
+    # for quiet_for_seconds (anchored at max(last matching observation,
+    # session start) so a freshly-started session never instant-fires).
+    "no_detections_for",
 ]
 
 RULE_TYPES: tuple[RuleType, ...] = (
@@ -37,6 +47,44 @@ RULE_TYPES: tuple[RuleType, ...] = (
     "roi_occupancy",
     "zone_entered",
     "dwell_exceeded",
+    "camera_offline",
+    "no_detections_for",
+)
+
+# M4: rule types evaluated on a timer rather than per-observation. Their
+# cooldown_seconds doubles as the RE-FIRE interval while the condition
+# persists, so it must be >= the evaluator tick (60s) — otherwise every
+# tick would fire (validate_rule_cooldown enforces this).
+TIMER_RULE_TYPES: frozenset[str] = frozenset({"camera_offline", "no_detections_for"})
+MIN_TIMER_COOLDOWN_SECONDS = 60
+
+# Duration bounds shared by offline_for_seconds / quiet_for_seconds:
+# 1 minute .. 7 days.
+MIN_TIMER_DURATION_SECONDS = 60
+MAX_TIMER_DURATION_SECONDS = 604_800
+
+# Observation types a no_detections_for rule may watch (the production
+# processor types), and the subset that carries class_label — an
+# object_classes filter is only honest over class-attributing types.
+NO_DETECTIONS_OBSERVATION_TYPES: tuple[str, ...] = (
+    "processor.line_crossing",
+    "processor.line_crossing_object",
+    "processor.roi_occupancy",
+    "processor.zone_entered",
+    "processor.zone_exited",
+    "processor.dwell_started",
+    "processor.dwell_updated",
+    "processor.dwell_exceeded",
+)
+CLASS_ATTRIBUTING_OBSERVATION_TYPES: frozenset[str] = frozenset(
+    {
+        "processor.line_crossing_object",
+        "processor.zone_entered",
+        "processor.zone_exited",
+        "processor.dwell_started",
+        "processor.dwell_updated",
+        "processor.dwell_exceeded",
+    }
 )
 
 RuleSeverity = Literal["info", "warning", "critical"]
@@ -98,6 +146,11 @@ _ALLOWED_CONFIG_KEYS: dict[str, frozenset[str]] = {
             "min_confidence",
             _SCHEDULE_KEY,
         }
+    ),
+    # --- M4 time-based rules ------------------------------------------------
+    "camera_offline": frozenset({"offline_for_seconds", _SCHEDULE_KEY}),
+    "no_detections_for": frozenset(
+        {"quiet_for_seconds", "observation_types", "object_classes", _SCHEDULE_KEY}
     ),
 }
 
@@ -201,9 +254,59 @@ def validate_rule_config(rule_type: str, config: dict[str, Any]) -> list[str]:
         isinstance(config["object_class"], str) and config["object_class"].strip()
     ):
         problems.append("config.object_class must be a non-empty string.")
+    for key in ("offline_for_seconds", "quiet_for_seconds"):
+        if rule_type in TIMER_RULE_TYPES and key in allowed and key not in config:
+            problems.append(f"config.{key} is required for {rule_type} rules.")
+        if key in config:
+            value = config[key]
+            if (
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or not (MIN_TIMER_DURATION_SECONDS <= value <= MAX_TIMER_DURATION_SECONDS)
+            ):
+                problems.append(
+                    f"config.{key} must be an integer between "
+                    f"{MIN_TIMER_DURATION_SECONDS} and {MAX_TIMER_DURATION_SECONDS} seconds."
+                )
+    if "observation_types" in config:
+        types = config["observation_types"]
+        if (
+            not isinstance(types, list)
+            or not types
+            or len(types) != len({t for t in types if isinstance(t, str)})
+            or any(t not in NO_DETECTIONS_OBSERVATION_TYPES for t in types)
+        ):
+            problems.append(
+                "config.observation_types must be a non-empty list of unique "
+                f"types from {list(NO_DETECTIONS_OBSERVATION_TYPES)}."
+            )
+    if rule_type == "no_detections_for" and "object_classes" in config:
+        # A class filter is only honest over class-attributing observation
+        # types; with observation_types omitted the evaluator defaults to
+        # exactly that set, so the combination is always valid then.
+        types = config.get("observation_types")
+        if isinstance(types, list) and any(
+            t not in CLASS_ATTRIBUTING_OBSERVATION_TYPES for t in types if isinstance(t, str)
+        ):
+            problems.append(
+                "config.object_classes requires observation_types that carry "
+                f"class_label: {sorted(CLASS_ATTRIBUTING_OBSERVATION_TYPES)}."
+            )
     if _SCHEDULE_KEY in config:
         _validate_schedule(config[_SCHEDULE_KEY], problems)
     return problems
+
+
+def validate_rule_cooldown(rule_type: str, cooldown_seconds: int) -> list[str]:
+    """Timer rules re-fire per cooldown while their condition persists, so
+    cooldown 0 ("every match") would fire on every evaluator tick."""
+    if rule_type in TIMER_RULE_TYPES and cooldown_seconds < MIN_TIMER_COOLDOWN_SECONDS:
+        return [
+            f"cooldown_seconds must be >= {MIN_TIMER_COOLDOWN_SECONDS} for "
+            f"{rule_type} rules (it is the re-fire interval while the "
+            "condition persists)."
+        ]
+    return []
 
 
 class RuleCreateRequest(BaseModel):
