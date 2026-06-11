@@ -1624,3 +1624,676 @@ account; 404 `camera_not_found` on cross-account.
 
 `POST /v1/stream-sessions/start` rejects cameras with `agent_id IS NULL`
 with 409 `camera_unassigned` — claim before streaming.
+
+## Endpoints — Workflow Engine M1 (auth: `current_user`)
+
+> Originally shipped as "Rules/Triggers M1"; re-labeled when the Workflow
+> Engine track was named. Same endpoints, same numbering position: this is
+> the first milestone of the Workflow Engine product track (separate from
+> the reliability milestone sequence). M1 = simple rules + in-app alerts;
+> M2 (below) reframes every rule match as a workflow run.
+
+Users author rules over processor observations; matched rules raise alerts
+into a dashboard inbox.
+
+Migration: `20260612120000_rules_and_alerts.sql` — creates `rules` and
+`alerts` (both RLS member-select + `GRANT SELECT TO authenticated`).
+`rules.rule_type` is open vocabulary at the DB layer (same posture as
+`observations.type`); the API schema layer enforces the currently-supported
+set, so new types ship without a migration.
+
+Evaluation runs inline on `POST /v1/internal/processor/observations`:
+after the observation insert, the evaluator fetches enabled rules for the
+camera matching the observation's rule type, runs a pure matcher per rule,
+and inserts alerts. The whole step is savepoint-isolated (mirroring the M5
+detection-metrics write) — it can NEVER fail observation ingest, including
+when the migration has not been applied yet. Tenant columns are derived
+from the session row, never the request.
+
+Rule types and per-type `config` keys (all optional unless noted):
+
+| `rule_type`      | fires on observation type   | config keys                          |
+|------------------|-----------------------------|--------------------------------------|
+| `line_crossing`  | `processor.line_crossing`   | `line_id`                            |
+| `roi_occupancy`  | `processor.roi_occupancy`   | `roi_id`, `min_total_count` (int ≥1) |
+| `zone_entered`   | `processor.zone_entered`    | `zone_id`                            |
+| `dwell_exceeded` | `processor.dwell_exceeded`  | `zone_id`, `min_duration_seconds` (>0) |
+
+Match semantics: a missing optional filter key means "match any"; a payload
+missing the field a filter needs does NOT match (a rule scoped to line A
+never fires on an observation that can't prove it came from line A).
+Unknown config keys are rejected at authoring time (422 `invalid_rule_config`)
+so typos surface immediately instead of as silently-never-matching rules.
+
+Flood control: `cooldown_seconds` (0–86400, default 300) is the minimum gap
+between two alerts from the same rule, enforced by a same-statement
+`NOT EXISTS` guard on insert. Worst case under concurrency is one duplicate
+alert across two connections (accepted for M1).
+
+Deferred (need a periodic evaluator that does not exist yet):
+`camera_offline`, `no_detections_for_n_minutes`; email/webhook delivery.
+
+### `POST /v1/rules`
+
+Auth: `current_user`, owner/admin on `account_id`. Camera must belong to the
+account (404 `camera_not_found` otherwise — anti-enumeration).
+
+Request:
+```json
+{
+  "account_id": "uuid",
+  "camera_id": "uuid",
+  "name": "Front door crossing",
+  "rule_type": "line_crossing",
+  "enabled": true,
+  "config": {"line_id": "line-1"},
+  "severity": "warning",
+  "cooldown_seconds": 300
+}
+```
+
+Response 201: the rule (no `account_id` echoed — same posture as the
+observations read path).
+```json
+{
+  "id": "uuid", "camera_id": "uuid", "name": "Front door crossing",
+  "rule_type": "line_crossing", "enabled": true,
+  "config": {"line_id": "line-1"}, "severity": "warning",
+  "cooldown_seconds": 300, "created_by": "uuid",
+  "created_at": "…", "updated_at": "…"
+}
+```
+
+Errors: 403 `forbidden` (viewer), 404 `camera_not_found`,
+422 `invalid_rule_config` (details.problems lists each issue),
+422 validation_error (unknown `rule_type`, bad `cooldown_seconds`).
+
+### `GET /v1/rules?account_id=…&camera_id=…`
+
+Auth: `current_user`, any member. `camera_id` optional filter. Newest first.
+Response 200: `{"rules": [RuleSummary, …]}`.
+
+### `GET /v1/rules/{rule_id}?account_id=…`
+
+Auth: `current_user`, any member. 404 `rule_not_found` for unknown or
+cross-tenant ids.
+
+### `PATCH /v1/rules/{rule_id}?account_id=…`
+
+Auth: `current_user`, owner/admin. Partial update of `name`, `enabled`,
+`config`, `severity`, `cooldown_seconds`. `rule_type` is immutable — delete
+and recreate to change it. A patched `config` is re-validated against the
+stored type. Response 200: the updated rule.
+
+### `DELETE /v1/rules/{rule_id}?account_id=…`
+
+Auth: `current_user`, owner/admin. 204 on success, 404 `rule_not_found`.
+Alerts the rule raised survive (their `rule_id` becomes null).
+
+### `GET /v1/alerts?account_id=…&status=…&camera_id=…&limit=…`
+
+Auth: `current_user`, any member. `status` ∈ {`open`, `resolved`} (optional),
+`camera_id` optional, `limit` 1–200 default 50. Newest first.
+
+Response 200:
+```json
+{
+  "alerts": [{
+    "id": "uuid", "camera_id": "uuid", "rule_id": "uuid",
+    "observation_id": "uuid", "severity": "warning", "status": "open",
+    "title": "Front door crossing",
+    "message": "Line crossing detected on Front door.",
+    "payload": {"line_id": "line-1", "count_delta": 1},
+    "created_at": "…", "read_at": null, "resolved_at": null
+  }]
+}
+```
+
+`payload` is the matched observation's payload (evidence snapshot).
+`observation_id` is a soft reference — the observations log may be pruned.
+
+### `POST /v1/alerts/{alert_id}/read`
+
+Auth: `current_user`, any member. Sets `read_at` once (idempotent — repeat
+calls return the same timestamp). Response 200: the alert.
+404 `alert_not_found` for unknown/cross-tenant ids.
+
+### `POST /v1/alerts/{alert_id}/resolve`
+
+Auth: `current_user`, owner/admin (resolution is a workflow decision, not a
+view state). Sets `status='resolved'`, `resolved_at`, and `read_at` if
+unset. Idempotent. Response 200: the alert.
+
+## Endpoints — Workflow Engine M2 (auth: `current_user`)
+
+Workflow Runs + Internal Event History. The product premise: Upstream is a
+camera **workflow engine**, not an alerts product. M1 added simple rules +
+in-app alerts; M2 makes every rule match a **workflow run** — the internal
+system of record — recorded WHETHER OR NOT an alert was sent. Alerts are now
+one action/output of a run: a cooldown-suppressed match still produces a run
+(`status='suppressed'`, `action_result='alert_suppressed_cooldown'`) with
+the evidence that triggered it.
+
+Still deferred (the schema deliberately leaves room, but none of this is
+built): multi-step sequencing (event A then B, time windows, waits),
+multi-camera / account-wide workflows (camera_id is already nullable),
+visual workflow builder, delivery channels (email/webhook/Slack), a
+`workflow_run_events` step table, and review/acknowledge mutations
+(`status='action_required'` is reserved but nothing produces it yet).
+
+Migration: `20260613120000_workflow_runs.sql` — creates `workflow_runs`
+(RLS member-select + grant) and adds `alerts.workflow_run_id` (FK,
+on delete set null). The FK lives on alerts so the write path is
+insert-run → insert-alert → finalize-run with no circular reference.
+
+For M2 the existing `rules` table acts as the workflow definition layer
+(`workflow_type = 'simple_rule'`); no separate workflows table. Run
+creation happens inside the existing `_evaluate_rules_safe` savepoint on
+`POST /v1/internal/processor/observations` — the M1 contract is unchanged:
+a failing (or not-yet-migrated) workflow layer can NEVER fail observation
+ingest.
+
+Run lifecycle per matching rule: insert run (`status='active'`, evidence =
+observation payload, payload = rule snapshot at match time) → cooldown-
+guarded alert insert carrying `workflow_run_id` → finalize run
+(`completed`/`alert_created` or `suppressed`/`alert_suppressed_cooldown`,
+`ended_at` stamped). Non-matching and disabled rules produce no run.
+
+Open vocabulary at the DB layer: `workflow_type`, `trigger_type`,
+`action_result`. CHECK-constrained (dashboard switches on it): `status` ∈
+{`active`, `completed`, `failed`, `action_required`, `suppressed`}.
+
+### `GET /v1/workflow-runs?account_id=…&status=…&camera_id=…&rule_id=…&limit=…`
+
+Auth: `current_user`, any member. All filters optional; `status` validated
+against the known set (422 otherwise); `limit` 1–200 default 50. Newest
+first. `alert` is the related alert (left join via
+`alerts.workflow_run_id`) or null — suppressed runs have none.
+
+Response 200:
+```json
+{
+  "runs": [{
+    "id": "uuid", "camera_id": "uuid", "rule_id": "uuid",
+    "trigger_observation_id": "uuid",
+    "workflow_type": "simple_rule", "status": "completed",
+    "title": "Front door crossing",
+    "summary": "Line crossing detected on Front door.",
+    "trigger_type": "processor.line_crossing",
+    "action_result": "alert_created",
+    "evidence": {"line_id": "line-1", "count_delta": 1},
+    "payload": {"rule": {"id": "uuid", "rule_type": "line_crossing",
+                          "config": {}, "severity": "warning",
+                          "cooldown_seconds": 300}},
+    "alert": {"id": "uuid", "status": "open", "severity": "warning"},
+    "started_at": "…", "ended_at": "…",
+    "created_at": "…", "updated_at": "…"
+  }]
+}
+```
+
+`account_id` is never echoed (same posture as the observations read path).
+`evidence` is the triggering observation's payload; `payload.rule` is the
+rule definition snapshot at match time, so runs stay interpretable after
+the rule is edited or deleted.
+
+### `GET /v1/workflow-runs/{workflow_run_id}?account_id=…`
+
+Auth: `current_user`, any member. Same shape as a list item (evidence,
+action result, related alert included). 404 `workflow_run_not_found` for
+unknown or cross-tenant ids (anti-enumeration).
+
+### Alert responses gain `workflow_run_id`
+
+`GET /v1/alerts` items (and the read/resolve responses) now include
+`workflow_run_id` (uuid | null) — null for alerts written before the M2
+migration. M2 is otherwise read-path only: no workflow-run mutation APIs.
+
+## Workflow Engine M3 — Richer Rule Conditions
+
+M1 added simple rules + in-app alerts; M2 made every match a workflow run
+(internal history); M3 makes the one-step rule language more expressive.
+Still deferred: multi-step sequencing, visual builder, delivery channels.
+
+No migration and no new endpoints — M3 extends the per-type ``config``
+vocabulary on the existing `/v1/rules` API and the pure matcher. Existing
+M1/M2 rules keep working unchanged. Workflow runs keep snapshotting the
+full (now richer) config in ``payload.rule``; evidence is unchanged.
+
+### Condition availability follows the audited observation payloads
+
+A condition is allowed ONLY on rule types whose production payloads can
+prove the field it needs (422 ``invalid_rule_config`` otherwise) — a rule
+that can never match is worse than an authoring-time rejection. Audited
+against the DeepStream analytics worker:
+
+| condition            | rule types                      | payload field        |
+|----------------------|---------------------------------|----------------------|
+| `object_classes`     | zone_entered, dwell_exceeded    | `class_label`        |
+| `require_track_id`   | zone_entered, dwell_exceeded    | `track_id`           |
+| `min_total_count`    | roi_occupancy (M1)              | `total_count`        |
+| `max_total_count`    | roi_occupancy                   | `total_count`        |
+| `schedule`           | all four types                  | observation time     |
+
+**Deferred at M3 (processor follow-ups):**
+
+> Update: the processor's payload-enrichment side task later unlocked
+> `min_confidence` (zone/dwell) and per-class ROI counts — see the
+> "Payload-enrichment unlock" section below. The rest stay deferred.
+
+- `direction` — in the line_crossing payload contract but never produced:
+  production line crossings come from nvdsanalytics CUMULATIVE line
+  counters, which are direction-blind aggregates.
+- `object_classes` / `require_track_id` / `min_confidence` on
+  line_crossing — same root cause: cumulative counters have no per-object
+  attribution. Per-object `lcStatus` labels exist in the processor's object
+  metadata, so a per-object line-crossing producer is feasible, but it
+  replaces the cumulative-counter state machine (idempotency/dedupe
+  semantics) — a documented processor follow-up.
+- "no detections for N minutes" — needs a periodic evaluator (still none).
+
+### Match semantics
+
+Unchanged posture, extended: a missing optional condition key means "match
+any"; a payload missing the field a configured condition needs does NOT
+match (no false matches). ``min_total_count`` and ``max_total_count`` are
+both inclusive bounds.
+
+### `schedule` — inline time-window gating
+
+```json
+{
+  "schedule": {
+    "days": ["mon", "tue", "wed", "thu", "fri"],
+    "start_time": "08:00",
+    "end_time": "18:00",
+    "timezone": "America/New_York"
+  }
+}
+```
+
+Evaluated INLINE from the observation's ``observed_at`` (converted to the
+schedule's IANA timezone) during ingest — there is no periodic evaluator.
+``days`` (optional; default every day) names the LOCAL day the window
+STARTS on. ``start_time < end_time`` is a same-day window matching
+``start <= t < end``; ``start_time > end_time`` wraps midnight (22:00-06:00
+on ["fri"] = Friday 22:00 through Saturday 05:59). ``start == end`` is
+rejected at authoring. An observation outside the window is a NON-MATCH:
+no workflow run, no alert. A malformed stored schedule degrades to
+"no match" (the gate runs inside the ingest savepoint and never raises).
+
+### Example richer configs
+
+```json
+{ "zone_id": "zone-1", "object_classes": ["person", "forklift"],
+  "require_track_id": true }
+```
+```json
+{ "roi_id": "roi-1", "min_total_count": 2, "max_total_count": 10,
+  "schedule": {"start_time": "22:00", "end_time": "06:00", "timezone": "UTC"} }
+```
+
+
+## Workflow Engine — payload-enrichment unlock (post-M3)
+
+The processor side task "Workflow Condition Payload Enrichment" enriched
+observation payloads with provable fields, unlocking two previously-deferred
+rule conditions. No migration, no new endpoints — `config` vocabulary and
+matcher only. Missing fields still mean NO match (the processor omits
+`confidence` when the track wasn't detected in the triggering frame, and
+pre-enrichment events carry an empty `class_counts`).
+
+| condition        | rule types                   | payload field            |
+|------------------|------------------------------|--------------------------|
+| `min_confidence` | zone_entered, dwell_exceeded | `confidence` (per-object detection confidence in the triggering frame; inclusive threshold, number in (0, 1]) |
+| `object_class`   | roi_occupancy                | `class_counts` (object-attributed per-class ROI counts) |
+
+`object_class` (single class name) scopes the existing
+`min_total_count` / `max_total_count` bounds to that class's count instead
+of the aggregate `total_count`. A class absent from the breakdown counts as
+zero; a payload with no `class_counts` dict can't prove anything and never
+matches. Because `min_total_count`'s floor is 1, pre-enrichment events
+(empty breakdown) can never match a class-scoped rule.
+
+Example: "alert when more than 3 cars are in the loading ROI, but only with
+confident person detections in the pick zone after hours" is now two rules:
+
+```json
+{ "roi_id": "loading", "object_class": "car", "min_total_count": 4 }
+```
+```json
+{ "zone_id": "pick", "object_classes": ["person"], "min_confidence": 0.75,
+  "schedule": {"start_time": "18:00", "end_time": "08:00", "timezone": "America/New_York"} }
+```
+
+Still deferred (honestly): all line_crossing conditions beyond `line_id` +
+`schedule`, and periodic-evaluation rule types.
+
+## Workflow Engine — per-object line crossing unlock
+
+The processor side task "Per-Object Line Crossing Producer" added a second
+line-crossing observation type, `processor.line_crossing_object`: per-OBJECT
+crossing evidence (track/class/confidence attribution, payload
+`event_mode: "object_crossing"`), emitted ALONGSIDE the unchanged aggregate
+`processor.line_crossing` count events.
+
+**The partition rule (prevents double-fire).** One physical crossing reaches
+this server as TWO observations. Both types map to the `line_crossing` rule
+family, and the matcher partitions on the payload:
+
+- a rule with ANY per-object condition (`object_classes`,
+  `require_track_id`, `min_confidence`) matches ONLY per-object events;
+- a plain rule (at most `line_id` + `schedule`) matches ONLY aggregate
+  events — exactly its pre-existing behavior.
+
+So each rule fires at most once per physical crossing, legacy rules are
+untouched, and a per-object-conditioned rule never falls back to aggregate
+events (an untracked crossing can't satisfy it — counted, not attributed).
+
+**Unlocked `line_crossing` config keys:** `object_classes`,
+`require_track_id`, `min_confidence` — same semantics and validation as on
+zone/dwell rules; missing payload fields still mean no match.
+
+**Still deferred:** `direction`. The per-object payload may carry
+`analytics_direction_label` (a raw nvdsanalytics direction-rule name), but
+that is NOT a geometry-relative a_to_b/b_to_a crossing direction, so
+direction filters remain rejected at authoring time.
+
+No migration; `ProcessorObservationType` widened in lock-step with the
+processor. Workflow runs record `trigger_type:
+"processor.line_crossing_object"` for per-object matches.
+
+## Workflow Engine M4 — Time-Based Evaluator
+
+M1 = simple rules + alerts; M2 = workflow runs/history; M3 = richer
+conditions; the payload side tasks enriched processor evidence. M4 adds the
+first PERIODIC evaluation path — rules that describe the ABSENCE of
+activity, which no single incoming observation can prove. Still deferred:
+multi-step sequencing, visual builder, delivery channels,
+`occupancy_above_for` (needs continuous state tracking).
+
+No migration. Two new rule types on the existing `/v1/rules` API:
+
+### `camera_offline`
+
+```json
+{ "offline_for_seconds": 300,
+  "schedule": {"days": ["mon","tue","wed","thu","fri"],
+                "start_time": "08:00", "end_time": "18:00",
+                "timezone": "America/Denver"} }
+```
+
+Matched when the camera has NO active streaming session AND no heartbeat
+within `offline_for_seconds` (60–604800). A camera that has never
+heartbeated matches; disabled cameras are never evaluated. Schedule is the
+M3 shape (optional = always active).
+
+### `no_detections_for`
+
+```json
+{ "quiet_for_seconds": 1800,
+  "observation_types": ["processor.zone_entered", "processor.line_crossing_object"],
+  "object_classes": ["person"] }
+```
+
+Evaluated ONLY while the camera has an active streaming session ("up but
+quiet" is the anomaly; a down camera is camera_offline's job — gating
+prevents double-alerting). The quiet clock anchors at max(last matching
+observation, session started_at) so a fresh session never instant-fires.
+`observation_types` (optional) must be known processor types; when omitted
+it defaults to all types — or to the class-attributing subset when
+`object_classes` is set (a class filter over class-blind types is rejected
+at authoring).
+
+### Firing semantics (differs from event rules — by design)
+
+A timer condition is continuous, so the workflow-run INSERT itself carries
+the re-fire guard: NOT EXISTS a run for the same rule within
+`cooldown_seconds`. The cooldown is the RE-FIRE interval while the
+condition persists; evaluator ticks inside the window create NOTHING (no
+suppressed-run-per-tick flooding — the fired run is the episode marker).
+Because of this, timer rules require `cooldown_seconds >= 60` (422
+otherwise). Fired runs: `workflow_type = 'time_based_rule'`,
+`trigger_type = 'timer.<rule_type>'`, evidence carrying
+last_seen/threshold/quiet-window facts, alert linked as usual (or run
+finalized suppressed if the alert guard races).
+
+### `POST /v1/internal/workflow-evaluator/run`
+
+Auth: processor shared secret (`X-Upstream-Webhook-Secret`) — internal
+infrastructure surface. Safe to call repeatedly; returns
+`{evaluated_rules, schedule_skipped, matched_rules, workflow_runs_created,
+alerts_created, suppressed_by_cooldown, errors}`.
+
+### Operational notes
+
+The in-process loop is gated by
+`UPSTREAM_WORKFLOW_EVALUATOR_INTERVAL_SECONDS` (default 60; 0 disables —
+drive the endpoint from external cron instead). Single-instance
+deployments only: with replicas, disable the loop on all but one. Overlap
+safety is best-effort (the single-statement NOT EXISTS guard — same
+posture as the M1 alert guard); no advisory locks. One rule's evaluation
+failure is logged with scalar ids and never stops a tick; evaluator
+failures never touch the observation-ingest path (separate code path
+entirely).
+
+## Workflow Engine M5 — Multi-Step Sequencing
+
+The first real multi-step capability: **A → B within N seconds**, with
+optional same-track correlation. Workflows are now a TOP-LEVEL product
+object (`workflows` table); the `rules` table remains the M1-M4
+simple/timer-rule layer, unchanged. Alerts remain optional outputs. Still
+deferred: arbitrary graphs / >2 steps, branching, visual builder,
+cross-camera sequencing, recovery/auto-resolve, delivery channels.
+
+Migration: `20260614120000_workflows.sql` — `workflows` table (RLS +
+grant) and three nullable `workflow_runs` columns: `workflow_id` (FK, set
+null on delete — history survives), `deadline_at` (partial-indexed expiry
+sweep), `dedupe_key` (duplicate-start guard).
+
+### `/v1/workflows` CRUD (auth: `current_user`)
+
+`POST /v1/workflows`, `GET /v1/workflows?camera_id=&type=`,
+`GET|PATCH|DELETE /v1/workflows/{workflow_id}` — owner/admin mutations,
+member reads, camera-ownership + anti-enumeration 404s,
+422 `invalid_workflow_config` with `details.problems`. `workflow_type` is
+immutable ('sequence' is the only accepted type today). Responses never
+echo `account_id`.
+
+### Sequence config
+
+```json
+{
+  "start": {"event_type": "processor.zone_entered",
+             "conditions": {"zone_id": "zone-a", "object_classes": ["person"],
+                             "min_confidence": 0.7, "require_track_id": true}},
+  "then": {"within_seconds": 30,
+            "event_type": "processor.line_crossing_object",
+            "conditions": {"line_id": "line-b"}},
+  "correlation": {"same_track_id": true},
+  "on_success": {"create_alert": false},
+  "on_timeout": {"create_alert": true,
+                  "alert_message": "Expected follow-up did not happen in time."},
+  "schedule": {"days": ["mon","tue","wed","thu","fri"],
+                "start_time": "08:00", "end_time": "18:00",
+                "timezone": "America/Denver"}
+}
+```
+
+Validation is strict: unknown keys rejected at every level; step
+`event_type` must be a discrete event type (`zone_entered`, `zone_exited`,
+`line_crossing`, `line_crossing_object`, `dwell_started`,
+`dwell_exceeded` — snapshots like roi_occupancy excluded); per-step
+conditions follow the M3 availability posture (aggregate `line_crossing`
+allows only `line_id`); `within_seconds` 5–86400;
+`correlation.same_track_id` requires BOTH event types to be
+track-attributing. `on_success.create_alert` defaults false;
+`on_timeout.create_alert` defaults true. Schedule is the M3 shape.
+
+### Sequencer behavior (observation ingest)
+
+Runs in its own savepoint after rule evaluation (one failing layer never
+affects the other, and neither can fail ingest). Completions are processed
+BEFORE starts. **Start**: schedule + start conditions match (and a track
+exists when correlating) → guarded INSERT of an `active` run
+(`workflow_type='sequence'`, `trigger_type=<start observation type>`,
+`deadline_at = observed_at + within_seconds`, start evidence + definition
+snapshot, correlation track captured). The guard: NOT EXISTS an active run
+for the same workflow with the same `dedupe_key` (the start observation's
+processor idempotency key, falling back to observation id) — duplicate
+deliveries can't double-start; distinct physical starts (two people) DO run
+in parallel. **Complete**: active runs on the camera whose `then` matches —
+event type, deadline not passed, conditions, same-track — flip to
+`completed` via a guarded UPDATE (`where status='active'`, single-shot),
+follow-up evidence appended, `action_result='sequence_completed'` (alert
+only when `on_success.create_alert`).
+
+### Timeout (M4 evaluator loop)
+
+Each evaluator tick sweeps `active` runs past `deadline_at`: guarded UPDATE
+to `failed` with timeout evidence (single-shot — repeated ticks can't
+re-fail), then the timeout alert (unless opted out), cooldown-guarded
+ACROSS runs of the same workflow (the guard joins alerts →
+workflow_runs.workflow_id, since alerts carry no workflow column). The
+evaluator stats response gains `sequence_runs_expired`.
+
+### Workflow run reads
+
+`WorkflowRunSummary` gains `workflow_id` (null on rule runs) and
+`deadline_at` (set while an active sequence run is waiting).
+
+## Module 7 M1 — Usage + Billing Foundation
+
+First production usage/billing surface: a usage summary read API and
+enforcement of the (previously display-only) monthly streaming minutes
+quota. Intentionally deferred: Stripe (M2), a plans table, monthly
+rollups, and processor/compute minutes (not tracked anywhere — never
+invented). **No migration required** — everything reads existing tables.
+
+### `GET /v1/usage/summary?account_id=` (auth: `current_user`, any member)
+
+```json
+{
+  "plan": {"key": "free", "label": "Free", "status": "active"},
+  "period": {"start": "2026-06-01T00:00:00Z", "end": "2026-07-01T00:00:00Z"},
+  "limits": {"max_cameras": 5, "max_concurrent_sessions": 5,
+              "monthly_minutes_quota": 600,
+              "allowed_stream_types": ["rtsp", "webcam"]},
+  "usage": {"cameras": 2, "active_streams": 1, "stream_minutes": 430,
+             "workflow_runs": 1204, "alerts": 86, "rules": 4, "workflows": 1},
+  "states": {"cameras": "ok", "active_streams": "ok",
+              "stream_minutes": "near_limit"}
+}
+```
+
+- Period = current UTC calendar month (`date_trunc('month')` convention,
+  same as agent bootstrap).
+- Every counter reuses the predicate of the code that owns it: cameras
+  `status <> 'disabled'` (max_cameras enforcement), active_streams
+  `state in ('approved','streaming')` (session enforcement),
+  stream_minutes = sum of usage_events **`session_ended` only** // 60
+  (bootstrap convention; `stream_seconds` events report the SAME durations
+  from the streaming-server side and must never be added). Completed
+  sessions only — an active session counts when it ends.
+- workflow_runs/alerts are period counts; rules/workflows are ALL current
+  definitions (no soft delete exists).
+- `plan.label` is a title-cased copy of `accounts.plan` (no plans table).
+- States: `ok` < 80%, `near_limit` >= 80%, `at_limit` == 100%,
+  `over_limit` > 100%; a null limit would read `ok` (unlimited), a
+  zero/negative limit reads at/over.
+- 404 `account_limits_missing` when the account or its limits row is gone.
+
+### Monthly minutes quota enforcement
+
+`check_session_start` now rejects session creation once COMPLETED stream
+minutes this period reach `account_limits.monthly_minutes_quota`:
+
+- 403 **`limit_exceeded.monthly_minutes_quota`** with details
+  `{limit, used, period_start, period_end}` (minutes, ISO timestamps).
+- Same minutes source as the summary (`session_ended` only). Documented
+  softness: an account near the cap can start one final session and
+  overshoot by its length — acceptable for a coarse cost-control cap.
+- A quota of 0 blocks all session starts (no 0-means-unlimited convention
+  in this codebase). All pre-existing checks (concurrent sessions, stream
+  type, codec/fps/resolution/bitrate) are unchanged and run as before.
+
+## Module 7 M2 — Stripe Checkout + Customer Portal
+
+Stripe-HOSTED checkout and billing management — Upstream never renders a
+card form and stores only customer/subscription/price identifiers.
+Deliberately deferred: metered billing, usage invoices, coupons, invoice
+history UI, plans table.
+
+Migration `20260616120000_account_billing.sql`: `account_billing` (1:1
+with accounts; nullable Stripe refs + subscription state; RLS member
+select) and `stripe_events` (webhook idempotency ledger; id = Stripe
+event id; RLS enabled with no policies — service-role only).
+
+### Env (all optional — unset ⇒ 503 `billing_not_configured` and the
+dashboard's "coming soon" fallback)
+
+- `UPSTREAM_STRIPE_SECRET_KEY` — sk_test_/sk_live_
+- `UPSTREAM_STRIPE_WEBHOOK_SECRET` — whsec_ for the endpoint below
+- `UPSTREAM_STRIPE_PRICE_STARTER_MONTHLY` / `UPSTREAM_STRIPE_PRICE_PRO_MONTHLY`
+  — price_ IDs from the Stripe dashboard
+- `UPSTREAM_DASHBOARD_BASE_URL` — Checkout/Portal return base (no slash)
+
+### `POST /v1/billing/checkout` (user auth, owner/admin)
+
+Body `{"account_id": "...", "plan": "starter"|"pro"}` → `{"url": "https://checkout.stripe.com/..."}`.
+Creates (or reuses) the account's Stripe customer, then a subscription-mode
+Checkout Session with `account_id`/`plan_key` stamped in both session AND
+subscription metadata. Plan keys map to price IDs via env; limits per plan
+live in `services/plans.py` (PLACEHOLDER values — pricing is configurable,
+not final). Errors: 403 role/tenancy, 422 unknown plan, 503 unconfigured.
+
+### `POST /v1/billing/portal` (user auth, owner/admin)
+
+Body `{"account_id": "..."}` → `{"url": "https://billing.stripe.com/..."}`.
+409 `billing_no_customer` before any checkout has created a customer.
+
+### `POST /v1/webhooks/stripe`
+
+No user auth — authentication is the `Stripe-Signature` check against the
+RAW request body (400 `invalid_webhook_signature` on failure/missing).
+Every event id is recorded in `stripe_events` first; duplicates ack
+`{"received": true, "duplicate": true}` without reprocessing. Handled:
+
+- `checkout.session.completed` — links customer/subscription to
+  metadata.account_id, then RETRIEVES the subscription from Stripe (the
+  session payload's copy is incomplete) and syncs.
+- `customer.subscription.created/updated/deleted` — sync status, price,
+  period (reads item-level current_period_* with top-level fallback —
+  both Stripe API shapes), cancel_at_period_end.
+- `invoice.payment_failed` — records past_due immediately; plan/limits
+  untouched.
+- Anything else: recorded + acked, unprocessed.
+
+### Subscription sync contract
+
+- `active`/`trialing` + known price → `accounts.plan` and the WHOLE
+  `account_limits` row are overwritten from the plan mapping (hand-tuned
+  limits don't survive a plan change). Unknown price → state recorded,
+  limits untouched (logged `stripe_price_unmapped`).
+- `cancel_at_period_end` → flag recorded, nothing downgrades until Stripe
+  deletes the subscription at period end.
+- deleted/`canceled` → downgrade to `free` plan + free limits. Cameras /
+  workflows / rules are never deleted; free limits just gate new activity.
+- `past_due`/`unpaid`/`incomplete*` → status recorded, plan/limits kept
+  (grace; Stripe dunning decides when it actually cancels).
+- `accounts.status` is NEVER touched — it stays account lifecycle state.
+
+### Usage summary `billing` block
+
+`GET /v1/usage/summary` responses now include:
+
+```json
+"billing": {"provider": "stripe", "configured": true, "status": "active",
+             "subscription_status": "active",
+             "current_period_start": "...", "current_period_end": "...",
+             "cancel_at_period_end": false, "management_available": true}
+```
+
+`status` is derived (`none|active|trialing|past_due|canceled`; every
+payment-trouble Stripe status maps to `past_due`). Stripe IDs are never
+exposed to the dashboard.
