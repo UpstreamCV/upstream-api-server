@@ -33,6 +33,7 @@ import asyncpg
 
 from upstream_api.config import get_settings
 from upstream_api.observability.logging import get_logger
+from upstream_api.services.account_audit import try_record_account_audit_log
 from upstream_api.services.plans import apply_plan_to_account, plan_for_price_id
 
 _logger = get_logger("billing")
@@ -120,6 +121,15 @@ async def mark_payment_failed(conn: asyncpg.Connection, *, account_id: UUID) -> 
     if that event is delayed.
     """
     await conn.execute(_SET_SUBSCRIPTION_STATUS_SQL, account_id, "past_due")
+    await try_record_account_audit_log(
+        conn,
+        account_id=account_id,
+        actor_type="stripe",
+        event_type="billing.payment_failed",
+        resource_type="billing",
+        summary="A subscription payment failed (Stripe).",
+        metadata={"subscription_status": "past_due"},
+    )
 
 
 def _epoch_to_dt(value: Any) -> datetime | None:
@@ -174,6 +184,20 @@ async def sync_subscription_to_account(
         fields["period_end"],
     )
 
+    await try_record_account_audit_log(
+        conn,
+        account_id=account_id,
+        actor_type="stripe",
+        event_type="billing.subscription_synced",
+        resource_type="stripe_subscription",
+        resource_id=fields["subscription_id"],
+        summary=f"Stripe subscription synced (status: {fields['status']}).",
+        metadata={
+            "subscription_status": fields["status"],
+            "cancel_at_period_end": fields["cancel_at_period_end"],
+        },
+    )
+
     status = fields["status"]
     if status in _ENTITLED_STATUSES:
         plan_key = (
@@ -187,7 +211,7 @@ async def sync_subscription_to_account(
                 subscription_id=fields["subscription_id"],
             )
             return
-        await apply_plan_to_account(conn, account_id=account_id, plan_key=plan_key)
+        await _apply_plan_with_audit(conn, account_id=account_id, plan_key=plan_key)
         _logger.info(
             "billing_plan_applied",
             account_id=str(account_id),
@@ -195,10 +219,51 @@ async def sync_subscription_to_account(
             subscription_status=status,
         )
     elif status == "canceled":
-        await apply_plan_to_account(conn, account_id=account_id, plan_key="free")
+        await try_record_account_audit_log(
+            conn,
+            account_id=account_id,
+            actor_type="stripe",
+            event_type="billing.subscription_canceled",
+            resource_type="stripe_subscription",
+            resource_id=fields["subscription_id"],
+            summary="Stripe subscription canceled — account downgraded to the free plan.",
+            metadata={},
+        )
+        await _apply_plan_with_audit(conn, account_id=account_id, plan_key="free")
         _logger.info(
             "billing_plan_downgraded",
             account_id=str(account_id),
             subscription_id=fields["subscription_id"],
         )
     # past_due / unpaid / incomplete*: state recorded above; limits stay.
+
+
+async def _apply_plan_with_audit(
+    conn: asyncpg.Connection, *, account_id: UUID, plan_key: str
+) -> None:
+    """apply_plan_to_account + audit events. plan_changed only fires when
+    the plan actually changes; limits_updated fires on every apply (the
+    limits row is overwritten even for a same-plan re-sync)."""
+    old_plan = await conn.fetchval("select plan from accounts where id = $1", account_id)
+    await apply_plan_to_account(conn, account_id=account_id, plan_key=plan_key)
+    if old_plan != plan_key:
+        await try_record_account_audit_log(
+            conn,
+            account_id=account_id,
+            actor_type="stripe",
+            event_type="billing.plan_changed",
+            resource_type="account",
+            resource_id=str(account_id),
+            summary=f"Plan changed from {old_plan!r} to {plan_key!r}.",
+            metadata={"old_plan": old_plan, "new_plan": plan_key},
+        )
+    await try_record_account_audit_log(
+        conn,
+        account_id=account_id,
+        actor_type="stripe",
+        event_type="billing.limits_updated",
+        resource_type="account_limits",
+        resource_id=str(account_id),
+        summary=f"Account limits set from the {plan_key!r} plan mapping.",
+        metadata={"plan": plan_key},
+    )

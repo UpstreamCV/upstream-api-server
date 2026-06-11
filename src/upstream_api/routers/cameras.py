@@ -37,6 +37,7 @@ from upstream_api.security.deps import (
     PoolDep,
     require_account_role,
 )
+from upstream_api.services.account_audit import try_record_account_audit_log
 from upstream_api.services.geometry import (
     default_geometry_config_record,
     fetch_geometry_config,
@@ -170,6 +171,17 @@ async def register_camera(
                 body.default_latency_mode,
                 json.dumps(body.metadata),
             )
+            assert row is not None
+            await try_record_account_audit_log(
+                conn,
+                account_id=auth.account_id,
+                actor_type="system",
+                event_type="camera.created",
+                resource_type="camera",
+                resource_id=str(row["id"]),
+                summary=f"Camera {body.name!r} registered by agent.",
+                metadata={"name": body.name, "source_type": body.source_type},
+            )
         else:
             # coalesce keeps a previously declared source_type when an older
             # agent re-registers without sending one.
@@ -270,6 +282,18 @@ async def create_camera(
             body.default_latency_mode,
             json.dumps(body.metadata),
         )
+        assert row is not None
+        await try_record_account_audit_log(
+            conn,
+            account_id=scope_account,
+            actor_user_id=caller.user.user_id if caller.user else None,
+            actor_type="user" if caller.user else "system",
+            event_type="camera.created",
+            resource_type="camera",
+            resource_id=str(row["id"]),
+            summary=f"Camera {body.name!r} created.",
+            metadata={"name": body.name, "source_type": body.source_type},
+        )
     assert row is not None
     return _camera_to_response(row)
 
@@ -350,6 +374,19 @@ async def update_camera(
             body.default_bitrate_kbps,
             body.default_latency_mode,
         )
+        assert row is not None
+        changed = sorted(k for k, v in body.model_dump(exclude_unset=True).items() if v is not None)
+        await try_record_account_audit_log(
+            conn,
+            account_id=scope_account,
+            actor_user_id=caller.user.user_id if caller.user else None,
+            actor_type="user" if caller.user else "system",
+            event_type="camera.updated",
+            resource_type="camera",
+            resource_id=str(camera_id),
+            summary=f"Camera {row['name']!r} updated.",
+            metadata={"name": row["name"], "changed_fields": changed},
+        )
     assert row is not None
     return _camera_to_response(row)
 
@@ -404,6 +441,17 @@ async def claim_camera(
             auth.account_id,
             body.agent_id,
         )
+        if row is not None:
+            await try_record_account_audit_log(
+                conn,
+                account_id=auth.account_id,
+                actor_type="system",
+                event_type="camera.claimed",
+                resource_type="camera",
+                resource_id=str(camera_id),
+                summary=f"Camera {row['name']!r} claimed by agent.",
+                metadata={"name": row["name"], "agent_id": str(body.agent_id)},
+            )
     if row is None:
         # Lost a claim race between the read and the conditional update.
         raise ConflictError(

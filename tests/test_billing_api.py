@@ -45,6 +45,13 @@ _FAKE_SETTINGS = SimpleNamespace(
 
 
 @pytest.fixture(autouse=True)
+def _reset_audit_cache() -> None:
+    from upstream_api.services.account_audit import reset_audit_table_cache
+
+    reset_audit_table_cache()
+
+
+@pytest.fixture(autouse=True)
 def _stripe_settings(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("upstream_api.routers.billing.get_settings", lambda: _FAKE_SETTINGS)
     monkeypatch.setattr("upstream_api.services.billing.get_settings", lambda: _FAKE_SETTINGS)
@@ -132,6 +139,8 @@ class FakeConn:
         self.plan_updates: list[tuple[Any, ...]] = []
         self.limits_updates: list[tuple[Any, ...]] = []
         self.status_updates: list[tuple[Any, ...]] = []
+        self.audit_rows: list[tuple[Any, ...]] = []
+        self.current_plan = "free"
 
     def transaction(self) -> _Tx:
         return _Tx()
@@ -141,6 +150,10 @@ class FakeConn:
         return self.billing_row
 
     async def fetchval(self, query: str, *args: Any) -> Any:
+        if "to_regclass" in query:
+            return True
+        if "select plan from accounts" in query:
+            return self.current_plan
         if "select name from accounts" in query:
             return self.account_name
         if "insert into stripe_events" in query:
@@ -175,8 +188,12 @@ class FakeConn:
                     "stripe_customer_id": args[1],
                 }
             return "INSERT 0 1"
+        if "insert into account_audit_logs" in query:
+            self.audit_rows.append(args)
+            return "INSERT 0 1"
         if "update accounts set plan" in query:
             self.plan_updates.append(args)
+            self.current_plan = args[1]
             return "UPDATE 1"
         if "update account_limits" in query:
             self.limits_updates.append(args)

@@ -4,6 +4,53 @@ Reverse chronological. Newest at top. Every meaningful commit gets an entry foll
 
 ---
 
+## 2026-06-11 - Module 7 M3: tenant audit logs
+
+### Summary
+Account-facing audit history for the customer dashboard (explicitly NOT
+the admin panel / platform-admin trail). New `account_audit_logs` table
+(member SELECT RLS, no client writes), `services/account_audit.py`
+(best-effort writes: to_regclass probe for pre-migration deploys,
+swallowed insert errors, recursive metadata sanitizer that drops
+secret-shaped keys), and `GET /v1/audit-logs` (member-readable,
+limit<=100, created_at keyset pagination, event/resource filters; stored
+ip/user_agent never returned).
+
+Instrumented mutation points: api tokens (create/revoke — name+scopes
+only, never the plaintext), cameras (web create/update as user; agent
+register/claim as system; idempotent re-register NOT logged), rules
+(create/update/delete), workflows (create/update/delete + explicit
+enabled/disabled events), billing (checkout_started/portal_opened as the
+user; subscription_synced/canceled/payment_failed/plan_changed/
+limits_updated as actor stripe via webhook sync), and
+stream_session.limit_rejected (all LimitExceeded rejections at session
+start, recorded on a fresh connection since the rejected transaction
+rolls back). High-volume runtime events (observations, heartbeats,
+workflow runs, alerts) deliberately excluded.
+
+### Files touched
+- `supabase/migrations/20260618120000_account_audit_logs.sql`
+- `src/upstream_api/services/account_audit.py` (NEW),
+  `routers/audit_logs.py` (NEW), `app.py`
+- instrumented: `routers/api_tokens.py`, `routers/cameras.py`,
+  `routers/rules.py`, `routers/workflows.py`, `routers/billing.py`,
+  `routers/stream_sessions.py`, `services/billing.py`
+  (+_apply_plan_with_audit)
+- tests: `tests/test_account_audit.py` (21: sanitizer truth table,
+  service insert/probe/best-effort, endpoint auth/tenancy/filters/
+  pagination, and route-level write assertions for tokens/rules/
+  workflows/billing/webhook-sync/limit-rejection incl. raw-token-never-
+  stored); updated test_billing_api.py fakes for the new queries.
+
+### Testing/checks
+`make test` — 1154 passed (+21). `make lint` + `uv run mypy src` clean.
+
+### Follow-up TODOs
+- Retention/pruning job once volume warrants (append-only today).
+- Actor display names need a member-directory endpoint (dashboard shows
+  short user ids).
+- camera.disabled/deleted events when those routes exist.
+
 ## 2026-06-11 - feat(observability): M9.3 — Prometheus GET /metrics + Sentry init
 
 ### Summary

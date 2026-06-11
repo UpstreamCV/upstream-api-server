@@ -23,6 +23,7 @@ from upstream_api.schemas.rules import (
     validate_rule_cooldown,
 )
 from upstream_api.security.deps import CurrentUser, PoolDep, require_account_role
+from upstream_api.services.account_audit import try_record_account_audit_log
 from upstream_api.services.processor import coerce_jsonb
 from upstream_api.services.rules import (
     delete_rule,
@@ -126,6 +127,16 @@ async def create_rule(
             created_by=user.user_id,
             req=body,
         )
+        await try_record_account_audit_log(
+            conn,
+            account_id=body.account_id,
+            actor_user_id=user.user_id,
+            event_type="rule.created",
+            resource_type="rule",
+            resource_id=str(row["id"]),
+            summary=f"Rule {body.name!r} created.",
+            metadata={"name": body.name, "rule_type": body.rule_type},
+        )
     return _summary(row)
 
 
@@ -187,6 +198,18 @@ async def patch_rule(
             severity=body.severity,
             cooldown_seconds=body.cooldown_seconds,
         )
+        assert row is not None  # Row existed inside the same transaction.
+        changed = sorted(body.model_dump(exclude_unset=True, exclude_none=True))
+        await try_record_account_audit_log(
+            conn,
+            account_id=scope_account,
+            actor_user_id=user.user_id,
+            event_type="rule.updated",
+            resource_type="rule",
+            resource_id=str(rule_id),
+            summary=f"Rule {row['name']!r} updated.",
+            metadata={"name": row["name"], "changed_fields": changed},
+        )
     assert row is not None  # Row existed inside the same transaction.
     return _summary(row)
 
@@ -202,6 +225,18 @@ async def delete_rule_endpoint(
     require_account_role(user, scope_account, "owner", "admin")
 
     async with pool.acquire() as conn, conn.transaction():
+        existing = await fetch_rule(conn, account_id=scope_account, rule_id=rule_id)
         deleted = await delete_rule(conn, account_id=scope_account, rule_id=rule_id)
+        if deleted and existing is not None:
+            await try_record_account_audit_log(
+                conn,
+                account_id=scope_account,
+                actor_user_id=user.user_id,
+                event_type="rule.deleted",
+                resource_type="rule",
+                resource_id=str(rule_id),
+                summary=f"Rule {existing['name']!r} deleted.",
+                metadata={"name": existing["name"]},
+            )
     if not deleted:
         raise NotFoundError("Rule not found.", code="rule_not_found")

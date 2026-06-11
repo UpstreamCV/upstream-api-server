@@ -17,6 +17,7 @@ from pydantic import BaseModel
 from upstream_api.config import get_settings
 from upstream_api.errors import ApiError, NotFoundError
 from upstream_api.security.deps import CurrentUser, PoolDep, require_account_role
+from upstream_api.services.account_audit import try_record_account_audit_log
 from upstream_api.services.billing import get_billing_row, upsert_customer
 from upstream_api.services.plans import price_id_for_plan
 from upstream_api.services.stripe_gateway import (
@@ -95,6 +96,16 @@ async def create_checkout(
         success_url=f"{billing_url}?checkout=success",
         cancel_url=f"{billing_url}?checkout=canceled",
     )
+    async with pool.acquire() as conn:
+        await try_record_account_audit_log(
+            conn,
+            account_id=body.account_id,
+            actor_user_id=user.user_id,
+            event_type="billing.checkout_started",
+            resource_type="billing",
+            summary=f"Stripe checkout started for the {body.plan} plan.",
+            metadata={"plan": body.plan},
+        )
     return BillingUrlResponse(url=url)
 
 
@@ -120,4 +131,14 @@ async def create_portal(
         customer_id=customer_id,
         return_url=f"{settings.dashboard_base_url}/dashboard/billing",
     )
+    async with pool.acquire() as conn:
+        await try_record_account_audit_log(
+            conn,
+            account_id=body.account_id,
+            actor_user_id=user.user_id,
+            event_type="billing.portal_opened",
+            resource_type="billing",
+            summary="Stripe billing portal opened.",
+            metadata={},
+        )
     return BillingUrlResponse(url=url)

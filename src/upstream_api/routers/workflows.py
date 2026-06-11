@@ -23,6 +23,7 @@ from upstream_api.schemas.workflows import (
     validate_sequence_config,
 )
 from upstream_api.security.deps import CurrentUser, PoolDep, require_account_role
+from upstream_api.services.account_audit import try_record_account_audit_log
 from upstream_api.services.processor import coerce_jsonb
 from upstream_api.services.workflows import (
     delete_workflow,
@@ -123,6 +124,16 @@ async def create_workflow(
             created_by=user.user_id,
             req=body,
         )
+        await try_record_account_audit_log(
+            conn,
+            account_id=body.account_id,
+            actor_user_id=user.user_id,
+            event_type="workflow.created",
+            resource_type="workflow",
+            resource_id=str(row["id"]),
+            summary=f"Workflow {body.name!r} created.",
+            metadata={"name": body.name, "workflow_type": body.workflow_type},
+        )
     return _summary(row)
 
 
@@ -189,6 +200,25 @@ async def patch_workflow(
             severity=body.severity,
             cooldown_seconds=body.cooldown_seconds,
         )
+        assert row is not None  # Row existed inside the same transaction.
+        # An explicit enabled flip gets its own event type; other field
+        # changes are a generic workflow.updated.
+        if body.enabled is not None and body.enabled != existing["enabled"]:
+            event = "workflow.enabled" if body.enabled else "workflow.disabled"
+            verb = "enabled" if body.enabled else "disabled"
+        else:
+            event, verb = "workflow.updated", "updated"
+        changed = sorted(body.model_dump(exclude_unset=True, exclude_none=True))
+        await try_record_account_audit_log(
+            conn,
+            account_id=scope_account,
+            actor_user_id=user.user_id,
+            event_type=event,
+            resource_type="workflow",
+            resource_id=str(workflow_id),
+            summary=f"Workflow {row['name']!r} {verb}.",
+            metadata={"name": row["name"], "changed_fields": changed},
+        )
     assert row is not None  # Row existed inside the same transaction.
     return _summary(row)
 
@@ -204,6 +234,18 @@ async def delete_workflow_endpoint(
     require_account_role(user, scope_account, "owner", "admin")
 
     async with pool.acquire() as conn, conn.transaction():
+        existing = await fetch_workflow(conn, account_id=scope_account, workflow_id=workflow_id)
         deleted = await delete_workflow(conn, account_id=scope_account, workflow_id=workflow_id)
+        if deleted and existing is not None:
+            await try_record_account_audit_log(
+                conn,
+                account_id=scope_account,
+                actor_user_id=user.user_id,
+                event_type="workflow.deleted",
+                resource_type="workflow",
+                resource_id=str(workflow_id),
+                summary=f"Workflow {existing['name']!r} deleted.",
+                metadata={"name": existing["name"]},
+            )
     if not deleted:
         raise NotFoundError("Workflow not found.", code="workflow_not_found")
