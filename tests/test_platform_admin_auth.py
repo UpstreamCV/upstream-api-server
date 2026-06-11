@@ -18,6 +18,7 @@ from upstream_api.config import get_settings
 from upstream_api.errors import ForbiddenError, UnauthorizedError
 from upstream_api.security.deps import current_platform_admin
 
+
 def _secret() -> str:
     """The active Supabase JWT secret. CI exports its own UPSTREAM_* values
     (which beat conftest's setdefault fallbacks), so tokens must be minted

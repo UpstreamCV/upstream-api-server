@@ -109,6 +109,30 @@ platform-admin work landed concurrently in the same tree).
 
 ---
 
+## 2026-06-11 - ci: platform-admin tests derive secrets from settings (+ import-order fixup)
+
+### Summary
+Four platform-admin tests hardcoded conftest's LOCAL fallback values
+("test-supabase-jwt-secret", "test-service"), but conftest only setdefault()s
+those — CI exports its own UPSTREAM_* values (ci-*), so the minted JWTs
+failed signature verification and the GoTrue apikey assertion compared the
+wrong literal. Tokens and expectations now come from get_settings() so the
+tests are env-agnostic. (Landed as two commits: the fix itself, then an
+import-order fixup + this entry — a shell quoting slip let the first commit
+push past the lint gate.)
+
+### Files touched
+- `tests/test_platform_admin_auth.py` — _mint() signs with the resolved
+  supabase_jwt_secret; imports re-sorted.
+- `tests/test_platform_admin_editing.py` — apikey assertion compares the
+  resolved service-role key.
+
+### Testing/checks
+Full suite green under BOTH env shapes: local defaults and CI's exact
+exported values (1151 passed each); ruff + mypy clean.
+
+---
+
 ## 2026-06-11 - ci: fix the 47 mypy errors in workflow/billing test files
 
 ### Summary
