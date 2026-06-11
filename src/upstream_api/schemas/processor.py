@@ -37,6 +37,12 @@ ProcessorObservationType = Literal[
     "processor.mock_heartbeat",
     "processor.mock_detection",
     "processor.line_crossing",
+    # Side task (per-object line crossing): per-OBJECT crossing evidence
+    # with track/class/confidence attribution and event_mode
+    # "object_crossing" in the payload. Flows ALONGSIDE the aggregate
+    # cumulative-counter type above — rule evaluation partitions on
+    # event_mode so one physical crossing never double-fires a rule.
+    "processor.line_crossing_object",
     # P4-C: second real DeepStream-backed type. The analytics worker
     # emits ROI occupancy snapshots gated by an on-change-OR-interval
     # policy (never per-frame). Same DB column / route / auth as

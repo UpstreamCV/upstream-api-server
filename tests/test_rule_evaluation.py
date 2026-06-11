@@ -242,6 +242,85 @@ _EVAL_NOW = datetime(2026, 6, 10, 12, 0, 0, tzinfo=UTC)
             {"total_count": 5, "class_counts": "x"},
             False,
         ),
+        # --- per-object line crossing: matcher partition ---------------------
+        # Plain rules match ONLY aggregate events (no event_mode)...
+        ("line_crossing", {}, {"line_id": "line-1"}, True),
+        ("line_crossing", {}, {"line_id": "line-1", "event_mode": "object_crossing"}, False),
+        # ...and per-object-conditioned rules match ONLY per-object events —
+        # one physical crossing produces both, so this prevents double-fire.
+        (
+            "line_crossing",
+            {"object_classes": ["person"]},
+            {"line_id": "line-1", "count_delta": 1},
+            False,
+        ),
+        (
+            "line_crossing",
+            {"object_classes": ["person"]},
+            {
+                "line_id": "line-1",
+                "event_mode": "object_crossing",
+                "class_label": "person",
+                "track_id": "7",
+            },
+            True,
+        ),
+        (
+            "line_crossing",
+            {"object_classes": ["person"]},
+            {
+                "line_id": "line-1",
+                "event_mode": "object_crossing",
+                "class_label": "car",
+                "track_id": "7",
+            },
+            False,
+        ),
+        # Missing class never matches a class-filtered line rule.
+        (
+            "line_crossing",
+            {"object_classes": ["person"]},
+            {"line_id": "line-1", "event_mode": "object_crossing", "track_id": "7"},
+            False,
+        ),
+        (
+            "line_crossing",
+            {"require_track_id": True},
+            {"line_id": "line-1", "event_mode": "object_crossing", "track_id": "7"},
+            True,
+        ),
+        (
+            "line_crossing",
+            {"require_track_id": True},
+            {"line_id": "line-1", "event_mode": "object_crossing"},
+            False,
+        ),
+        (
+            "line_crossing",
+            {"min_confidence": 0.7},
+            {"line_id": "line-1", "event_mode": "object_crossing", "confidence": 0.84},
+            True,
+        ),
+        (
+            "line_crossing",
+            {"min_confidence": 0.7},
+            {"line_id": "line-1", "event_mode": "object_crossing", "confidence": 0.5},
+            False,
+        ),
+        # Missing confidence never matches when configured.
+        (
+            "line_crossing",
+            {"min_confidence": 0.7},
+            {"line_id": "line-1", "event_mode": "object_crossing"},
+            False,
+        ),
+        # line_id filter applies to per-object events too.
+        (
+            "line_crossing",
+            {"line_id": "line-1", "min_confidence": 0.5},
+            {"line_id": "line-2", "event_mode": "object_crossing", "confidence": 0.9},
+            False,
+        ),
     ],
 )
 def test_rule_matches(
@@ -295,6 +374,14 @@ def test_rule_matches(
         ("dwell_exceeded", {"min_confidence": 0.5, "object_classes": ["person"]}),
         ("roi_occupancy", {"object_class": "person", "min_total_count": 3}),
         ("roi_occupancy", {"object_class": "person", "max_total_count": 2}),
+        # --- per-object line crossing unlock ---------------------------------
+        ("line_crossing", {"object_classes": ["person"]}),
+        ("line_crossing", {"require_track_id": True}),
+        ("line_crossing", {"min_confidence": 0.7}),
+        (
+            "line_crossing",
+            {"line_id": "line-1", "object_classes": ["person"], "min_confidence": 0.7},
+        ),
     ],
 )
 def test_valid_configs_pass(rule_type: str, config: dict[str, Any]) -> None:
@@ -315,10 +402,7 @@ def test_valid_configs_pass(rule_type: str, config: dict[str, Any]) -> None:
         ("nonsense_type", {}),
         # --- M3: conditions are rejected on types whose payloads can't
         # prove them (processor follow-up, not faked) ------------------------
-        ("line_crossing", {"object_classes": ["person"]}),
-        ("line_crossing", {"require_track_id": True}),
-        ("line_crossing", {"direction": "a_to_b"}),  # deferred — never produced
-        ("line_crossing", {"min_confidence": 0.7}),  # no per-object attribution
+        ("line_crossing", {"direction": "a_to_b"}),  # still deferred — no true a_to_b
         ("roi_occupancy", {"object_classes": ["person"]}),  # use object_class (single)
         ("roi_occupancy", {"min_confidence": 0.7}),  # counts have no confidence
         # --- payload-enrichment unlock: value validation ---------------------
@@ -765,6 +849,81 @@ async def test_in_schedule_richer_rule_creates_linked_run_and_alert() -> None:
     assert json.loads(conn.run_inserts[0][9])["rule"]["config"] == config
     assert conn.alert_inserts[0][4] == conn.run_ids[0]
     assert conn.run_finalizes == [(conn.run_ids[0], "completed", "alert_created")]
+
+
+async def test_one_physical_crossing_never_double_fires_a_rule() -> None:
+    """The partition contract: one physical crossing reaches the api-server
+    as TWO observations (aggregate processor.line_crossing + per-object
+    processor.line_crossing_object). A plain rule fires only on the
+    aggregate; a per-object-conditioned rule fires only on the per-object
+    event. Each rule produces exactly ONE workflow run + alert total."""
+    account, camera = uuid4(), uuid4()
+    plain_rule = _eval_rule(account_id=account, camera_id=camera, config={})
+    conditioned_rule = _eval_rule(
+        account_id=account,
+        camera_id=camera,
+        config={"object_classes": ["person"], "min_confidence": 0.7},
+    )
+    conn = FakeEvalConn(rules=[plain_rule, conditioned_rule])
+
+    aggregate_payload = {
+        "line_id": "line-1",
+        "line_label": "line-1",
+        "count_delta": 1,
+        "cumulative_count": 4,
+    }
+    object_payload = {
+        "line_id": "line-1",
+        "line_label": "line-1",
+        "event_mode": "object_crossing",
+        "track_id": "7",
+        "class_label": "person",
+        "confidence": 0.84,
+    }
+    created_aggregate = await evaluate_observation(
+        conn,  # type: ignore[arg-type]
+        account_id=account,
+        camera_id=camera,
+        observation_id=uuid4(),
+        observation_type="processor.line_crossing",
+        payload=aggregate_payload,
+        observed_at=_EVAL_NOW,
+    )
+    created_object = await evaluate_observation(
+        conn,  # type: ignore[arg-type]
+        account_id=account,
+        camera_id=camera,
+        observation_id=uuid4(),
+        observation_type="processor.line_crossing_object",
+        payload=object_payload,
+        observed_at=_EVAL_NOW,
+    )
+    # One alert per rule across BOTH observations — never two for one rule.
+    assert created_aggregate == 1  # plain rule, aggregate event only
+    assert created_object == 1  # conditioned rule, per-object event only
+    assert len(conn.run_inserts) == 2
+    assert len(conn.alert_inserts) == 2
+    fired_rule_ids = {args[2] for args in conn.alert_inserts}
+    assert fired_rule_ids == {plain_rule["id"], conditioned_rule["id"]}
+
+
+async def test_conditioned_line_rule_ignores_aggregate_even_when_alone() -> None:
+    """A per-object-conditioned rule must not fall back to aggregate
+    events when no per-object event arrives (e.g. untracked crossing)."""
+    account, camera = uuid4(), uuid4()
+    rule = _eval_rule(account_id=account, camera_id=camera, config={"require_track_id": True})
+    conn = FakeEvalConn(rules=[rule])
+    created = await evaluate_observation(
+        conn,  # type: ignore[arg-type]
+        account_id=account,
+        camera_id=camera,
+        observation_id=uuid4(),
+        observation_type="processor.line_crossing",
+        payload={"line_id": "line-1", "count_delta": 1},
+        observed_at=_EVAL_NOW,
+    )
+    assert created == 0
+    assert conn.run_inserts == []
 
 
 async def test_two_matching_rules_create_two_alerts() -> None:
