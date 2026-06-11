@@ -46,6 +46,7 @@ from upstream_api.routers import (
     workflow_runs,
     workflows,
 )
+from upstream_api.services.health_sampler import health_sampler_loop
 from upstream_api.services.http_client import build_http_client
 from upstream_api.services.workflow_evaluator import workflow_evaluator_loop
 
@@ -71,15 +72,33 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             "workflow_evaluator_loop_started",
             interval_seconds=settings.workflow_evaluator_interval_seconds,
         )
+    # Admin-panel health history: server-side sampler so the panel's graphs
+    # read persisted history instead of collecting client-side. Same gated
+    # single-instance posture as the evaluator.
+    sampler_task: asyncio.Task[None] | None = None
+    if settings.health_sample_interval_seconds > 0:
+        sampler_task = asyncio.create_task(
+            health_sampler_loop(
+                pool,
+                app.state.http_client,
+                settings,
+                settings.health_sample_interval_seconds,
+            )
+        )
+        _logger.info(
+            "health_sampler_loop_started",
+            interval_seconds=settings.health_sample_interval_seconds,
+        )
     _logger.info("startup", environment=settings.environment, port=settings.port)
     try:
         yield
     finally:
         _logger.info("shutdown")
-        if evaluator_task is not None:
-            evaluator_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await evaluator_task
+        for task in (evaluator_task, sampler_task):
+            if task is not None:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
         await app.state.http_client.aclose()
         await pool.close()
 

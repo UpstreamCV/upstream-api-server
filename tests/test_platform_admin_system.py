@@ -234,3 +234,105 @@ def test_timeseries_clamps_hours() -> None:
     client = _ts_client(TimeseriesConn([]))
     assert client.get("/v1/admin/system/timeseries?hours=0").status_code == 422
     assert client.get("/v1/admin/system/timeseries?hours=200").status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# GET /v1/admin/system/health/history + the sampler service
+# ---------------------------------------------------------------------------
+
+
+def test_health_history_returns_samples() -> None:
+    from datetime import UTC, datetime
+
+    conn = TimeseriesConn(
+        [
+            {
+                "sampled_at": datetime(2026, 6, 11, 12, 0, tzinfo=UTC),
+                "db_ok": True,
+                "db_latency_ms": 1.4,
+                "mediamtx_status": "ok",
+                "mediamtx_active_paths": 2,
+                "processors_active": 1,
+                "processors_stale": 0,
+                "processors_failed": 0,
+                "active_sessions": 2,
+            }
+        ]
+    )
+    client = _ts_client(conn)
+    r = client.get("/v1/admin/system/health/history?minutes=30")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["minutes"] == 30
+    assert body["interval_seconds"] == 60  # settings default
+    assert body["samples"][0]["db_latency_ms"] == 1.4
+    assert conn.args == (30,)
+
+
+def test_health_history_clamps_minutes() -> None:
+    client = _ts_client(TimeseriesConn([]))
+    assert client.get("/v1/admin/system/health/history?minutes=1").status_code == 422
+    assert client.get("/v1/admin/system/health/history?minutes=2000").status_code == 422
+
+
+async def test_record_sample_inserts_row(monkeypatch: pytest.MonkeyPatch) -> None:
+    import upstream_api.services.health_sampler as sampler_module
+    from upstream_api.config import get_settings
+    from upstream_api.schemas.platform_admin import (
+        DatabaseHealth as DbHealth,
+    )
+    from upstream_api.schemas.platform_admin import (
+        ProcessorsHealth as ProcHealth,
+    )
+    from upstream_api.schemas.platform_admin import (
+        StreamingServerHealth as StreamHealth,
+    )
+    from upstream_api.services.health_sampler import record_sample
+
+    async def fake_check_database(_pool: Any) -> DbHealth:
+        return DbHealth(status="ok", latency_ms=2.5)
+
+    async def fake_check_streaming_server(_client: Any, *, base_url: str) -> StreamHealth:
+        return StreamHealth(status="unreachable", error="refused")
+
+    async def fake_processor_rollup(_pool: Any) -> ProcHealth:
+        return ProcHealth(active=1, stale=0, failed=0)
+
+    monkeypatch.setattr(sampler_module, "check_database", fake_check_database)
+    monkeypatch.setattr(sampler_module, "check_streaming_server", fake_check_streaming_server)
+    monkeypatch.setattr(sampler_module, "processor_rollup", fake_processor_rollup)
+
+    class SamplerConn:
+        def __init__(self) -> None:
+            self.executes: list[tuple[str, tuple[Any, ...]]] = []
+
+        async def fetchval(self, _query: str, *args: Any) -> int:
+            return 3  # active sessions
+
+        async def execute(self, query: str, *args: Any) -> str:
+            self.executes.append((query, args))
+            return "OK"
+
+    class SamplerAcquire:
+        def __init__(self, conn: SamplerConn) -> None:
+            self.conn = conn
+
+        async def __aenter__(self) -> SamplerConn:
+            return self.conn
+
+        async def __aexit__(self, *_exc: Any) -> None:
+            return None
+
+    class SamplerPool:
+        def __init__(self) -> None:
+            self.conn = SamplerConn()
+
+        def acquire(self) -> SamplerAcquire:
+            return SamplerAcquire(self.conn)
+
+    pool = SamplerPool()
+    await record_sample(pool, object(), get_settings())  # type: ignore[arg-type]
+    inserts = [a for q, a in pool.conn.executes if "insert into system_health_samples" in q]
+    assert len(inserts) == 1
+    # (db_ok, latency, mediamtx_status, paths, active, stale, failed, sessions)
+    assert inserts[0] == (True, 2.5, "unreachable", None, 1, 0, 0, 3)

@@ -98,6 +98,39 @@ platform-admin work landed concurrently in the same tree).
 
 ---
 
+## 2026-06-11 - feat(admin): server-side health sampler + history endpoint
+
+### Summary
+Moves health-history collection off the browser: an in-process sampler loop
+(same gated single-instance posture as the workflow evaluator) probes DB
+latency, MediaMTX reachability, processor rollup, and active-session count
+every UPSTREAM_HEALTH_SAMPLE_INTERVAL_SECONDS (default 60, 0 disables) and
+appends to the new system_health_samples table (7-day inline retention).
+GET /v1/admin/system/health/history serves the window to the panel, which
+now reads shared persisted history instead of building per-tab ring buffers
+— graphs exist even when nobody is watching.
+
+### Files touched
+- `supabase/migrations/20260618120000_system_health_samples.sql` — new
+  table + index; RLS enabled, zero policies.
+- `src/upstream_api/services/health_sampler.py` — record_sample /
+  prune_samples / health_sampler_loop (one failed tick logs and continues).
+- `src/upstream_api/app.py` — lifespan starts/cancels the sampler task
+  alongside the evaluator.
+- `src/upstream_api/config.py` — health_sample_interval_seconds.
+- `src/upstream_api/routers/platform_admin/system.py` +
+  `schemas/platform_admin.py` — /system/health/history endpoint.
+- `tests/test_platform_admin_system.py` — history endpoint, minutes clamp,
+  record_sample insert-shape test (monkeypatched probes).
+- `docs/api-contracts.md`, `docs/module-map.md`.
+
+### Testing/checks
+`pytest` 1148 passed; `ruff`/`mypy` clean; `make db-reset` replays. Live:
+sampler at a 5 s test interval produced server-side samples the panel's
+history endpoint served (db_ok 2 ms, MediaMTX unreachable, sessions=1).
+
+---
+
 ## 2026-06-11 - feat(admin): system activity timeseries endpoint
 
 ### Summary
