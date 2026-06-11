@@ -27,7 +27,11 @@ from upstream_api.services.rules import (
     build_alert_message,
     evaluate_observation,
     rule_matches,
+    schedule_allows,
 )
+
+# A Wednesday 12:00 UTC — used wherever evaluation needs an observation time.
+_EVAL_NOW = datetime(2026, 6, 10, 12, 0, 0, tzinfo=UTC)
 
 # ---------------------------------------------------------------------------
 # rule_matches — pure truth table.
@@ -73,6 +77,80 @@ from upstream_api.services.rules import (
         ("dwell_exceeded", {"min_duration_seconds": 120}, {}, False),
         # Unknown rule types never match.
         ("camera_offline", {}, {}, False),
+        # --- M3: object class filter (zone_entered / dwell_exceeded) -------
+        (
+            "zone_entered",
+            {"object_classes": ["person"]},
+            {"zone_id": "z", "class_label": "person"},
+            True,
+        ),
+        (
+            "zone_entered",
+            {"object_classes": ["person", "forklift"]},
+            {"zone_id": "z", "class_label": "forklift"},
+            True,
+        ),
+        (
+            "zone_entered",
+            {"object_classes": ["person"]},
+            {"zone_id": "z", "class_label": "car"},
+            False,
+        ),
+        # Payload that can't prove its class never matches a filtered rule.
+        ("zone_entered", {"object_classes": ["person"]}, {"zone_id": "z"}, False),
+        ("zone_entered", {"object_classes": ["person"]}, {"zone_id": "z", "class_label": 3}, False),
+        # Filter omitted keeps M1 behavior.
+        ("zone_entered", {}, {"zone_id": "z"}, True),
+        (
+            "dwell_exceeded",
+            {"object_classes": ["person"]},
+            {"zone_id": "z", "class_label": "person", "duration_seconds": 61.0},
+            True,
+        ),
+        (
+            "dwell_exceeded",
+            {"object_classes": ["person"]},
+            {"zone_id": "z", "class_label": "car", "duration_seconds": 61.0},
+            False,
+        ),
+        (
+            "dwell_exceeded",
+            {"object_classes": ["person"]},
+            {"zone_id": "z", "duration_seconds": 61.0},
+            False,
+        ),
+        # Class filter composes with the duration threshold.
+        (
+            "dwell_exceeded",
+            {"object_classes": ["person"], "min_duration_seconds": 120},
+            {"zone_id": "z", "class_label": "person", "duration_seconds": 61.0},
+            False,
+        ),
+        # --- M3: require_track_id (zone_entered / dwell_exceeded) ----------
+        ("zone_entered", {"require_track_id": True}, {"zone_id": "z", "track_id": "t-7"}, True),
+        ("zone_entered", {"require_track_id": True}, {"zone_id": "z"}, False),
+        ("zone_entered", {"require_track_id": True}, {"zone_id": "z", "track_id": ""}, False),
+        ("zone_entered", {"require_track_id": False}, {"zone_id": "z"}, True),
+        (
+            "dwell_exceeded",
+            {"require_track_id": True},
+            {"zone_id": "z", "track_id": "t-7", "duration_seconds": 5},
+            True,
+        ),
+        (
+            "dwell_exceeded",
+            {"require_track_id": True},
+            {"zone_id": "z", "duration_seconds": 5},
+            False,
+        ),
+        # --- M3: max_total_count (roi_occupancy) ---------------------------
+        ("roi_occupancy", {"max_total_count": 5}, {"total_count": 5}, True),
+        ("roi_occupancy", {"max_total_count": 5}, {"total_count": 6}, False),
+        ("roi_occupancy", {"min_total_count": 2, "max_total_count": 5}, {"total_count": 1}, False),
+        ("roi_occupancy", {"min_total_count": 2, "max_total_count": 5}, {"total_count": 3}, True),
+        ("roi_occupancy", {"min_total_count": 2, "max_total_count": 5}, {"total_count": 9}, False),
+        # Bounds need a provable count.
+        ("roi_occupancy", {"max_total_count": 5}, {}, False),
     ],
 )
 def test_rule_matches(
@@ -98,6 +176,28 @@ def test_rule_matches(
         ("zone_entered", {"zone_id": "z-1"}),
         ("dwell_exceeded", {"zone_id": "z-1", "min_duration_seconds": 90}),
         ("dwell_exceeded", {"min_duration_seconds": 90.5}),
+        # --- M3 ------------------------------------------------------------
+        ("zone_entered", {"object_classes": ["person", "forklift"], "require_track_id": True}),
+        ("dwell_exceeded", {"object_classes": ["person"], "min_duration_seconds": 30}),
+        ("roi_occupancy", {"min_total_count": 2, "max_total_count": 10}),
+        ("roi_occupancy", {"max_total_count": 1}),
+        (
+            "line_crossing",
+            {
+                "line_id": "line-1",
+                "schedule": {
+                    "days": ["mon", "tue", "wed", "thu", "fri"],
+                    "start_time": "08:00",
+                    "end_time": "18:00",
+                    "timezone": "America/New_York",
+                },
+            },
+        ),
+        # Overnight window + default days are both valid.
+        (
+            "zone_entered",
+            {"schedule": {"start_time": "22:00", "end_time": "06:00", "timezone": "UTC"}},
+        ),
     ],
 )
 def test_valid_configs_pass(rule_type: str, config: dict[str, Any]) -> None:
@@ -116,6 +216,80 @@ def test_valid_configs_pass(rule_type: str, config: dict[str, Any]) -> None:
         ("dwell_exceeded", {"min_duration_seconds": 0}),
         ("dwell_exceeded", {"min_duration_seconds": -5}),
         ("nonsense_type", {}),
+        # --- M3: conditions are rejected on types whose payloads can't
+        # prove them (processor follow-up, not faked) ------------------------
+        ("line_crossing", {"object_classes": ["person"]}),
+        ("line_crossing", {"require_track_id": True}),
+        ("line_crossing", {"direction": "a_to_b"}),  # deferred — never produced
+        ("zone_entered", {"min_confidence": 0.7}),  # deferred — not in payloads
+        ("roi_occupancy", {"object_classes": ["person"]}),  # aggregate counts only
+        # --- M3: value validation -------------------------------------------
+        ("zone_entered", {"object_classes": []}),
+        ("zone_entered", {"object_classes": ["person", "person"]}),
+        ("zone_entered", {"object_classes": ["person", ""]}),
+        ("zone_entered", {"object_classes": "person"}),
+        ("zone_entered", {"object_classes": [f"c{i}" for i in range(21)]}),
+        ("zone_entered", {"require_track_id": "yes"}),
+        ("roi_occupancy", {"max_total_count": 0}),
+        ("roi_occupancy", {"min_total_count": 5, "max_total_count": 2}),
+        # --- M3: schedule validation -----------------------------------------
+        ("line_crossing", {"schedule": "always"}),
+        ("line_crossing", {"schedule": {"start_time": "08:00", "end_time": "18:00"}}),  # no tz
+        (
+            "line_crossing",
+            {"schedule": {"start_time": "8am", "end_time": "18:00", "timezone": "UTC"}},
+        ),
+        (
+            "line_crossing",
+            {"schedule": {"start_time": "08:00", "end_time": "24:00", "timezone": "UTC"}},
+        ),
+        (
+            "line_crossing",
+            {"schedule": {"start_time": "08:00", "end_time": "08:00", "timezone": "UTC"}},
+        ),
+        (
+            "line_crossing",
+            {
+                "schedule": {
+                    "start_time": "08:00",
+                    "end_time": "18:00",
+                    "timezone": "Mars/Olympus",
+                }
+            },
+        ),
+        (
+            "line_crossing",
+            {
+                "schedule": {
+                    "days": ["monday"],
+                    "start_time": "08:00",
+                    "end_time": "18:00",
+                    "timezone": "UTC",
+                }
+            },
+        ),
+        (
+            "line_crossing",
+            {
+                "schedule": {
+                    "days": [],
+                    "start_time": "08:00",
+                    "end_time": "18:00",
+                    "timezone": "UTC",
+                }
+            },
+        ),
+        (
+            "line_crossing",
+            {
+                "schedule": {
+                    "start_time": "08:00",
+                    "end_time": "18:00",
+                    "timezone": "UTC",
+                    "label": "work hours",
+                }
+            },
+        ),
     ],
 )
 def test_invalid_configs_fail(rule_type: str, config: dict[str, Any]) -> None:
@@ -125,6 +299,103 @@ def test_invalid_configs_fail(rule_type: str, config: dict[str, Any]) -> None:
 def test_build_alert_message_uses_labels_over_ids() -> None:
     msg = build_alert_message("line_crossing", {"line_id": "line-1", "line_label": "Front door"})
     assert "Front door" in msg
+
+
+# ---------------------------------------------------------------------------
+# schedule_allows — pure time-window gate (M3).
+# ---------------------------------------------------------------------------
+
+_BUSINESS_HOURS = {
+    "schedule": {
+        "days": ["mon", "tue", "wed", "thu", "fri"],
+        "start_time": "08:00",
+        "end_time": "18:00",
+        "timezone": "UTC",
+    }
+}
+
+
+def _utc(day: int, hour: int, minute: int = 0) -> datetime:
+    """June 2026: the 8th is a Monday, 13th/14th the weekend."""
+    return datetime(2026, 6, day, hour, minute, tzinfo=UTC)
+
+
+def test_no_schedule_always_allows() -> None:
+    assert schedule_allows({}, _utc(8, 3)) is True
+
+
+def test_inside_window_allows() -> None:
+    assert schedule_allows(_BUSINESS_HOURS, _utc(8, 9, 30)) is True
+
+
+def test_window_bounds_are_start_inclusive_end_exclusive() -> None:
+    assert schedule_allows(_BUSINESS_HOURS, _utc(8, 8, 0)) is True
+    assert schedule_allows(_BUSINESS_HOURS, _utc(8, 17, 59)) is True
+    assert schedule_allows(_BUSINESS_HOURS, _utc(8, 18, 0)) is False
+
+
+def test_outside_hours_blocks() -> None:
+    assert schedule_allows(_BUSINESS_HOURS, _utc(8, 6)) is False
+
+
+def test_wrong_day_blocks() -> None:
+    assert schedule_allows(_BUSINESS_HOURS, _utc(13, 9)) is False  # Saturday
+
+
+def test_days_default_to_every_day() -> None:
+    cfg = {"schedule": {"start_time": "08:00", "end_time": "18:00", "timezone": "UTC"}}
+    assert schedule_allows(cfg, _utc(13, 9)) is True  # Saturday
+
+
+def test_timezone_conversion() -> None:
+    cfg = {
+        "schedule": {
+            "start_time": "08:00",
+            "end_time": "18:00",
+            "timezone": "America/New_York",  # UTC-4 in June (EDT)
+        }
+    }
+    # 11:00 UTC = 07:00 New York → outside; 13:00 UTC = 09:00 → inside.
+    assert schedule_allows(cfg, _utc(8, 11)) is False
+    assert schedule_allows(cfg, _utc(8, 13)) is True
+
+
+def test_overnight_window_wraps_midnight() -> None:
+    cfg = {
+        "schedule": {
+            "days": ["fri"],
+            "start_time": "22:00",
+            "end_time": "06:00",
+            "timezone": "UTC",
+        }
+    }
+    assert schedule_allows(cfg, _utc(12, 23)) is True  # Friday 23:00
+    # Saturday 05:00 belongs to Friday's overnight window.
+    assert schedule_allows(cfg, _utc(13, 5)) is True
+    assert schedule_allows(cfg, _utc(13, 7)) is False  # past the tail
+    assert schedule_allows(cfg, _utc(13, 23)) is False  # Saturday 23:00 not in days
+
+
+def test_naive_observed_at_treated_as_utc() -> None:
+    naive = datetime(2026, 6, 8, 9, 0, 0)  # Monday 09:00, no tzinfo
+    assert schedule_allows(_BUSINESS_HOURS, naive) is True
+
+
+@pytest.mark.parametrize(
+    "schedule",
+    [
+        "always",  # not a dict
+        {"start_time": "08:00", "end_time": "18:00"},  # missing timezone
+        {"start_time": "08:00", "end_time": "18:00", "timezone": "Mars/Olympus"},
+        {"start_time": "8am", "end_time": "18:00", "timezone": "UTC"},
+        {"start_time": "08:00", "end_time": "08:00", "timezone": "UTC"},
+        {"start_time": "08:00", "end_time": "18:00", "timezone": "UTC", "days": "mon"},
+    ],
+)
+def test_malformed_stored_schedule_degrades_to_no_match(schedule: object) -> None:
+    """The gate runs inside the ingest savepoint — a malformed stored
+    schedule must degrade to "no match", never raise."""
+    assert schedule_allows({"schedule": schedule}, _utc(8, 9)) is False
 
 
 # ---------------------------------------------------------------------------
@@ -220,6 +491,7 @@ async def test_matching_rule_creates_alert() -> None:
         observation_id=observation_id,
         observation_type="processor.line_crossing",
         payload={"line_id": "line-1", "line_label": "Front door"},
+        observed_at=_EVAL_NOW,
     )
     assert created == 1
     args = conn.alert_inserts[0]
@@ -248,6 +520,7 @@ async def test_matching_rule_creates_workflow_run() -> None:
         observation_id=observation_id,
         observation_type="processor.line_crossing",
         payload={"line_id": "line-1", "line_label": "Front door"},
+        observed_at=_EVAL_NOW,
     )
     assert len(conn.run_inserts) == 1
     args = conn.run_inserts[0]
@@ -277,6 +550,7 @@ async def test_unmapped_observation_type_is_a_noop() -> None:
         observation_id=uuid4(),
         observation_type="processor.mock_detection",
         payload={},
+        observed_at=_EVAL_NOW,
     )
     assert created == 0
 
@@ -292,6 +566,7 @@ async def test_non_matching_config_creates_nothing() -> None:
         observation_id=uuid4(),
         observation_type="processor.line_crossing",
         payload={"line_id": "line-2"},
+        observed_at=_EVAL_NOW,
     )
     assert created == 0
     assert conn.alert_inserts == []
@@ -314,11 +589,76 @@ async def test_cooldown_suppresses_repeat_alert_but_still_records_run() -> None:
         observation_id=uuid4(),
         observation_type="processor.line_crossing",
         payload={"line_id": "line-1"},
+        observed_at=_EVAL_NOW,
     )
     assert created == 0
     assert conn.alert_inserts == []
     assert len(conn.run_inserts) == 1
     assert conn.run_finalizes == [(conn.run_ids[0], "suppressed", "alert_suppressed_cooldown")]
+
+
+async def test_out_of_schedule_rule_creates_no_run_and_no_alert() -> None:
+    """M3: a rule outside its time window is a NON-MATCH — no workflow run,
+    no alert (Part 6 semantics)."""
+    account, camera = uuid4(), uuid4()
+    rule = _eval_rule(
+        account_id=account,
+        camera_id=camera,
+        config={
+            "schedule": {
+                "days": ["sat", "sun"],
+                "start_time": "08:00",
+                "end_time": "18:00",
+                "timezone": "UTC",
+            }
+        },
+    )
+    conn = FakeEvalConn(rules=[rule])
+    created = await evaluate_observation(
+        conn,  # type: ignore[arg-type]
+        account_id=account,
+        camera_id=camera,
+        observation_id=uuid4(),
+        observation_type="processor.line_crossing",
+        payload={"line_id": "line-1"},
+        observed_at=_EVAL_NOW,  # a Wednesday
+    )
+    assert created == 0
+    assert conn.run_inserts == []
+    assert conn.alert_inserts == []
+
+
+async def test_in_schedule_richer_rule_creates_linked_run_and_alert() -> None:
+    """M3 integration: richer conditions (class + track + schedule) that
+    hold produce the full M2 chain — run with config snapshot, linked alert."""
+    account, camera = uuid4(), uuid4()
+    config = {
+        "object_classes": ["person"],
+        "require_track_id": True,
+        "schedule": {
+            "days": ["wed"],
+            "start_time": "08:00",
+            "end_time": "18:00",
+            "timezone": "UTC",
+        },
+    }
+    rule = _eval_rule(account_id=account, camera_id=camera, rule_type="zone_entered", config=config)
+    conn = FakeEvalConn(rules=[rule])
+    created = await evaluate_observation(
+        conn,  # type: ignore[arg-type]
+        account_id=account,
+        camera_id=camera,
+        observation_id=uuid4(),
+        observation_type="processor.zone_entered",
+        payload={"zone_id": "z-1", "class_label": "person", "track_id": "t-9"},
+        observed_at=_EVAL_NOW,  # Wednesday 12:00 UTC — inside the window
+    )
+    assert created == 1
+    assert len(conn.run_inserts) == 1
+    # The run's payload snapshots the FULL richer config.
+    assert json.loads(conn.run_inserts[0][9])["rule"]["config"] == config
+    assert conn.alert_inserts[0][4] == conn.run_ids[0]
+    assert conn.run_finalizes == [(conn.run_ids[0], "completed", "alert_created")]
 
 
 async def test_two_matching_rules_create_two_alerts() -> None:
@@ -335,6 +675,7 @@ async def test_two_matching_rules_create_two_alerts() -> None:
         observation_id=uuid4(),
         observation_type="processor.line_crossing",
         payload={"line_id": "line-1"},
+        observed_at=_EVAL_NOW,
     )
     assert created == 2
 

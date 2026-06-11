@@ -4,6 +4,67 @@ Reverse chronological. Newest at top. Every meaningful commit gets an entry foll
 
 ---
 
+## 2026-06-10 - Workflow Engine M3: richer rule conditions
+
+### Summary
+Third milestone of the Workflow Engine track. Makes one-step rules more
+expressive WITHOUT multi-step sequencing: object-class filters and
+require_track_id (zone_entered + dwell_exceeded), max_total_count bounds
+(roi_occupancy), and schedule time-window gating (all types, evaluated
+inline from the observation timestamp — no periodic evaluator). Conditions
+are allowed only on rule types whose PRODUCTION observation payloads can
+prove the needed field (audited in the DeepStream worker, not just the
+payload contract): zone/dwell events carry class_label + track_id; line
+crossings are cumulative direction-blind counters with no per-object
+attribution; ROI counts are cross-class aggregates. min_confidence and
+direction are deferred with documented processor follow-ups rather than
+faked. No migration; no new endpoints; M1/M2 rules unchanged; M2 run
+snapshots automatically capture the richer config.
+
+### Files touched
+- `src/upstream_api/schemas/rules.py` — per-type allowed-key map extended
+  (object_classes / require_track_id / max_total_count / schedule);
+  validators for each (class list 1-20 unique non-empty; max >= min;
+  schedule: HH:MM times, distinct, IANA timezone via ZoneInfo, unique day
+  keys); availability rationale documented inline.
+- `src/upstream_api/services/rules.py` — matcher gains `_classes_allowed` /
+  `_track_ok` (zone/dwell), max_total_count bound (roi); new pure
+  `schedule_allows` (timezone conversion, start-inclusive/end-exclusive,
+  overnight wrap where the tail belongs to the window's start day, naive
+  timestamps treated as UTC, malformed stored schedules degrade to
+  no-match — never raise inside the ingest savepoint).
+  `evaluate_observation` takes `observed_at` and gates on the schedule
+  before matching; out-of-window = NON-MATCH (no run, no alert).
+- `src/upstream_api/routers/processor.py` — passes `body.observed_at`.
+- `tests/test_rule_evaluation.py` — truth table +25 cases (class/track/
+  count bounds incl. missing-field no-match), 12 schedule_allows tests
+  (bounds, days default, timezone, overnight wrap, malformed degrade),
+  validation +30 cases (incl. conditions rejected on unprovable types and
+  deferred keys), 2 integration tests (out-of-schedule creates no run/alert;
+  in-schedule richer rule creates run with full config snapshot + linked
+  alert).
+- `docs/api-contracts.md` — "Workflow Engine M3" section with the
+  availability table and deferral reasons.
+
+### System interaction notes
+Same ingest path as M2; the only flow change is
+`schedule_allows(config, observed_at)` running before `rule_matches` per
+rule. The savepoint contract is untouched (route-level test still pins it).
+
+### Testing/checks
+`make test` — 855 passed (67 new). `make lint` clean; `uv run mypy src`
+clean. No live-DB step needed (no migration).
+
+### Follow-up TODOs
+- Processor: stamp per-detection `confidence` onto zone/dwell payloads →
+  unlocks `min_confidence`.
+- Processor: per-object line-crossing attribution (class/track/direction)
+  → unlocks those conditions on line_crossing.
+- Processor: per-class ROI counts → unlocks class-specific occupancy
+  thresholds.
+- DST edge: schedule windows during a skipped/repeated local hour follow
+  ZoneInfo's mapping; acceptable for M3, document if users hit it.
+
 ## 2026-06-10 - Workflow Engine M2: workflow runs + internal event history
 
 ### Summary

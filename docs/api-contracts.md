@@ -1814,3 +1814,86 @@ unknown or cross-tenant ids (anti-enumeration).
 `GET /v1/alerts` items (and the read/resolve responses) now include
 `workflow_run_id` (uuid | null) — null for alerts written before the M2
 migration. M2 is otherwise read-path only: no workflow-run mutation APIs.
+
+## Workflow Engine M3 — Richer Rule Conditions
+
+M1 added simple rules + in-app alerts; M2 made every match a workflow run
+(internal history); M3 makes the one-step rule language more expressive.
+Still deferred: multi-step sequencing, visual builder, delivery channels.
+
+No migration and no new endpoints — M3 extends the per-type ``config``
+vocabulary on the existing `/v1/rules` API and the pure matcher. Existing
+M1/M2 rules keep working unchanged. Workflow runs keep snapshotting the
+full (now richer) config in ``payload.rule``; evidence is unchanged.
+
+### Condition availability follows the audited observation payloads
+
+A condition is allowed ONLY on rule types whose production payloads can
+prove the field it needs (422 ``invalid_rule_config`` otherwise) — a rule
+that can never match is worse than an authoring-time rejection. Audited
+against the DeepStream analytics worker:
+
+| condition            | rule types                      | payload field        |
+|----------------------|---------------------------------|----------------------|
+| `object_classes`     | zone_entered, dwell_exceeded    | `class_label`        |
+| `require_track_id`   | zone_entered, dwell_exceeded    | `track_id`           |
+| `min_total_count`    | roi_occupancy (M1)              | `total_count`        |
+| `max_total_count`    | roi_occupancy                   | `total_count`        |
+| `schedule`           | all four types                  | observation time     |
+
+**Deferred (documented processor follow-ups, not faked):**
+
+- `min_confidence` — NO observation payload carries confidence today. The
+  processor has per-detection confidence internally (`metadata_models`
+  detection objects); the follow-up is stamping it onto zone/dwell payloads
+  (and line crossings once per-object attribution exists).
+- `direction` — in the line_crossing payload contract but never produced:
+  production line crossings come from nvdsanalytics CUMULATIVE line
+  counters, which are direction-blind aggregates.
+- `object_classes` / `require_track_id` on line_crossing — same root cause:
+  cumulative counters have no per-object attribution.
+- per-class ROI counts — ROI occupancy counts are cross-class aggregates
+  (M7D); `class_counts` in the payload contract is not populated per-class
+  by the production worker.
+- "no detections for N minutes" — needs a periodic evaluator (still none).
+
+### Match semantics
+
+Unchanged posture, extended: a missing optional condition key means "match
+any"; a payload missing the field a configured condition needs does NOT
+match (no false matches). ``min_total_count`` and ``max_total_count`` are
+both inclusive bounds.
+
+### `schedule` — inline time-window gating
+
+```json
+{
+  "schedule": {
+    "days": ["mon", "tue", "wed", "thu", "fri"],
+    "start_time": "08:00",
+    "end_time": "18:00",
+    "timezone": "America/New_York"
+  }
+}
+```
+
+Evaluated INLINE from the observation's ``observed_at`` (converted to the
+schedule's IANA timezone) during ingest — there is no periodic evaluator.
+``days`` (optional; default every day) names the LOCAL day the window
+STARTS on. ``start_time < end_time`` is a same-day window matching
+``start <= t < end``; ``start_time > end_time`` wraps midnight (22:00-06:00
+on ["fri"] = Friday 22:00 through Saturday 05:59). ``start == end`` is
+rejected at authoring. An observation outside the window is a NON-MATCH:
+no workflow run, no alert. A malformed stored schedule degrades to
+"no match" (the gate runs inside the ingest savepoint and never raises).
+
+### Example richer configs
+
+```json
+{ "zone_id": "zone-1", "object_classes": ["person", "forklift"],
+  "require_track_id": true }
+```
+```json
+{ "roi_id": "roi-1", "min_total_count": 2, "max_total_count": 10,
+  "schedule": {"start_time": "22:00", "end_time": "06:00", "timezone": "UTC"} }
+```
