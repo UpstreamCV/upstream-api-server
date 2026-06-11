@@ -40,6 +40,7 @@ from upstream_api.routers import (
     users,
     workflow_evaluator,
     workflow_runs,
+    workflows,
 )
 from upstream_api.services.http_client import build_http_client
 from upstream_api.services.workflow_evaluator import workflow_evaluator_loop
@@ -135,5 +136,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(alerts.router)  # /v1/alerts (Workflow Engine M1)
     app.include_router(workflow_runs.router)  # /v1/workflow-runs (Workflow Engine M2)
     app.include_router(workflow_evaluator.router)  # /v1/internal/workflow-evaluator (M4)
+    app.include_router(workflows.router)  # /v1/workflows (Workflow Engine M5)
 
     return app

@@ -68,6 +68,7 @@ class FakeConn:
         self.last_observation_by_camera = last_observation_by_camera or {}
         self.rules_in_cooldown = rules_in_cooldown or set()
         self.liveness_raises = liveness_raises
+        self.expired_sequence_runs: list[dict[str, Any]] = []
         self.run_inserts: list[tuple[Any, ...]] = []
         self.alert_inserts: list[tuple[Any, ...]] = []
         self.run_finalizes: list[tuple[Any, ...]] = []
@@ -75,6 +76,8 @@ class FakeConn:
         self.run_ids: list[UUID] = []
 
     async def fetch(self, query: str, *args: Any) -> list[dict[str, Any]]:
+        if "from workflow_runs r" in query:
+            return list(self.expired_sequence_runs)
         assert "from rules" in query
         return list(self.rules)
 
@@ -523,6 +526,7 @@ def test_endpoint_returns_stats_shape() -> None:
         "workflow_runs_created",
         "alerts_created",
         "suppressed_by_cooldown",
+        "sequence_runs_expired",
         "errors",
     }
     assert body["evaluated_rules"] == 1

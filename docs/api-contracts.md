@@ -2042,3 +2042,88 @@ posture as the M1 alert guard); no advisory locks. One rule's evaluation
 failure is logged with scalar ids and never stops a tick; evaluator
 failures never touch the observation-ingest path (separate code path
 entirely).
+
+## Workflow Engine M5 — Multi-Step Sequencing
+
+The first real multi-step capability: **A → B within N seconds**, with
+optional same-track correlation. Workflows are now a TOP-LEVEL product
+object (`workflows` table); the `rules` table remains the M1-M4
+simple/timer-rule layer, unchanged. Alerts remain optional outputs. Still
+deferred: arbitrary graphs / >2 steps, branching, visual builder,
+cross-camera sequencing, recovery/auto-resolve, delivery channels.
+
+Migration: `20260614120000_workflows.sql` — `workflows` table (RLS +
+grant) and three nullable `workflow_runs` columns: `workflow_id` (FK, set
+null on delete — history survives), `deadline_at` (partial-indexed expiry
+sweep), `dedupe_key` (duplicate-start guard).
+
+### `/v1/workflows` CRUD (auth: `current_user`)
+
+`POST /v1/workflows`, `GET /v1/workflows?camera_id=&type=`,
+`GET|PATCH|DELETE /v1/workflows/{workflow_id}` — owner/admin mutations,
+member reads, camera-ownership + anti-enumeration 404s,
+422 `invalid_workflow_config` with `details.problems`. `workflow_type` is
+immutable ('sequence' is the only accepted type today). Responses never
+echo `account_id`.
+
+### Sequence config
+
+```json
+{
+  "start": {"event_type": "processor.zone_entered",
+             "conditions": {"zone_id": "zone-a", "object_classes": ["person"],
+                             "min_confidence": 0.7, "require_track_id": true}},
+  "then": {"within_seconds": 30,
+            "event_type": "processor.line_crossing_object",
+            "conditions": {"line_id": "line-b"}},
+  "correlation": {"same_track_id": true},
+  "on_success": {"create_alert": false},
+  "on_timeout": {"create_alert": true,
+                  "alert_message": "Expected follow-up did not happen in time."},
+  "schedule": {"days": ["mon","tue","wed","thu","fri"],
+                "start_time": "08:00", "end_time": "18:00",
+                "timezone": "America/Denver"}
+}
+```
+
+Validation is strict: unknown keys rejected at every level; step
+`event_type` must be a discrete event type (`zone_entered`, `zone_exited`,
+`line_crossing`, `line_crossing_object`, `dwell_started`,
+`dwell_exceeded` — snapshots like roi_occupancy excluded); per-step
+conditions follow the M3 availability posture (aggregate `line_crossing`
+allows only `line_id`); `within_seconds` 5–86400;
+`correlation.same_track_id` requires BOTH event types to be
+track-attributing. `on_success.create_alert` defaults false;
+`on_timeout.create_alert` defaults true. Schedule is the M3 shape.
+
+### Sequencer behavior (observation ingest)
+
+Runs in its own savepoint after rule evaluation (one failing layer never
+affects the other, and neither can fail ingest). Completions are processed
+BEFORE starts. **Start**: schedule + start conditions match (and a track
+exists when correlating) → guarded INSERT of an `active` run
+(`workflow_type='sequence'`, `trigger_type=<start observation type>`,
+`deadline_at = observed_at + within_seconds`, start evidence + definition
+snapshot, correlation track captured). The guard: NOT EXISTS an active run
+for the same workflow with the same `dedupe_key` (the start observation's
+processor idempotency key, falling back to observation id) — duplicate
+deliveries can't double-start; distinct physical starts (two people) DO run
+in parallel. **Complete**: active runs on the camera whose `then` matches —
+event type, deadline not passed, conditions, same-track — flip to
+`completed` via a guarded UPDATE (`where status='active'`, single-shot),
+follow-up evidence appended, `action_result='sequence_completed'` (alert
+only when `on_success.create_alert`).
+
+### Timeout (M4 evaluator loop)
+
+Each evaluator tick sweeps `active` runs past `deadline_at`: guarded UPDATE
+to `failed` with timeout evidence (single-shot — repeated ticks can't
+re-fail), then the timeout alert (unless opted out), cooldown-guarded
+ACROSS runs of the same workflow (the guard joins alerts →
+workflow_runs.workflow_id, since alerts carry no workflow column). The
+evaluator stats response gains `sequence_runs_expired`.
+
+### Workflow run reads
+
+`WorkflowRunSummary` gains `workflow_id` (null on rule runs) and
+`deadline_at` (set while an active sequence run is waiting).
