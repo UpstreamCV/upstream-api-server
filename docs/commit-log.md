@@ -4,6 +4,62 @@ Reverse chronological. Newest at top. Every meaningful commit gets an entry foll
 
 ---
 
+## 2026-06-10 - Workflow Engine M5: multi-step sequencing (A → B within N seconds)
+
+### Summary
+The first real multi-step capability and the point where workflows become
+a TOP-LEVEL product object: a new `workflows` table holds sequence
+definitions (start event → expected follow-up within a window, optional
+same-track correlation, on_success/on_timeout outcomes, M3 schedule);
+the `rules` table remains the M1-M4 simple/timer layer untouched.
+Execution state rides the existing `workflow_runs` table with three new
+nullable columns (workflow_id / deadline_at / dedupe_key) — no steps table
+needed for two steps (evidence jsonb holds {start, follow_up|timeout}).
+
+Sequencer (services/workflow_sequencer.py) runs at observation ingest in
+its OWN savepoint after rule evaluation: completions first (guarded
+UPDATE where status='active' — single-shot), then starts (guarded INSERT —
+NOT EXISTS active run per (workflow, dedupe_key), dedupe_key = the start
+observation's processor idempotency key; duplicate deliveries can't
+double-start, distinct physical starts run in parallel). Timeouts close in
+the M4 evaluator loop: guarded fail UPDATE + timeout alert
+(on_timeout.create_alert defaults true), cooldown-guarded ACROSS runs of
+the same workflow via an alerts→workflow_runs join (alerts carry no
+workflow column). Strict authoring validation mirrors the M3 availability
+posture (per-event-type condition keys; same_track_id requires both event
+types track-attributing; within_seconds 5-86400; discrete event types
+only).
+
+### Files touched
+- `supabase/migrations/20260614120000_workflows.sql`
+- `src/upstream_api/schemas/workflows.py` (+ validate_sequence_config)
+- `src/upstream_api/services/workflows.py` (CRUD),
+  `services/workflow_sequencer.py` (start/complete + step matcher),
+  `services/workflow_evaluator.py` (expiry sweep + sequence_runs_expired
+  stat), `services/workflow_runs.py` (+workflow_id/deadline_at columns on
+  reads)
+- `src/upstream_api/routers/workflows.py` (CRUD),
+  `routers/processor.py` (_evaluate_sequences_safe savepoint),
+  `routers/workflow_evaluator.py` (stats field),
+  `routers/workflow_runs.py` (summary fields), `app.py`
+- tests: `tests/test_workflow_sequencer.py` (53: validation truth table,
+  step matcher, start/dedupe/complete/track/deadline, timeout + alert
+  opt-out + no-respam + cross-run cooldown, ingest savepoint contract,
+  /v1/workflows CRUD + roles + tenancy, SQL pinning); updated pinned
+  shapes in test_workflow_runs_api.py + test_workflow_evaluator.py.
+
+### Testing/checks
+`make test` — 1001 passed (+53). `make lint` + `uv run mypy src` clean.
+All M1-M4 suites unchanged and passing (ingest path untouched except the
+added savepoint; no observation type behavior changed).
+
+### Follow-up TODOs
+- >2 steps / branching (a workflow_run_steps table when needed),
+  cross-camera scope, visual builder, recovery/auto-resolve, delivery
+  channels — all deferred by design.
+- Active sequence runs are bounded by start-event volume; if a workflow
+  with no follow-up ever floods, a per-workflow active-run cap is the knob.
+
 ## 2026-06-10 - Workflow Engine M4: time-based evaluator (camera_offline, no_detections_for)
 
 ### Summary

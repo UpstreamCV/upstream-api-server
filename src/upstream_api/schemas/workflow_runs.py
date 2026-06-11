@@ -40,6 +40,8 @@ class WorkflowRunSummary(BaseModel):
     id: UUID
     camera_id: UUID | None
     rule_id: UUID | None
+    # M5: set on sequence runs (null on simple/timer rule runs).
+    workflow_id: UUID | None
     trigger_observation_id: UUID | None
     workflow_type: str
     status: str
@@ -50,6 +52,8 @@ class WorkflowRunSummary(BaseModel):
     evidence: dict[str, Any]
     payload: dict[str, Any]
     alert: WorkflowRunAlertRef | None
+    # M5: when an active sequence run times out (null otherwise).
+    deadline_at: datetime | None
     started_at: datetime
     ended_at: datetime | None
     created_at: datetime

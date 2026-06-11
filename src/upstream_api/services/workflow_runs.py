@@ -40,9 +40,9 @@ update workflow_runs
 # workflow_run_id FK — see 20260613120000_workflow_runs.sql). At most one
 # alert per run in the current flow, so the join cannot fan out.
 _RUN_COLUMNS = """
-    r.id, r.camera_id, r.rule_id, r.trigger_observation_id,
+    r.id, r.camera_id, r.rule_id, r.workflow_id, r.trigger_observation_id,
     r.workflow_type, r.status, r.title, r.summary, r.trigger_type,
-    r.action_result, r.evidence, r.payload,
+    r.action_result, r.evidence, r.payload, r.deadline_at,
     r.started_at, r.ended_at, r.created_at, r.updated_at,
     a.id as alert_id, a.status as alert_status, a.severity as alert_severity
 """

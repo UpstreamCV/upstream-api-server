@@ -50,6 +50,7 @@ from upstream_api.services.processor import (
 )
 from upstream_api.services.rules import evaluate_observation
 from upstream_api.services.stream_validation import SessionStateRow, load_session_state
+from upstream_api.services.workflow_sequencer import evaluate_sequences
 
 _logger = get_logger("processor")
 
@@ -229,6 +230,37 @@ async def _evaluate_rules_safe(
         )
 
 
+async def _evaluate_sequences_safe(
+    conn: asyncpg.Connection,
+    *,
+    session: SessionStateRow,
+    body: ProcessorObservationRequest,
+    observation_id: UUID,
+) -> None:
+    """Workflow Engine M5: run the two-step sequencer for the
+    just-ingested observation. Same savepoint contract as the rule
+    evaluator — a failing (or not-yet-migrated) sequencer can NEVER fail
+    observation ingest, and its own savepoint means a sequencer failure
+    doesn't roll back rule evaluation (or vice versa)."""
+    try:
+        async with conn.transaction():
+            await evaluate_sequences(
+                conn,
+                account_id=session.account_id,
+                camera_id=session.camera_id,
+                observation_id=observation_id,
+                observation_type=body.type,
+                payload=body.payload,
+                observed_at=body.observed_at,
+            )
+    except Exception as exc:
+        _logger.warning(
+            "sequence_evaluation_failed",
+            camera_id=str(session.camera_id),
+            error=type(exc).__name__,
+        )
+
+
 @router.post("/observations", response_model=ProcessorObservationResponse)
 async def post_observation(
     body: ProcessorObservationRequest,
@@ -255,6 +287,13 @@ async def post_observation(
         # observation. Best-effort — isolated in a savepoint so it can never
         # break observation ingest.
         await _evaluate_rules_safe(
+            conn,
+            session=session,
+            body=body,
+            observation_id=new_id,
+        )
+        # Workflow Engine M5: two-step sequences, in their own savepoint.
+        await _evaluate_sequences_safe(
             conn,
             session=session,
             body=body,

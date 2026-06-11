@@ -27,6 +27,7 @@ class EvaluatorRunResponse(BaseModel):
     workflow_runs_created: int
     alerts_created: int
     suppressed_by_cooldown: int
+    sequence_runs_expired: int
     errors: int
 
 
@@ -43,5 +44,6 @@ async def run_evaluator(
         workflow_runs_created=stats.workflow_runs_created,
         alerts_created=stats.alerts_created,
         suppressed_by_cooldown=stats.suppressed_by_cooldown,
+        sequence_runs_expired=stats.sequence_runs_expired,
         errors=stats.errors,
     )

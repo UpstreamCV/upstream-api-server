@@ -57,6 +57,7 @@ from upstream_api.schemas.rules import (
 from upstream_api.services.processor import coerce_jsonb
 from upstream_api.services.rules import _INSERT_ALERT_SQL, schedule_allows
 from upstream_api.services.workflow_runs import finalize_workflow_run
+from upstream_api.services.workflow_sequencer import _create_workflow_alert
 
 _logger = get_logger("workflow_evaluator")
 
@@ -129,6 +130,8 @@ class EvaluatorStats:
     workflow_runs_created: int = 0
     alerts_created: int = 0
     suppressed_by_cooldown: int = 0
+    # M5: active sequence runs whose deadline passed this tick.
+    sequence_runs_expired: int = 0
     errors: int = 0
 
 
@@ -328,6 +331,122 @@ async def _evaluate_rule(
         )
 
 
+# M5: active sequence runs past their deadline (uses the partial index
+# from 20260614120000_workflows.sql). The join also picks up the workflow's
+# outcome config + alert severity/cooldown.
+_EXPIRED_SEQUENCE_RUNS_SQL = """
+select r.id, r.account_id, r.camera_id, r.workflow_id, r.title,
+       r.deadline_at, r.evidence,
+       w.name as workflow_name, w.config, w.severity, w.cooldown_seconds
+  from workflow_runs r
+  join workflows w on w.id = r.workflow_id
+ where r.status = 'active'
+   and r.deadline_at is not null
+   and r.deadline_at < $1
+"""
+
+# status = 'active' in the WHERE makes the failure transition single-shot:
+# concurrent sweeps (or a racing completion) can never fail a run twice.
+_FAIL_SEQUENCE_RUN_SQL = """
+update workflow_runs
+   set status = 'failed',
+       action_result = $2,
+       summary = $3,
+       evidence = $4::jsonb,
+       ended_at = now()
+ where id = $1
+   and status = 'active'
+returning id
+"""
+
+
+async def _expire_one_sequence_run(
+    conn: asyncpg.Connection,
+    run: Any,
+    *,
+    now: datetime,
+    stats: EvaluatorStats,
+) -> None:
+    config = coerce_jsonb(run["config"])
+    on_timeout = config.get("on_timeout")
+    # Default TRUE: a timeout alert is the usual reason to author a
+    # sequence; on_timeout.create_alert = false opts out explicitly.
+    wants_alert = not (isinstance(on_timeout, dict) and on_timeout.get("create_alert") is False)
+    message_raw = on_timeout.get("alert_message") if isinstance(on_timeout, dict) else None
+    then = config.get("then")
+    then_label = (
+        str(then.get("event_type", "the follow-up event"))
+        if isinstance(then, dict)
+        else "the follow-up event"
+    )
+    summary = (
+        message_raw
+        if isinstance(message_raw, str) and message_raw.strip()
+        else f"Sequence timed out waiting for {then_label}."
+    )
+    evidence = coerce_jsonb(run["evidence"])
+    evidence["timeout"] = {
+        "deadline_at": run["deadline_at"].isoformat() if run["deadline_at"] else None,
+        "expired_at": now.isoformat(),
+    }
+    failed = await conn.fetchval(
+        _FAIL_SEQUENCE_RUN_SQL,
+        run["id"],
+        "no_action",
+        summary,
+        json.dumps(evidence),
+    )
+    if failed is None:
+        return  # completed (or already failed) by a racing path
+    stats.sequence_runs_expired += 1
+    if not wants_alert:
+        return
+    alert_id = await _create_workflow_alert(
+        conn,
+        account_id=run["account_id"],
+        camera_id=run["camera_id"],
+        observation_id=None,
+        workflow_run_id=run["id"],
+        workflow_id=run["workflow_id"],
+        severity=run["severity"],
+        title=run["workflow_name"],
+        message=summary,
+        evidence=evidence,
+        cooldown_seconds=float(run["cooldown_seconds"]),
+    )
+    # Stamp the honest outcome only after the alert insert resolved.
+    await conn.execute(
+        "update workflow_runs set action_result = $2 where id = $1",
+        run["id"],
+        "alert_created" if alert_id is not None else "alert_suppressed_cooldown",
+    )
+    if alert_id is not None:
+        stats.alerts_created += 1
+    else:
+        stats.suppressed_by_cooldown += 1
+
+
+async def expire_sequence_runs(
+    conn: asyncpg.Connection,
+    *,
+    now: datetime,
+    stats: EvaluatorStats,
+) -> None:
+    """M5: close active sequence runs whose deadline has passed. One run's
+    failure is logged with scalar ids and never stops the sweep."""
+    runs = await conn.fetch(_EXPIRED_SEQUENCE_RUNS_SQL, now)
+    for run in runs:
+        try:
+            await _expire_one_sequence_run(conn, run, now=now, stats=stats)
+        except Exception as exc:
+            stats.errors += 1
+            _logger.warning(
+                "sequence_run_expiry_failed",
+                workflow_run_id=str(run["id"]),
+                error=type(exc).__name__,
+            )
+
+
 async def run_workflow_evaluator(
     pool: asyncpg.Pool,
     *,
@@ -355,6 +474,12 @@ async def run_workflow_evaluator(
                     rule_id=str(rule["id"]),
                     error=type(exc).__name__,
                 )
+        # M5: sweep expired sequence runs in the same tick.
+        try:
+            await expire_sequence_runs(conn, now=now, stats=stats)
+        except Exception as exc:
+            stats.errors += 1
+            _logger.warning("sequence_expiry_sweep_failed", error=type(exc).__name__)
     return stats
 
 
