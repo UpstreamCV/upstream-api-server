@@ -295,3 +295,16 @@ class PerceptionSnapshotRecord(BaseModel):
 
 class LatestPerceptionSnapshotResponse(BaseModel):
     snapshot: PerceptionSnapshotRecord
+
+
+class PerceptionStreamTokenResponse(BaseModel):
+    """Short-lived credentials for the perception-fanout WS hot path.
+
+    ``ws_url`` is the full browser-reachable subscribe endpoint
+    (``{fanout_public_ws_url}/v1/subscribe``); the client appends
+    ``?token=...``. The token must never be logged or persisted.
+    """
+
+    token: str
+    ws_url: str
+    expires_at: datetime

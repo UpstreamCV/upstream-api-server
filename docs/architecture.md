@@ -235,3 +235,24 @@ untangle — see `commit-log.md` 2026-05-28/29):
 > **Rule for new realtime/dashboard tables:** add `grant select on public.<table> to authenticated;` **and** `alter table <table> replica identity full;` (if UPDATE events matter) **in the same migration that creates the table**, and add it to the `supabase_realtime` publication. Otherwise it will read fine via the API and be silent over Realtime.
 
 Symptom → cause cheat-sheet (full version in `troubleshooting.md`): SUBSCRIBED + `401` per record → token expired / not set on the socket; SUBSCRIBED + no 401 + no events → missing GRANT, or the RLS policy returns false; events arrive but empty (`camera_id` undefined / `keys=[]`) → payload stripped (auth-rejected record or oversized).
+
+## Perception-fanout hot path (10–15 Hz detection overlays)
+
+The Realtime path above tops out at the processor's DB-write cadence
+(~1 Hz) because every snapshot rides Postgres write → WAL decode →
+Realtime fan-out. For the live bounding-box overlay, a separate
+**ephemeral hot path** exists: the `perception-fanout` WS sidecar in
+`upstream-streaming-server` relays processor snapshots to browsers at
+10–15 Hz with no DB involvement (contract:
+`upstream-streaming-server/docs/perception-fanout.md`).
+
+This api-server's role is **auth only**:
+`POST /v1/cameras/{camera_id}/perception/stream-token` runs the normal
+Supabase JWT + camera-ownership checks, then mints a short-lived `upt1`
+HMAC token (`security/fanout_token.py`) signed with
+`UPSTREAM_FANOUT_TOKEN_SECRET` (shared with the sidecar) and returns it
+with `ws_url` built from `UPSTREAM_FANOUT_PUBLIC_WS_URL`. Both settings
+optional — unset means 503 `perception_stream_not_configured` and the
+dashboard silently stays on the Realtime + polling path above, which
+remains the durable record and the universal fallback. The processor's
+`POST /v1/internal/processor/perception-snapshots` cadence is unchanged.

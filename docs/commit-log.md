@@ -4,6 +4,52 @@ Reverse chronological. Newest at top. Every meaningful commit gets an entry foll
 
 ---
 
+## 2026-06-11 - Perception-fanout stream-token endpoint (10-15 Hz overlay hot path)
+
+### Summary
+Auth side of the new perception-fanout WS hot path (the sidecar itself
+lives in `upstream-streaming-server/perception-fanout/` — see its
+`docs/perception-fanout.md` for the wire contract). The dashboard's
+live detection overlay was capped at ~1-3 fps by the DB-backed path
+(processor POST → upsert → WAL → Realtime/poll); the sidecar relays
+snapshots at 10-15 Hz with no DB, and THIS repo's job is minting the
+browser's credentials for it.
+
+New `POST /v1/cameras/{camera_id}/perception/stream-token`
+(routers/cameras.py): CurrentCaller + the same camera-ownership check
+as `perception/latest`, then mints a short-lived `upt1` HMAC token
+(new `security/fanout_token.py` — stdlib hmac/base64/json, payload
+`{cam, acct, sub, iat, exp}`, signature over `"upt1."+b64url(payload)`;
+the verify twin lives in the sidecar and must stay in sync). Response:
+`{token, ws_url, expires_at}` with `ws_url` built from settings, so the
+dashboard needs no extra NEXT_PUBLIC env. All authz happens at mint
+time; revocation exposure is bounded by the TTL.
+
+New settings (config.py, all optional): `fanout_token_secret` (must
+match the sidecar's `UPSTREAM_FANOUT_TOKEN_SECRET`),
+`fanout_public_ws_url` (prod `wss://ingest.upstreamcv.com/perception`,
+dev `ws://127.0.0.1:18990`), `fanout_token_ttl_seconds` (600). Either
+of the first two unset → 503 `perception_stream_not_configured`
+(billing_not_configured pattern) and the dashboard silently stays on
+Realtime + polling. New schema `PerceptionStreamTokenResponse`
+(schemas/processor.py). Existing processor ingest endpoints and
+cadence untouched.
+
+### Tests
+`tests/test_perception_stream_token.py` (9 cases): minted token
+round-trips `verify_fanout_token` with the right cam/acct/sub, TTL
+honored, agent-caller subject (`agent-token:<id>`), unknown +
+cross-tenant camera 404, unauthenticated 401, 503 when either setting
+is missing (including secret-without-url), token never echoed in
+response headers. Full suite: 1181 passed.
+
+### Docs updated
+`docs/api-contracts.md` (endpoint section + 503 row in the error
+table), `docs/architecture.md` (hot-path section under the Realtime
+notes), `docs/module-map.md` (`security/fanout_token.py`, cameras
+router, tests), `.env.example`, `deploy/.env.production.example`,
+this entry.
+
 ## 2026-06-11 - Module 7 M3: tenant audit logs
 
 ### Summary
