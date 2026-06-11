@@ -63,6 +63,7 @@ def _update_returning_row() -> dict[str, Any]:
     query in `mark_failed` on the success path."""
     return {
         "state": "failed",
+        "started_at": None,
         "lim_width": 1280,
         "lim_height": 720,
         "lim_fps": 30,

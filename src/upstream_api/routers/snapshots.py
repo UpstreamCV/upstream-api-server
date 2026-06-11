@@ -31,6 +31,7 @@ from fastapi import APIRouter, File, Form, Query, UploadFile
 from upstream_api.config import Settings
 from upstream_api.errors import ApiError, ConflictError, LimitExceeded, NotFoundError
 from upstream_api.observability.context import agent_id_var, session_id_var
+from upstream_api.observability.metrics import track_ingest
 from upstream_api.schemas.snapshots import LatestFrameResponse, SnapshotUploadResponse
 from upstream_api.security.deps import (
     CurrentAgent,
@@ -266,6 +267,7 @@ async def upload_snapshot(
     response_model=SnapshotUploadResponse,
     status_code=201,
 )
+@track_ingest("snapshots")
 async def ingest_upload_snapshot(
     _ingest: CurrentIngest,
     pool: PoolDep,

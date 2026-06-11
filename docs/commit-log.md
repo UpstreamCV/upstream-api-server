@@ -53,6 +53,12 @@ workflow runs, alerts) deliberately excluded.
 
 ## 2026-06-11 - feat(observability): M9.3 — Prometheus GET /metrics + Sentry init
 
+**Landed:** this entry's text was written ahead of the code and got swept
+into an earlier admin docs commit; the M9.3 *code* lands in the commit that
+also adds this note. Includes the cross-review follow-ups: snapshots ingest
+instrumented (`@track_ingest("snapshots")`) and a symmetric tz guard on
+`created_at` in `mark_streaming`.
+
 ### Summary
 Implements roadmap M9.3 (upstream-streaming-server docs/design/07-roadmap.md,
 doc 01 §3): the api-server gets a token-gated Prometheus `GET /metrics`

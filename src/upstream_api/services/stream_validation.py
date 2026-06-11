@@ -15,6 +15,7 @@ from uuid import UUID
 import asyncpg
 
 from upstream_api.errors import ConflictError, NotFoundError
+from upstream_api.observability.metrics import observe_time_to_streaming, record_transition
 
 
 @dataclass(frozen=True, slots=True)
@@ -151,7 +152,7 @@ async def mark_streaming(
                validated_bitrate_kbps = $7
          where id = $1
            and state = 'approved'
-         returning state, lim_width, lim_height, lim_fps, lim_codec,
+         returning state, created_at, lim_width, lim_height, lim_fps, lim_codec,
                    lim_bitrate_kbps, lim_latency_mode
         """,
         session_id,
@@ -177,6 +178,15 @@ async def mark_streaming(
         )
 
     await _sync_camera_status(conn, session_id, "streaming")
+
+    record_transition("approved", "streaming")
+    # Time-to-streaming SLI (doc 01 §5): /start (row creation) → this webhook.
+    # `started_at` is caller-supplied and `created_at` driver-supplied; skip if
+    # either side is tz-naive so a quirky caller (or a non-timestamptz column)
+    # can't crash the transition with an aware/naive subtraction.
+    created_at = row["created_at"]
+    if created_at is not None and created_at.tzinfo is not None and started_at.tzinfo is not None:
+        observe_time_to_streaming(max(0.0, (started_at - created_at).total_seconds()))
 
     expected = {
         "codec": row["lim_codec"],
@@ -233,6 +243,10 @@ async def mark_ended(
 
     await _sync_camera_status(conn, session_id, "idle")
 
+    # `started_at` is written exactly once, on the approved→streaming edge,
+    # so its presence is the authoritative "was streaming" marker.
+    record_transition("streaming" if row["started_at"] is not None else "approved", "ended")
+
     duration: float | None = None
     if row["started_at"] is not None and row["ended_at"] is not None:
         duration = (row["ended_at"] - row["started_at"]).total_seconds()
@@ -262,7 +276,7 @@ async def mark_failed(
                failure_message = $3
          where id = $1
            and state in ('approved', 'streaming')
-         returning state, lim_width, lim_height, lim_fps, lim_codec,
+         returning state, started_at, lim_width, lim_height, lim_fps, lim_codec,
                    lim_bitrate_kbps, lim_latency_mode
         """,
         session_id,
@@ -273,6 +287,9 @@ async def mark_failed(
         await _explain_unexpected_state(conn, session_id, expected="approved|streaming")
 
     await _sync_camera_status(conn, session_id, "error")
+
+    # Same `started_at` reasoning as mark_ended above.
+    record_transition("streaming" if row["started_at"] is not None else "approved", "failed")
 
     expected = {
         "codec": row["lim_codec"],

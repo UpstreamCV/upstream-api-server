@@ -70,6 +70,7 @@ async def test_mark_streaming_transitions_approved_to_streaming() -> None:
     conn = FakeConn(
         update_returns={
             "state": "streaming",
+            "created_at": datetime.now(tz=UTC) - timedelta(seconds=3),
             "lim_width": 1280,
             "lim_height": 720,
             "lim_fps": 30,
@@ -212,6 +213,7 @@ async def test_mark_failed_writes_validation_row_with_mismatch() -> None:
     conn = FakeConn(
         update_returns={
             "state": "failed",
+            "started_at": None,
             "lim_width": 1280,
             "lim_height": 720,
             "lim_fps": 30,

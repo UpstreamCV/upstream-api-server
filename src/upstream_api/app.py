@@ -33,6 +33,7 @@ from upstream_api.routers import (
     dashboard,
     heartbeats,
     ingest,
+    metrics,
     models,
     platform_admin,
     processor,
@@ -108,6 +109,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or get_settings()
     configure_logging(level=settings.log_level, json_logs=settings.is_production)
 
+    # M9.3 — Sentry error tracking. No-op when the DSN is unset (local dev,
+    # CI). send_default_pii=False: request bodies, headers with credentials,
+    # and user identifiers never leave the box.
+    if settings.sentry_dsn:
+        import sentry_sdk
+
+        sentry_sdk.init(
+            dsn=settings.sentry_dsn,
+            environment=settings.environment,
+            send_default_pii=False,
+        )
+
     # Interactive docs (Swagger UI, ReDoc) are dev-only. The machine-readable
     # OpenAPI spec is always available for tooling (Postman, codegen, etc.).
     app = FastAPI(
@@ -166,5 +179,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(billing.router)  # /v1/billing (Module 7 M2)
     app.include_router(stripe_webhooks.router)  # /v1/webhooks/stripe (Module 7 M2)
     app.include_router(platform_admin.router)  # /v1/admin/* (admin panel)
+    app.include_router(metrics.router)  # GET /metrics (M9.3 observability)
 
     return app

@@ -28,6 +28,7 @@ from fastapi.responses import Response
 from upstream_api.errors import ConflictError, NotFoundError
 from upstream_api.observability.context import session_id_var
 from upstream_api.observability.logging import get_logger
+from upstream_api.observability.metrics import record_auth, track_ingest
 from upstream_api.schemas.ingest import (
     ExpectedConfigResponse,
     IngestActionResponse,
@@ -76,6 +77,7 @@ router = APIRouter(prefix="/v1/ingest", tags=["ingest"])
 
 
 @router.post("/validate-stream", response_model=ValidateStreamResponse)
+@track_ingest("validate-stream")
 async def validate_stream(
     body: ValidateStreamRequest,
     _ingest: CurrentIngest,
@@ -135,6 +137,7 @@ async def validate_stream(
 
 
 @router.post("/stream-started", response_model=IngestActionResponse)
+@track_ingest("stream-started")
 async def stream_started(
     body: StreamStartedRequest,
     _ingest: CurrentIngest,
@@ -154,6 +157,7 @@ async def stream_started(
 
 
 @router.post("/stream-ended", response_model=IngestActionResponse)
+@track_ingest("stream-ended")
 async def stream_ended(
     body: StreamEndedRequest,
     _ingest: CurrentIngest,
@@ -225,6 +229,7 @@ async def stream_ended(
 
 
 @router.post("/lookup-session", response_model=LookupSessionResponse)
+@track_ingest("lookup-session")
 async def lookup_session(
     body: LookupSessionRequest,
     _ingest: CurrentIngest,
@@ -254,6 +259,7 @@ async def lookup_session(
 
 
 @router.post("/validation-failed", response_model=IngestActionResponse)
+@track_ingest("validation-failed")
 async def validation_failed(
     body: ValidationFailedRequest,
     _ingest: CurrentIngest,
@@ -294,6 +300,7 @@ async def validation_failed(
 
 
 @router.get("/expected/{session_id}", response_model=ExpectedConfigResponse)
+@track_ingest("expected")
 async def get_expected_config(
     session_id: UUID,
     _ingest: CurrentIngest,
@@ -333,6 +340,7 @@ async def get_expected_config(
 
 
 @router.post("/stream-validations", response_model=IngestActionResponse)
+@track_ingest("stream-validations")
 async def post_stream_validation_report(
     body: StreamValidationReportRequest,
     _ingest: CurrentIngest,
@@ -406,11 +414,13 @@ def _deny(reason_code: str, **fields: str) -> Response:
     MediaMTX 1.9.3 inspects only the status code (per
     ``mediamtx.yml.default:97-98``), so no body is sent.
     """
+    record_auth("deny")
     _authlog.warning("mediamtx_auth_denied", reason_code=reason_code, **fields)
     return Response(status_code=401)
 
 
 @router.post("/mediamtx-auth/{secret}", status_code=200, response_model=None)
+@track_ingest("mediamtx-auth")
 async def mediamtx_auth(
     secret: Annotated[str, Path(min_length=1, max_length=512)],
     body: MediaMTXAuthRequest,
@@ -434,6 +444,7 @@ async def mediamtx_auth(
     URL, the full key, or the password field.
     """
     if not verify_shared_secret(secret, settings.mediamtx_webhook_secret.get_secret_value()):
+        record_auth("deny")
         # Do NOT include the presented value in the log line.
         _authlog.warning("mediamtx_auth_denied", reason_code="invalid_webhook_secret")
         return Response(status_code=401)
@@ -452,6 +463,7 @@ async def mediamtx_auth(
         async with pool.acquire() as conn:
             session, reason_code = await check_session_admit(conn, streamid)
     except Exception:
+        record_auth("deny")
         # Fail-closed on any DB / pool error. exception() captures the
         # traceback into the structured log without leaking the streamid.
         _authlog.exception(
@@ -474,6 +486,7 @@ async def mediamtx_auth(
         return _deny(reason_code, **fields)
 
     assert session is not None
+    record_auth("allow")
     session_id_var.set(session.id)
     _authlog.info(
         "mediamtx_auth_allowed",
