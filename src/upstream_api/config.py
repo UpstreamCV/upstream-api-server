@@ -54,6 +54,12 @@ class Settings(BaseSettings):
     # guard makes overlap safe, but redundant evaluation is wasted work).
     workflow_evaluator_interval_seconds: int = 60
 
+    # Admin-panel health history: tick interval for the in-process sampler
+    # loop (services/health_sampler.py) that persists component health into
+    # system_health_samples. 0 disables. Single-instance posture, same as
+    # the workflow evaluator above.
+    health_sample_interval_seconds: int = 60
+
     # Module 7 M2 — Stripe Checkout + Customer Portal. ALL optional: with
     # stripe_secret_key unset, /v1/billing/* and /v1/webhooks/stripe return
     # 503 billing_not_configured and the dashboard shows its "coming soon"

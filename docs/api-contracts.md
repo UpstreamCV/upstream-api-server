@@ -1553,6 +1553,7 @@ All mutations write an `admin_audit_log` row (`{before, after}` diff,
 | POST | `/v1/admin/streams/{session_id}/stop` | Force-stop: `approved\|streaming` → `ended` (`end_reason=admin_forced`), camera mirrored to idle, usage event recorded, best-effort MediaMTX deprovision. Audited (`stream.force_stop`). |
 | POST | `/v1/admin/users/recovery-link` | `{email}` → one-time GoTrue recovery `action_link` for out-of-band delivery. Link NOT audited (event is, without the link). `404 user_not_found`. |
 | GET | `/v1/admin/system/timeseries?hours=24` | Hourly activity for the System graphs (`hours` 1–168): zero-filled `generate_series` buckets of `sessions_started`, `validation_failures`, `streaming_minutes` (from `session_ended` usage events), `avg_fps` (null = no heartbeats that hour). |
+| GET | `/v1/admin/system/health/history?minutes=60` | Server-collected component samples (`minutes` 5–1440, cap 2000 rows) from the in-process sampler loop: db_ok/latency, MediaMTX status/paths, processor rollup, active sessions. |
 | GET | `/v1/admin/platform-admins` | Allowlist with emails. |
 | POST | `/v1/admin/platform-admins` | `{email, note?}` — grants an EXISTING auth user admin access (`400 user_not_found`, `409 already_admin`). Audited. |
 | DELETE | `/v1/admin/platform-admins/{user_id}` | Revokes; self-removal → `409 cannot_remove_self`. Audited. |

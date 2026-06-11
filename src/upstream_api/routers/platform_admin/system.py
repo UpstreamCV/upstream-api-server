@@ -7,6 +7,8 @@ from fastapi import APIRouter, Query, Request
 from upstream_api import __version__
 from upstream_api.schemas.platform_admin import (
     ApiHealth,
+    HealthHistoryResponse,
+    HealthSample,
     ProcessorsHealth,
     SystemHealthResponse,
     SystemTimeseriesPoint,
@@ -109,6 +111,53 @@ async def get_system_timeseries(
                 validation_failures=r["validation_failures"],
                 streaming_minutes=round(r["streaming_minutes"], 1),
                 avg_fps=round(r["avg_fps"], 1) if r["avg_fps"] is not None else None,
+            )
+            for r in rows
+        ],
+    )
+
+
+@router.get("/system/health/history", response_model=HealthHistoryResponse)
+async def get_health_history(
+    _admin: CurrentPlatformAdmin,
+    pool: PoolDep,
+    settings: SettingsDep,
+    minutes: Annotated[int, Query(ge=5, le=1440)] = 60,
+) -> HealthHistoryResponse:
+    """Server-collected health samples for the live graphs.
+
+    Source: the in-process sampler loop (services/health_sampler.py). The
+    panel reads this instead of building client-side ring buffers, so the
+    history is shared across tabs and exists while nobody is watching.
+    Capped at 2000 rows (a 24h window at the 60 s default is 1440).
+    """
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            select sampled_at, db_ok, db_latency_ms, mediamtx_status,
+                   mediamtx_active_paths, processors_active, processors_stale,
+                   processors_failed, active_sessions
+              from system_health_samples
+             where sampled_at > now() - make_interval(mins => $1)
+             order by sampled_at
+             limit 2000
+            """,
+            minutes,
+        )
+    return HealthHistoryResponse(
+        minutes=minutes,
+        interval_seconds=settings.health_sample_interval_seconds,
+        samples=[
+            HealthSample(
+                sampled_at=r["sampled_at"],
+                db_ok=r["db_ok"],
+                db_latency_ms=r["db_latency_ms"],
+                mediamtx_status=r["mediamtx_status"],
+                mediamtx_active_paths=r["mediamtx_active_paths"],
+                processors_active=r["processors_active"],
+                processors_stale=r["processors_stale"],
+                processors_failed=r["processors_failed"],
+                active_sessions=r["active_sessions"],
             )
             for r in rows
         ],

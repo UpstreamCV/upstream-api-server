@@ -73,6 +73,24 @@ class SystemTimeseriesResponse(BaseModel):
     points: list[SystemTimeseriesPoint]
 
 
+class HealthSample(BaseModel):
+    sampled_at: datetime
+    db_ok: bool
+    db_latency_ms: float | None
+    mediamtx_status: str
+    mediamtx_active_paths: int | None
+    processors_active: int
+    processors_stale: int
+    processors_failed: int
+    active_sessions: int
+
+
+class HealthHistoryResponse(BaseModel):
+    minutes: int
+    interval_seconds: int
+    samples: list[HealthSample]
+
+
 # ---------------------------------------------------------------------------
 # /v1/admin/streams
 # ---------------------------------------------------------------------------
