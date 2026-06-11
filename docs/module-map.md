@@ -138,6 +138,7 @@ One file per resource / external system. Handlers consume these and never write 
 Each router owns its own path prefix. They consume `services.*` and never write SQL directly.
 
 - `admin.py` — `GET /` (service-info landing), `GET /healthz`, `GET /readyz`.
+- `metrics.py` (M9.3) — `GET /metrics`: Prometheus exposition of the registry in `observability/metrics.py`. 404 when `UPSTREAM_PROMETHEUS_AUTH_TOKEN` is unset; otherwise exact `Authorization: Bearer <token>` with constant-time compare (401 on mismatch). Refreshes the `db_pool_size`/`db_pool_in_use` gauges from `app.state.db_pool` per scrape.
 - `platform_admin/` (admin panel) — `/v1/admin` prefix, all `CurrentPlatformAdmin`-authed, consumed only by `upstream-admin-panel`: `me.py` (`GET /me` gate check), `system.py` (`GET /system/health` rollup via `services/admin_health`), `streams.py` (`GET /streams`, `/streams/summary`, `/streams/{id}` — cross-account session reads with lateral latest-heartbeat/validation/processor joins), `accounts.py` (`GET/POST /accounts`, `/accounts/{id}` detail + `PATCH` name/slug/plan/status, `PATCH .../limits`, member CRUD with last-owner guards, token issue/revoke with one-time plaintext — all mutations audited via `services/admin_audit`), `usage.py` (`GET /usage` bucketed, `GET /usage/summary`), `audit.py` (`GET /audit-log`), `users.py` (`POST /users/recovery-link` via GoTrue admin; `GET/POST/DELETE /platform-admins` allowlist CRUD with self-removal guard). `streams.py` additionally has `POST /streams/{id}/stop` (force-stop + MediaMTX deprovision). `services/supabase_admin.py` wraps the GoTrue Admin REST API (create user, recovery link).
 - `accounts.py` — `/v1/account` prefix. Dashboard-user reads of the caller's account + members + limits, plus the M3 account-level processing master switch: `GET`/`PATCH /v1/account/processing-config` (`processing_enabled` toggle the eligible-sessions SQL enforces).
 - `users.py` — `/v1/me` prefix. Dashboard-user introspection of their own user / membership state.
@@ -164,6 +165,7 @@ Pydantic v2 request/response models, one file per resource. All models default t
 - `context.py` — `request_id_var`, `account_id_var`, `agent_id_var`, `session_id_var`. Bound by middleware and the auth deps; auto-included in every log line.
 - `logging.py` — `configure_logging(level, json_logs)`, `get_logger(name)`. Secret-key denylist scrubs `authorization`, `*token*`, `*secret*`, `*_key`, `password`.
 - `middleware.py` — `RequestIdMiddleware` (reads/sets `X-Request-ID`), `AccessLogMiddleware` (one log line per request with duration).
+- `metrics.py` (M9.3) — module-level Prometheus `CollectorRegistry` (NOT the global default — tests build many apps per process) + collectors: `ingest_webhook_total{endpoint,outcome}`, `mediamtx_auth_total{decision}`, `session_transitions_total{from_state,to_state}`, `session_start_to_streaming_seconds` histogram, `db_pool_size`/`db_pool_in_use` gauges. One-line call-site helpers (`record_ingest`/`record_auth`/`record_transition`/`observe_time_to_streaming`) and the `track_ingest` decorator that classifies handler outcomes as ok/client_error/server_error from HTTP status.
 
 ## `tests/`
 

@@ -4,6 +4,124 @@ Reverse chronological. Newest at top. Every meaningful commit gets an entry foll
 
 ---
 
+## 2026-06-11 - feat(observability): M9.3 — Prometheus GET /metrics + Sentry init
+
+### Summary
+Implements roadmap M9.3 (upstream-streaming-server docs/design/07-roadmap.md,
+doc 01 §3): the api-server gets a token-gated Prometheus `GET /metrics`
+endpoint backed by a module-level registry, instrumentation on the ingest
+webhooks / MediaMTX auth gate / session state machine, and a guarded
+`sentry_sdk.init()` in the app factory. `UPSTREAM_PROMETHEUS_AUTH_TOKEN`
+becomes optional in Settings: unset → `/metrics` 404s (the endpoint does not
+exist for that deployment); set → exact `Authorization: Bearer <token>` with
+constant-time compare (`security/shared_secret.verify_shared_secret`), wrong
+or missing token → 401.
+
+### Files touched
+- `src/upstream_api/observability/metrics.py` — new: module-level
+  `CollectorRegistry` (NOT `prometheus_client.REGISTRY`; tests build many
+  apps per process) + `ingest_webhook_total{endpoint,outcome}`,
+  `mediamtx_auth_total{decision}`,
+  `session_transitions_total{from_state,to_state}`,
+  `session_start_to_streaming_seconds` (buckets 0.5–60 s bracketing the
+  p95 < 8 s SLI), `db_pool_size`/`db_pool_in_use`; one-line helpers
+  (`record_ingest`/`record_auth`/`record_transition`/
+  `observe_time_to_streaming`) + `track_ingest` decorator.
+- `src/upstream_api/routers/metrics.py` — new: `GET /metrics` handler
+  (404/401/200 gating above); refreshes the pool gauges from
+  `app.state.db_pool` (`get_size()`/`get_idle_size()`) per scrape; returns
+  `generate_latest(registry)` as text/plain.
+- `src/upstream_api/config.py` — `prometheus_auth_token: SecretStr | None = None`.
+- `src/upstream_api/app.py` — mounts the metrics router; Sentry init when
+  `settings.sentry_dsn` is set (`send_default_pii=False`, environment tag);
+  missing DSN is a no-op.
+- `src/upstream_api/routers/ingest.py` — `@track_ingest("<endpoint>")` on all
+  8 handlers (outcome ok/client_error/server_error from HTTP status);
+  `record_auth("allow"/"deny")` one-liners in the mediamtx-auth decision
+  paths (`_deny`, bad-secret, fail-closed exception, allow).
+- `src/upstream_api/services/stream_validation.py` — `mark_streaming` records
+  approved→streaming and observes time-to-streaming from `created_at` (added
+  to the UPDATE's RETURNING) vs the webhook's `started_at`; `mark_ended` /
+  `mark_failed` record →ended/→failed with the from-state derived from
+  `started_at` presence (written exactly once, on the approved→streaming
+  edge; `mark_failed`'s RETURNING gains `started_at`). Idempotent /
+  wrong-state paths record nothing.
+- `src/upstream_api/services/session_lifecycle.py` — `start_session` records
+  created→approved; `stop_session` records `<prior>`→ended (prior state is in
+  the row it already selected).
+- `tests/test_metrics_endpoint.py` — new: 12 cases — /metrics 404 (token
+  unset via `model_copy` settings override), 401 missing/wrong/non-Bearer,
+  200 + body contains the series names; allow/deny + ingest-outcome counter
+  deltas through the mediamtx-auth route with FakeConn/FakePool; transition
+  counters + histogram via `mark_*`/`start_session` with fakes
+  (delta-based `registry.get_sample_value` assertions).
+- `tests/test_stream_validation.py`, `tests/test_ingest_validation_failed.py`,
+  `tests/test_stream_sessions_router.py` — fake UPDATE...RETURNING rows gain
+  the newly selected `created_at`/`started_at` columns.
+- `tests/test_app_routes.py` — `/metrics:GET` added to the expected route set.
+- `docs/api-contracts.md` — `GET /metrics` section; env-table rows for
+  `UPSTREAM_PROMETHEUS_AUTH_TOKEN` (now optional) and `UPSTREAM_SENTRY_DSN`.
+- `docs/module-map.md` — entries for the two new modules.
+
+### Functions/classes changed
+- `track_ingest(endpoint)` — async-handler decorator; classifies outcome from
+  `status_code` on the return value or raised exception (`functools.wraps`
+  keeps FastAPI DI signature inspection working). Dependency-level failures
+  (e.g. webhook-secret 401s) fire before the handler and are not counted.
+- `Settings.prometheus_auth_token` — `SecretStr` → `SecretStr | None = None`
+  (was required at boot; deployed envs keep it set).
+
+### System interaction notes
+`Prometheus → GET /metrics (Bearer token, constant-time) → registry exposition
++ pool-gauge refresh`. Webhook traffic: `MediaMTX/streaming-server →
+/v1/ingest/* handler → track_ingest counter` and `mediamtx-auth →
+record_auth`. State machine: `start_session / mark_streaming / mark_ended /
+mark_failed / stop_session → session_transitions_total`, with
+`session_start_to_streaming_seconds` observed on the approved→streaming edge
+(`started_at - created_at`, skipped if `started_at` arrives tz-naive,
+clamped at 0).
+
+### Testing/checks
+`uv run ruff format --check src tests` and `uv run ruff check src tests`
+clean; `uv run mypy src tests` — no new errors (the 47 pre-existing errors in
+five Module-7/Workflow test files remain, untouched); `uv run pytest -q` —
+all passed, 0 failed (1145 at last run; 12 new tests in
+`tests/test_metrics_endpoint.py`; the suite total is moving because
+platform-admin work landed concurrently in the same tree).
+
+### Follow-up TODOs
+- Per-router request-latency histograms (doc 01 §3 "standard per-router
+  latency") are not part of this commit.
+- `sweeper_actions_total` / `reconciler_actions_total` land with M10.x.
+- Counters increment even if the surrounding DB transaction later rolls
+  back — acceptable for trend metrics, documented here for honesty.
+
+---
+
+## 2026-06-11 - feat(admin): system activity timeseries endpoint
+
+### Summary
+Backs the panel's new System-page graphs: GET /v1/admin/system/timeseries
+returns hourly buckets (1-168h window) of sessions started, validation
+failures, streaming minutes (session_ended usage events / 60), and average
+heartbeat FPS. Buckets come from generate_series so quiet hours are explicit
+zeros; avg_fps is null (not 0) for hours with no heartbeats.
+
+### Files touched
+- `src/upstream_api/routers/platform_admin/system.py` — new endpoint.
+- `src/upstream_api/schemas/platform_admin.py` — SystemTimeseriesPoint /
+  Response.
+- `tests/test_platform_admin_system.py` — zero-fill + null-fps + rounding +
+  hours clamp tests.
+- `docs/api-contracts.md` — endpoint row.
+
+### Testing/checks
+`pytest tests/test_platform_admin_system.py` (10 passed), `ruff`, `mypy`
+clean. Live-verified against the local stack: 24 zero-filled buckets with
+the seeded session's hour showing 1 start / 20.6 min / 30.0 fps.
+
+---
+
 ## 2026-06-11 - feat(admin): editing surface — account create/edit, members, tokens, force-stop, platform-admins
 
 ### Summary

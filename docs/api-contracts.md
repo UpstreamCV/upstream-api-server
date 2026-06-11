@@ -95,6 +95,10 @@ No auth. Pings the DB with a 500ms timeout.
 
 200 → `{ "status": "ok" }`. 503 → `{ "status": "not_ready", "error": "…" }`.
 
+### `GET /metrics`
+
+Prometheus scrape endpoint (M9.3). Auth: `Authorization: Bearer <UPSTREAM_PROMETHEUS_AUTH_TOKEN>`, constant-time compare. With the token env **unset** the route returns 404 (it does not exist for that deployment); wrong/missing token or non-Bearer scheme → 401. 200 returns the `text/plain` exposition of the api-server registry: `ingest_webhook_total{endpoint,outcome}`, `mediamtx_auth_total{decision}`, `session_transitions_total{from_state,to_state}`, `session_start_to_streaming_seconds` (histogram), `db_pool_size` / `db_pool_in_use` (refreshed per scrape). In production the route is additionally firewalled to the monitoring box's IP.
+
 ### `POST /v1/agents/register`
 
 Auth: `current_agent`. Upserts on `(account_id, name)`. `last_seen_at` is set to `now()`.
@@ -354,7 +358,7 @@ Authenticated via `CurrentCaller`. The `resource_id` is the value the client rec
 | `UPSTREAM_MEDIAMTX_RTSP_BASE` | no | Internal MediaMTX RTSP read base advertised to a processor (default `rtsp://host.docker.internal:8554`). The read surface, **not** the SRT publish URL |
 | `UPSTREAM_MEDIAMTX_BASE_URL` | no | MediaMTX WHEP base for the dashboard read-path proxy (default `http://localhost:8889`). Must be reachable only from the api-server in production |
 | `UPSTREAM_MEDIAMTX_API_BASE_URL` | no | MediaMTX HTTP control-API base used to provision/deprovision per-session paths and passphrases (default `http://localhost:9997`). Reachable only from the api-server in production |
-| `UPSTREAM_PROMETHEUS_AUTH_TOKEN` | yes | Reserved for the `/metrics` Bearer auth gate. The endpoint itself isn't implemented yet (Phase 6 pending); the value is still required at boot so a Phase-6 rollout doesn't trip startup |
+| `UPSTREAM_PROMETHEUS_AUTH_TOKEN` | no | Bearer token for the `GET /metrics` auth gate (M9.3). Unset → the endpoint 404s; keep it set in every deployed env |
 | `UPSTREAM_SRT_INGEST_HOST` | no | SRT ingest host advertised in `srt_url` (default `ingest.upstreamcv.com`) |
 | `UPSTREAM_SRT_INGEST_PORT` | no | SRT ingest port (default `18890`) |
 | `UPSTREAM_PORT` | no | HTTP port (default 4000) |
@@ -366,7 +370,7 @@ Authenticated via `CurrentCaller`. The `resource_id` is the value the client rec
 | `UPSTREAM_ALLOWED_ORIGINS` | no | CSV list of CORS origins (default `http://localhost:3000`) |
 | `UPSTREAM_SUPABASE_STORAGE_BUCKET` | no | Supabase Storage bucket for snapshot uploads (default `snapshots`) |
 | `UPSTREAM_SNAPSHOT_MAX_BYTES` | no | Per-request snapshot size limit (default 5 MB) |
-| `UPSTREAM_SENTRY_DSN` | no | Sentry exception reporting |
+| `UPSTREAM_SENTRY_DSN` | no | Sentry exception reporting (M9.3: initialized at app startup when set, `send_default_pii=False`; unset is a no-op) |
 
 ## Endpoints — Phase 2: ingest webhooks (auth: `current_ingest`, except mediamtx-auth)
 
@@ -1548,6 +1552,7 @@ All mutations write an `admin_audit_log` row (`{before, after}` diff,
 | DELETE | `/v1/admin/accounts/{id}/api-tokens/{token_id}` | Idempotent soft-revoke. Audited. |
 | POST | `/v1/admin/streams/{session_id}/stop` | Force-stop: `approved\|streaming` → `ended` (`end_reason=admin_forced`), camera mirrored to idle, usage event recorded, best-effort MediaMTX deprovision. Audited (`stream.force_stop`). |
 | POST | `/v1/admin/users/recovery-link` | `{email}` → one-time GoTrue recovery `action_link` for out-of-band delivery. Link NOT audited (event is, without the link). `404 user_not_found`. |
+| GET | `/v1/admin/system/timeseries?hours=24` | Hourly activity for the System graphs (`hours` 1–168): zero-filled `generate_series` buckets of `sessions_started`, `validation_failures`, `streaming_minutes` (from `session_ended` usage events), `avg_fps` (null = no heartbeats that hour). |
 | GET | `/v1/admin/platform-admins` | Allowlist with emails. |
 | POST | `/v1/admin/platform-admins` | `{email, note?}` — grants an EXISTING auth user admin access (`400 user_not_found`, `409 already_admin`). Audited. |
 | DELETE | `/v1/admin/platform-admins/{user_id}` | Revokes; self-removal → `409 cannot_remove_self`. Audited. |

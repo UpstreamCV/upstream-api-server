@@ -153,3 +153,84 @@ async def test_missing_account_is_404() -> None:
 
 async def test_active_account_passes() -> None:
     await check_account_active(StatusConn("active"), uuid4())
+
+
+# ---------------------------------------------------------------------------
+# GET /v1/admin/system/timeseries
+# ---------------------------------------------------------------------------
+
+
+class TimeseriesConn:
+    def __init__(self, rows: list[dict[str, Any]]) -> None:
+        self.rows = rows
+        self.args: tuple[Any, ...] = ()
+
+    async def fetch(self, _query: str, *args: Any) -> list[dict[str, Any]]:
+        self.args = args
+        return self.rows
+
+
+class TimeseriesAcquire:
+    def __init__(self, conn: TimeseriesConn) -> None:
+        self.conn = conn
+
+    async def __aenter__(self) -> TimeseriesConn:
+        return self.conn
+
+    async def __aexit__(self, *_exc: Any) -> None:
+        return None
+
+
+class TimeseriesPool:
+    def __init__(self, conn: TimeseriesConn) -> None:
+        self.conn = conn
+
+    def acquire(self) -> TimeseriesAcquire:
+        return TimeseriesAcquire(self.conn)
+
+
+def _ts_client(conn: TimeseriesConn) -> TestClient:
+    app = create_app()
+    app.state.http_client = object()
+    app.dependency_overrides[get_pool] = lambda: TimeseriesPool(conn)
+    app.dependency_overrides[current_platform_admin] = lambda: _ADMIN
+    return TestClient(app)
+
+
+def test_timeseries_returns_zero_filled_points() -> None:
+    from datetime import UTC, datetime
+
+    conn = TimeseriesConn(
+        [
+            {
+                "bucket": datetime(2026, 6, 11, 10, tzinfo=UTC),
+                "sessions_started": 0,
+                "validation_failures": 0,
+                "streaming_minutes": 0.0,
+                "avg_fps": None,
+            },
+            {
+                "bucket": datetime(2026, 6, 11, 11, tzinfo=UTC),
+                "sessions_started": 3,
+                "validation_failures": 1,
+                "streaming_minutes": 42.5,
+                "avg_fps": 29.97,
+            },
+        ]
+    )
+    client = _ts_client(conn)
+    r = client.get("/v1/admin/system/timeseries?hours=2")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["hours"] == 2
+    assert conn.args == (2,)
+    assert body["points"][0]["avg_fps"] is None  # no heartbeats != 0 fps
+    assert body["points"][1]["sessions_started"] == 3
+    assert body["points"][1]["streaming_minutes"] == 42.5
+    assert body["points"][1]["avg_fps"] == 30.0  # rounded to 1dp
+
+
+def test_timeseries_clamps_hours() -> None:
+    client = _ts_client(TimeseriesConn([]))
+    assert client.get("/v1/admin/system/timeseries?hours=0").status_code == 422
+    assert client.get("/v1/admin/system/timeseries?hours=200").status_code == 422

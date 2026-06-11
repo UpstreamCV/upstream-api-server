@@ -1,12 +1,16 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Request
+from typing import Annotated
+
+from fastapi import APIRouter, Query, Request
 
 from upstream_api import __version__
 from upstream_api.schemas.platform_admin import (
     ApiHealth,
     ProcessorsHealth,
     SystemHealthResponse,
+    SystemTimeseriesPoint,
+    SystemTimeseriesResponse,
 )
 from upstream_api.security.deps import CurrentPlatformAdmin, PoolDep, SettingsDep
 from upstream_api.services.admin_health import (
@@ -47,4 +51,65 @@ async def get_system_health(
         database=database,
         streaming_server=streaming_server,
         processors=processors,
+    )
+
+
+@router.get("/system/timeseries", response_model=SystemTimeseriesResponse)
+async def get_system_timeseries(
+    _admin: CurrentPlatformAdmin,
+    pool: PoolDep,
+    hours: Annotated[int, Query(ge=1, le=168)] = 24,
+) -> SystemTimeseriesResponse:
+    """Hourly platform activity for the System page graphs.
+
+    Buckets come from generate_series so quiet hours are explicit zeros —
+    a graph that silently skips empty hours misreads as healthy load.
+    `avg_fps` is null for hours with no heartbeats (distinct from 0 fps,
+    which would mean stalled streams).
+    """
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            with hours as (
+              select generate_series(
+                       date_trunc('hour', now()) - ($1::int - 1) * interval '1 hour',
+                       date_trunc('hour', now()),
+                       interval '1 hour'
+                     ) as bucket
+            )
+            select h.bucket,
+                   (select count(*)::int from stream_sessions s
+                     where s.created_at >= h.bucket
+                       and s.created_at < h.bucket + interval '1 hour') as sessions_started,
+                   (select count(*)::int from stream_validations v
+                     where v.passed = false
+                       and v.created_at >= h.bucket
+                       and v.created_at < h.bucket + interval '1 hour') as validation_failures,
+                   coalesce((select sum(u.quantity) / 60.0 from usage_events u
+                     where u.event_type = 'session_ended'
+                       and u.unit = 'seconds'
+                       and u.occurred_at >= h.bucket
+                       and u.occurred_at < h.bucket + interval '1 hour'), 0)::float
+                     as streaming_minutes,
+                   (select avg(hb.fps)::float from heartbeats hb
+                     where hb.reported_at >= h.bucket
+                       and hb.reported_at < h.bucket + interval '1 hour'
+                       and hb.fps is not null) as avg_fps
+              from hours h
+             order by h.bucket
+            """,
+            hours,
+        )
+    return SystemTimeseriesResponse(
+        hours=hours,
+        points=[
+            SystemTimeseriesPoint(
+                bucket=r["bucket"],
+                sessions_started=r["sessions_started"],
+                validation_failures=r["validation_failures"],
+                streaming_minutes=round(r["streaming_minutes"], 1),
+                avg_fps=round(r["avg_fps"], 1) if r["avg_fps"] is not None else None,
+            )
+            for r in rows
+        ],
     )

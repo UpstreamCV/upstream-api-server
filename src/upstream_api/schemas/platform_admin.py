@@ -60,6 +60,19 @@ class SystemHealthResponse(BaseModel):
     processors: ProcessorsHealth
 
 
+class SystemTimeseriesPoint(BaseModel):
+    bucket: datetime
+    sessions_started: int
+    validation_failures: int
+    streaming_minutes: float
+    avg_fps: float | None
+
+
+class SystemTimeseriesResponse(BaseModel):
+    hours: int
+    points: list[SystemTimeseriesPoint]
+
+
 # ---------------------------------------------------------------------------
 # /v1/admin/streams
 # ---------------------------------------------------------------------------
