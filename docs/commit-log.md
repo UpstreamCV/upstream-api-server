@@ -4,6 +4,45 @@ Reverse chronological. Newest at top. Every meaningful commit gets an entry foll
 
 ---
 
+## 2026-06-10 - Payload-enrichment unlock: min_confidence + object_class count bounds
+
+### Summary
+Consumer half of the processor side task "Workflow Condition Payload
+Enrichment" (upstream-processor enriches zone/dwell payloads with per-object
+`confidence` and populates object-attributed `class_counts` on ROI
+occupancy). Unlocks two conditions M3 deferred: `min_confidence` on
+zone_entered/dwell_exceeded (inclusive threshold in (0, 1]; missing
+confidence never matches — the processor omits it when the track wasn't
+detected in the triggering frame) and `object_class` on roi_occupancy
+(scopes min/max_total_count to that class's count; no class_counts dict →
+no match; absent class counts as zero, safe because min's floor is 1, so
+pre-enrichment events can never match). Still deferred honestly: all
+line_crossing conditions beyond line_id + schedule (cumulative counters
+have no per-object attribution — per-object producer is the documented
+processor follow-up).
+
+### Files touched
+- `src/upstream_api/schemas/rules.py` — allowed-key maps (+min_confidence on
+  zone/dwell, +object_class on roi) + value validators; availability
+  rationale updated.
+- `src/upstream_api/services/rules.py` — `_confidence_ok` helper;
+  roi matcher counts against `class_counts[object_class]` when set.
+- `tests/test_rule_evaluation.py` — +30 truth-table/validation cases
+  (inclusive threshold, missing/odd confidence, class-scoped bounds,
+  empty/missing breakdown, composition with M3 conditions, rejected keys on
+  unprovable types).
+- `docs/api-contracts.md` — M3 deferral list amended + "payload-enrichment
+  unlock" section.
+
+### Testing/checks
+`make test` — 885 passed (+30). `make lint` + `uv run mypy src` clean.
+No migration (config is jsonb; observation payloads are open-shape JSON —
+old observations ingest unchanged, the savepoint contract is untouched).
+
+### Follow-up TODOs
+- Per-object line-crossing producer in the processor → unlocks
+  direction/class/track/confidence on line_crossing.
+
 ## 2026-06-10 - Workflow Engine M3: richer rule conditions
 
 ### Summary

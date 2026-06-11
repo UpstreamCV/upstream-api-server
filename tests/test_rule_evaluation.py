@@ -151,6 +151,97 @@ _EVAL_NOW = datetime(2026, 6, 10, 12, 0, 0, tzinfo=UTC)
         ("roi_occupancy", {"min_total_count": 2, "max_total_count": 5}, {"total_count": 9}, False),
         # Bounds need a provable count.
         ("roi_occupancy", {"max_total_count": 5}, {}, False),
+        # --- payload-enrichment unlock: min_confidence (zone/dwell) --------
+        (
+            "zone_entered",
+            {"min_confidence": 0.7},
+            {"zone_id": "z", "confidence": 0.86},
+            True,
+        ),
+        (
+            "zone_entered",
+            {"min_confidence": 0.7},
+            {"zone_id": "z", "confidence": 0.7},
+            True,  # threshold is inclusive
+        ),
+        (
+            "zone_entered",
+            {"min_confidence": 0.7},
+            {"zone_id": "z", "confidence": 0.55},
+            False,
+        ),
+        # Missing confidence never matches a confidence-filtered rule.
+        ("zone_entered", {"min_confidence": 0.7}, {"zone_id": "z"}, False),
+        ("zone_entered", {"min_confidence": 0.7}, {"zone_id": "z", "confidence": "hi"}, False),
+        # Threshold omitted keeps prior behavior.
+        ("zone_entered", {}, {"zone_id": "z", "confidence": 0.1}, True),
+        (
+            "dwell_exceeded",
+            {"min_confidence": 0.7, "min_duration_seconds": 30},
+            {"zone_id": "z", "confidence": 0.9, "duration_seconds": 31},
+            True,
+        ),
+        (
+            "dwell_exceeded",
+            {"min_confidence": 0.7},
+            {"zone_id": "z", "duration_seconds": 31},
+            False,
+        ),
+        # Confidence composes with class + track conditions.
+        (
+            "zone_entered",
+            {"min_confidence": 0.7, "object_classes": ["person"], "require_track_id": True},
+            {"zone_id": "z", "confidence": 0.8, "class_label": "person", "track_id": "t"},
+            True,
+        ),
+        (
+            "zone_entered",
+            {"min_confidence": 0.7, "object_classes": ["person"], "require_track_id": True},
+            {"zone_id": "z", "confidence": 0.8, "class_label": "car", "track_id": "t"},
+            False,
+        ),
+        # --- payload-enrichment unlock: object_class counts (roi) ----------
+        (
+            "roi_occupancy",
+            {"object_class": "person", "min_total_count": 2},
+            {"total_count": 5, "class_counts": {"person": 2, "car": 3}},
+            True,
+        ),
+        (
+            "roi_occupancy",
+            {"object_class": "person", "min_total_count": 3},
+            {"total_count": 5, "class_counts": {"person": 2, "car": 3}},
+            False,
+        ),
+        (
+            "roi_occupancy",
+            {"object_class": "person", "min_total_count": 1, "max_total_count": 2},
+            {"total_count": 9, "class_counts": {"person": 2, "car": 7}},
+            True,  # bounds apply to the CLASS count, not the total
+        ),
+        # Class absent from the breakdown counts as zero → below the min floor.
+        (
+            "roi_occupancy",
+            {"object_class": "forklift"},
+            {"total_count": 5, "class_counts": {"person": 5}},
+            False,
+        ),
+        # Pre-enrichment events (empty breakdown) can never match a
+        # class-scoped count rule.
+        (
+            "roi_occupancy",
+            {"object_class": "person"},
+            {"total_count": 5, "class_counts": {}},
+            False,
+        ),
+        # No class_counts dict at all → can't prove anything.
+        ("roi_occupancy", {"object_class": "person"}, {"total_count": 5}, False),
+        (
+            "roi_occupancy",
+            {"object_class": "person"},
+            {"total_count": 5, "class_counts": "x"},
+            False,
+        ),
     ],
 )
 def test_rule_matches(
@@ -198,6 +289,12 @@ def test_rule_matches(
             "zone_entered",
             {"schedule": {"start_time": "22:00", "end_time": "06:00", "timezone": "UTC"}},
         ),
+        # --- payload-enrichment unlock --------------------------------------
+        ("zone_entered", {"min_confidence": 0.7}),
+        ("zone_entered", {"min_confidence": 1}),
+        ("dwell_exceeded", {"min_confidence": 0.5, "object_classes": ["person"]}),
+        ("roi_occupancy", {"object_class": "person", "min_total_count": 3}),
+        ("roi_occupancy", {"object_class": "person", "max_total_count": 2}),
     ],
 )
 def test_valid_configs_pass(rule_type: str, config: dict[str, Any]) -> None:
@@ -221,8 +318,17 @@ def test_valid_configs_pass(rule_type: str, config: dict[str, Any]) -> None:
         ("line_crossing", {"object_classes": ["person"]}),
         ("line_crossing", {"require_track_id": True}),
         ("line_crossing", {"direction": "a_to_b"}),  # deferred — never produced
-        ("zone_entered", {"min_confidence": 0.7}),  # deferred — not in payloads
-        ("roi_occupancy", {"object_classes": ["person"]}),  # aggregate counts only
+        ("line_crossing", {"min_confidence": 0.7}),  # no per-object attribution
+        ("roi_occupancy", {"object_classes": ["person"]}),  # use object_class (single)
+        ("roi_occupancy", {"min_confidence": 0.7}),  # counts have no confidence
+        # --- payload-enrichment unlock: value validation ---------------------
+        ("zone_entered", {"min_confidence": 0}),
+        ("zone_entered", {"min_confidence": 1.5}),
+        ("zone_entered", {"min_confidence": True}),
+        ("zone_entered", {"min_confidence": "0.7"}),
+        ("roi_occupancy", {"object_class": ""}),
+        ("roi_occupancy", {"object_class": 7}),
+        ("zone_entered", {"object_class": "person"}),  # roi-only key
         # --- M3: value validation -------------------------------------------
         ("zone_entered", {"object_classes": []}),
         ("zone_entered", {"object_classes": ["person", "person"]}),
