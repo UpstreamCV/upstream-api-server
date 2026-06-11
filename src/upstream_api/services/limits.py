@@ -15,6 +15,7 @@ from uuid import UUID
 import asyncpg
 
 from upstream_api.errors import LimitExceeded, NotFoundError
+from upstream_api.services.usage import current_usage_period
 
 
 @dataclass(frozen=True, slots=True)
@@ -151,6 +152,7 @@ async def check_session_start(
 
     check_camera_defaults(limits, requested)
     check_stream_type_allowed(limits, camera_source_type)
+    await check_monthly_minutes_quota(conn, account_id=account_id, limits=limits)
 
     # Serialize concurrent start_session calls for the same account so the
     # count(*) below and the eventual insert observe a consistent view of
@@ -209,4 +211,53 @@ async def check_camera_slot_available(
             f"Camera slot limit reached: {count} of {limits.max_cameras}.",
             code="limit_exceeded.max_cameras",
             details={"in_use": count, "max": limits.max_cameras},
+        )
+
+
+async def check_monthly_minutes_quota(
+    conn: asyncpg.Connection,
+    *,
+    account_id: UUID,
+    limits: AccountLimits,
+) -> None:
+    """Reject session start once COMPLETED stream minutes hit the monthly quota.
+
+    Module 7 M1 — the quota existed since day one but was never enforced.
+    Minutes come from usage_events ``session_ended`` only (the same source
+    the usage summary and agent bootstrap report), seconds // 60. Two
+    documented softnesses, both acceptable for a coarse cost-control cap:
+
+    - Currently-active sessions contribute nothing until they end, so an
+      account can start one final session near the cap and overshoot by
+      that session's length.
+    - A quota of 0 means no streaming minutes are allowed at all — any
+      session start is rejected — consistent with how max_cameras=0 would
+      behave. There is no 0-means-unlimited convention in this codebase.
+    """
+    period_start, period_end = current_usage_period()
+    used_seconds = await conn.fetchval(
+        """
+        select coalesce(sum(quantity), 0)::bigint
+          from usage_events
+         where account_id = $1
+           and event_type = 'session_ended'
+           and occurred_at >= $2
+           and occurred_at < $3
+        """,
+        account_id,
+        period_start,
+        period_end,
+    )
+    used_minutes = int(used_seconds or 0) // 60
+    if used_minutes >= limits.monthly_minutes_quota:
+        raise LimitExceeded(
+            f"Monthly streaming minutes quota reached: "
+            f"{used_minutes} of {limits.monthly_minutes_quota} minutes used.",
+            code="limit_exceeded.monthly_minutes_quota",
+            details={
+                "limit": limits.monthly_minutes_quota,
+                "used": used_minutes,
+                "period_start": period_start.isoformat(),
+                "period_end": period_end.isoformat(),
+            },
         )

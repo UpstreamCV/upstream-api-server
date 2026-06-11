@@ -37,6 +37,7 @@ from upstream_api.routers import (
     rules,
     snapshots,
     stream_sessions,
+    usage,
     users,
     workflow_evaluator,
     workflow_runs,
@@ -137,5 +138,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(workflow_runs.router)  # /v1/workflow-runs (Workflow Engine M2)
     app.include_router(workflow_evaluator.router)  # /v1/internal/workflow-evaluator (M4)
     app.include_router(workflows.router)  # /v1/workflows (Workflow Engine M5)
+    app.include_router(usage.router)  # /v1/usage (Module 7 M1)
 
     return app
