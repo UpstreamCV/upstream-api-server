@@ -114,6 +114,26 @@ class Settings(BaseSettings):
     #   deployed:        rtsp://<internal-streaming-host>:8554
     mediamtx_rtsp_base: str = "rtsp://host.docker.internal:8554"
 
+    # Perception fan-out hot path (live detection overlays at 10–15 Hz).
+    # Both optional: with either unset,
+    # POST /v1/cameras/{id}/perception/stream-token returns 503
+    # perception_stream_not_configured (same pattern as
+    # billing_not_configured) and the dashboard silently stays on its
+    # Realtime + polling fallback.
+    #
+    # fanout_token_secret must MATCH the sidecar's
+    # UPSTREAM_FANOUT_TOKEN_SECRET (upstream-streaming-server) — this
+    # server mints subscriber tokens, the sidecar verifies them.
+    # fanout_public_ws_url is the browser-reachable base of the sidecar;
+    # the WS subscribe URL is advertised as
+    # ``{fanout_public_ws_url}/v1/subscribe`` in the token response so
+    # the dashboard needs no NEXT_PUBLIC_* env of its own.
+    #   prod:      wss://ingest.upstreamcv.com/perception
+    #   local dev: ws://127.0.0.1:18990
+    fanout_token_secret: SecretStr | None = None
+    fanout_public_ws_url: str | None = None
+    fanout_token_ttl_seconds: int = 600
+
     @property
     def is_production(self) -> bool:
         return self.environment == "production"

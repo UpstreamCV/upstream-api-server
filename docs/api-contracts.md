@@ -73,6 +73,7 @@ Every non-2xx response uses this shape:
 | 422 | `validation_error` | pydantic request validation failed |
 | 500 | `internal_error` | unhandled exception |
 | 502 | `mediamtx_provision_failed` | `/start` couldn't PATCH the MediaMTX path for the new session; row is left `failed` with `failure_code='mediamtx_provision_failed'` |
+| 503 | `perception_stream_not_configured` | `POST /v1/cameras/{id}/perception/stream-token` while `UPSTREAM_FANOUT_TOKEN_SECRET` / `UPSTREAM_FANOUT_PUBLIC_WS_URL` are unset (deployment has no perception-fanout sidecar; dashboard stays on Realtime + polling) |
 | 502 | `upstream_unavailable` | WHEP proxy timed out, got a 5xx, or got an unparseable response from MediaMTX |
 
 ## Endpoints — Phase 1 (implemented)
@@ -909,6 +910,41 @@ Response 200: `{ "snapshot": PerceptionSnapshotRecord }` where `PerceptionSnapsh
 `snapshot` is returned as stored (opaque JSON — the server does not deep-validate its shape). `account_id` is not echoed. The query is double-scoped by account and camera.
 
 Errors: `camera_not_found` (404 — unknown camera or a camera in another account); `perception_snapshot_not_found` (404 — the processor has not posted a snapshot for this camera yet; mirrors `latest-frame`'s missing-resource convention).
+
+### `POST /v1/cameras/{camera_id}/perception/stream-token`
+
+Mints a short-lived token for the **perception-fanout WS hot path** —
+the sidecar in `upstream-streaming-server` that relays processor
+snapshots to browsers at 10–15 Hz, bypassing the DB (full contract:
+`upstream-streaming-server/docs/perception-fanout.md`). All authz
+happens HERE (same `CurrentCaller` + camera-ownership checks as
+`perception/latest`); the sidecar only verifies signature + expiry, so
+membership revocation exposure is bounded by the TTL
+(`UPSTREAM_FANOUT_TOKEN_TTL_SECONDS`, default 600).
+
+Query: `account_id`. Body: none.
+
+Response 200:
+```json
+{
+  "token": "upt1.<b64url payload>.<b64url hmac>",
+  "ws_url": "wss://ingest.upstreamcv.com/perception/v1/subscribe",
+  "expires_at": "2026-06-11T17:13:22Z"
+}
+```
+
+Token algorithm (`security/fanout_token.py`; the verify twin lives in
+the sidecar's `app/tokens.py` — keep in sync): payload
+`{"cam","acct","sub","iat","exp"}`, signature
+`HMAC_SHA256(secret, "upt1." + b64url(payload))`, secret =
+`UPSTREAM_FANOUT_TOKEN_SECRET` (must match the sidecar's). The token
+rides the WS query string (browsers cannot set WS headers): never log
+it, never persist it; the dashboard re-mints on every (re)connect.
+
+Errors: `camera_not_found` (404); `perception_stream_not_configured`
+(503 — `UPSTREAM_FANOUT_TOKEN_SECRET` or `UPSTREAM_FANOUT_PUBLIC_WS_URL`
+unset for this deployment; same convention as `billing_not_configured` —
+the dashboard then stays on its Realtime + polling fallback).
 
 ### `GET /v1/cameras/{camera_id}/processor-status/latest`
 

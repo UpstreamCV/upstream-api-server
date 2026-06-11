@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import json
+import time
+from datetime import UTC, datetime
 from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Query
 
-from upstream_api.errors import ConflictError, ForbiddenError, NotFoundError
+from upstream_api.config import get_settings
+
+from upstream_api.errors import ApiError, ConflictError, ForbiddenError, NotFoundError
 from upstream_api.schemas.cameras import (
     CameraClaimRequest,
     CameraCreateRequest,
@@ -28,6 +32,7 @@ from upstream_api.schemas.processor import (
     LatestProcessorStatusResponse,
     ObservationRecord,
     PerceptionSnapshotRecord,
+    PerceptionStreamTokenResponse,
     ProcessorStatusRecord,
     RecentObservationsResponse,
 )
@@ -37,6 +42,7 @@ from upstream_api.security.deps import (
     PoolDep,
     require_account_role,
 )
+from upstream_api.security.fanout_token import mint_fanout_token
 from upstream_api.services.account_audit import try_record_account_audit_log
 from upstream_api.services.geometry import (
     default_geometry_config_record,
@@ -607,6 +613,75 @@ async def get_latest_perception_snapshot(
             observed_at=row["observed_at"],
             updated_at=row["updated_at"],
         )
+    )
+
+
+class PerceptionStreamNotConfiguredError(ApiError):
+    status_code = 503
+    code = "perception_stream_not_configured"
+
+
+@router.post(
+    "/{camera_id}/perception/stream-token",
+    response_model=PerceptionStreamTokenResponse,
+)
+async def mint_perception_stream_token(
+    camera_id: UUID,
+    caller: CurrentCaller,
+    pool: PoolDep,
+    account_id: Annotated[UUID | None, Query()] = None,
+) -> PerceptionStreamTokenResponse:
+    """Mint a short-lived token for the perception-fanout WS hot path.
+
+    The perception-fanout sidecar (upstream-streaming-server) relays
+    processor snapshots to browsers at 10–15 Hz, bypassing the DB; this
+    endpoint is where its subscriber auth happens. Supabase JWT auth +
+    the same camera-ownership check as ``perception/latest`` run HERE,
+    then the browser presents the resulting HMAC token to the sidecar,
+    which only verifies signature + expiry (shared
+    ``UPSTREAM_FANOUT_TOKEN_SECRET``). Membership is re-checked at every
+    mint, so revocation exposure is bounded by the token TTL.
+
+    Returns 503 ``perception_stream_not_configured`` when the fanout
+    settings are unset (same convention as ``billing_not_configured``) —
+    the dashboard then stays on its Realtime + polling fallback. The
+    token is returned once and never logged.
+    """
+    settings = get_settings()
+    if settings.fanout_token_secret is None or not settings.fanout_public_ws_url:
+        raise PerceptionStreamNotConfiguredError(
+            "Perception streaming is not configured for this deployment."
+        )
+
+    scope_account = caller.resolve_account(account_id)
+    async with pool.acquire() as conn:
+        owner_row = await conn.fetchrow(
+            "select account_id from cameras where id = $1",
+            camera_id,
+        )
+    if owner_row is None or owner_row["account_id"] != scope_account:
+        raise NotFoundError("Camera not found.", code="camera_not_found")
+
+    if caller.user is not None:
+        subject = str(caller.user.user_id)
+    else:
+        assert caller.agent is not None
+        subject = f"agent-token:{caller.agent.token_id}"
+
+    now = int(time.time())
+    expires_at = now + settings.fanout_token_ttl_seconds
+    token = mint_fanout_token(
+        camera_id=str(camera_id),
+        account_id=str(scope_account),
+        subject=subject,
+        issued_at=now,
+        expires_at=expires_at,
+        secret=settings.fanout_token_secret.get_secret_value(),
+    )
+    return PerceptionStreamTokenResponse(
+        token=token,
+        ws_url=f"{settings.fanout_public_ws_url.rstrip('/')}/v1/subscribe",
+        expires_at=datetime.fromtimestamp(expires_at, tz=UTC),
     )
 
 
