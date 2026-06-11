@@ -2127,3 +2127,58 @@ evaluator stats response gains `sequence_runs_expired`.
 
 `WorkflowRunSummary` gains `workflow_id` (null on rule runs) and
 `deadline_at` (set while an active sequence run is waiting).
+
+## Module 7 M1 — Usage + Billing Foundation
+
+First production usage/billing surface: a usage summary read API and
+enforcement of the (previously display-only) monthly streaming minutes
+quota. Intentionally deferred: Stripe (M2), a plans table, monthly
+rollups, and processor/compute minutes (not tracked anywhere — never
+invented). **No migration required** — everything reads existing tables.
+
+### `GET /v1/usage/summary?account_id=` (auth: `current_user`, any member)
+
+```json
+{
+  "plan": {"key": "free", "label": "Free", "status": "active"},
+  "period": {"start": "2026-06-01T00:00:00Z", "end": "2026-07-01T00:00:00Z"},
+  "limits": {"max_cameras": 5, "max_concurrent_sessions": 5,
+              "monthly_minutes_quota": 600,
+              "allowed_stream_types": ["rtsp", "webcam"]},
+  "usage": {"cameras": 2, "active_streams": 1, "stream_minutes": 430,
+             "workflow_runs": 1204, "alerts": 86, "rules": 4, "workflows": 1},
+  "states": {"cameras": "ok", "active_streams": "ok",
+              "stream_minutes": "near_limit"}
+}
+```
+
+- Period = current UTC calendar month (`date_trunc('month')` convention,
+  same as agent bootstrap).
+- Every counter reuses the predicate of the code that owns it: cameras
+  `status <> 'disabled'` (max_cameras enforcement), active_streams
+  `state in ('approved','streaming')` (session enforcement),
+  stream_minutes = sum of usage_events **`session_ended` only** // 60
+  (bootstrap convention; `stream_seconds` events report the SAME durations
+  from the streaming-server side and must never be added). Completed
+  sessions only — an active session counts when it ends.
+- workflow_runs/alerts are period counts; rules/workflows are ALL current
+  definitions (no soft delete exists).
+- `plan.label` is a title-cased copy of `accounts.plan` (no plans table).
+- States: `ok` < 80%, `near_limit` >= 80%, `at_limit` == 100%,
+  `over_limit` > 100%; a null limit would read `ok` (unlimited), a
+  zero/negative limit reads at/over.
+- 404 `account_limits_missing` when the account or its limits row is gone.
+
+### Monthly minutes quota enforcement
+
+`check_session_start` now rejects session creation once COMPLETED stream
+minutes this period reach `account_limits.monthly_minutes_quota`:
+
+- 403 **`limit_exceeded.monthly_minutes_quota`** with details
+  `{limit, used, period_start, period_end}` (minutes, ISO timestamps).
+- Same minutes source as the summary (`session_ended` only). Documented
+  softness: an account near the cap can start one final session and
+  overshoot by its length — acceptable for a coarse cost-control cap.
+- A quota of 0 blocks all session starts (no 0-means-unlimited convention
+  in this codebase). All pre-existing checks (concurrent sessions, stream
+  type, codec/fps/resolution/bitrate) are unchanged and run as before.

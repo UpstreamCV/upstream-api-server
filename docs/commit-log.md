@@ -4,6 +4,51 @@ Reverse chronological. Newest at top. Every meaningful commit gets an entry foll
 
 ---
 
+## 2026-06-11 - Module 7 M1: usage summary API + monthly minutes quota enforcement
+
+### Summary
+First production usage/billing surface. New `GET /v1/usage/summary`
+(user auth, any member) returns plan (title-cased accounts.plan — no
+plans table yet), the current UTC calendar-month period, account limits,
+reliable usage counters, and ok/near_limit/at_limit/over_limit states
+(80%/100% thresholds). Every counter reuses the owning predicate:
+cameras `status <> 'disabled'`, active streams
+`state in ('approved','streaming')`, stream minutes = usage_events
+`session_ended` sum // 60 (the bootstrap convention; `stream_seconds`
+is the streaming-server's duplicate report of the same durations and is
+never added). Completed sessions only — documented undercount while a
+session is live. workflow_runs/alerts counted per period; rules/workflows
+are all current definitions.
+
+Also enforces the day-one-but-never-enforced
+`account_limits.monthly_minutes_quota` at session start: 403
+`limit_exceeded.monthly_minutes_quota` with {limit, used, period_start,
+period_end} once completed minutes reach the quota. Quota 0 = no
+streaming allowed (consistent with other limits). Deliberately deferred:
+Stripe (M2), plans table, rollups, processor minutes (not tracked). No
+migration needed.
+
+### Files touched
+- `src/upstream_api/schemas/usage.py` (response models + usage_state)
+- `src/upstream_api/services/usage_summary.py` (aggregation),
+  `services/usage.py` (+current_usage_period), `services/limits.py`
+  (+check_monthly_minutes_quota in check_session_start)
+- `src/upstream_api/routers/usage.py`, `app.py`
+- `tests/test_usage_summary.py` (39: state table, period math, summary
+  shape/counts/states/label, tenancy + viewer read + unauthenticated,
+  missing-limits 404, SQL pinning, quota allow/reject/zero/round-down,
+  existing checks preserved)
+
+### Testing/checks
+`make test` — 1040 passed (+39). `make lint` + `uv run mypy src` clean.
+
+### Follow-up TODOs
+- M2: Stripe (customer/subscription fields, checkout/portal, webhook
+  sync), plan-driven limits.
+- Processor-minutes usage event before showing compute usage.
+- Consider counting elapsed time of active sessions if the overshoot
+  softness ever matters at real quotas.
+
 ## 2026-06-10 - Workflow Engine M5: multi-step sequencing (A → B within N seconds)
 
 ### Summary
