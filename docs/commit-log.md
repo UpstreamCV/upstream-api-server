@@ -4,6 +4,55 @@ Reverse chronological. Newest at top. Every meaningful commit gets an entry foll
 
 ---
 
+## 2026-06-11 - Module 7 M2: Stripe Checkout + Customer Portal
+
+### Summary
+First real subscription flow, Stripe-hosted end to end (no card data ever
+touches Upstream; only customer/subscription/price IDs are stored). New
+`account_billing` table (1:1, nullable Stripe refs + subscription state)
++ `stripe_events` idempotency ledger. POST /v1/billing/checkout
+(owner/admin -> subscription-mode Checkout Session, customer created on
+first use, account_id/plan_key stamped in session AND subscription
+metadata) and /v1/billing/portal (409 billing_no_customer before first
+checkout). POST /v1/webhooks/stripe authenticates via Stripe-Signature
+over the RAW body, dedupes by event id (insert-on-conflict guard), and
+syncs: active/trialing + known price overwrite accounts.plan +
+account_limits from the plan mapping (services/plans.py — placeholder
+limits; free mirrors signup defaults); deleted downgrades to free
+(nothing is ever deleted); cancel_at_period_end and past_due record
+state without touching limits (grace). checkout.session.completed
+re-fetches the subscription from Stripe rather than trusting the partial
+payload; period fields read item-level current_period_* with top-level
+fallback (both Stripe API shapes). Usage summary gains a `billing` block
+(derived status + management_available; no Stripe IDs exposed). All env
+optional: unconfigured deployments 503 billing_not_configured.
+
+### Files touched
+- `supabase/migrations/20260616120000_account_billing.sql`
+- `src/upstream_api/config.py` (5 optional Stripe settings)
+- `src/upstream_api/services/stripe_gateway.py` (injectable SDK wrapper,
+  to_thread), `services/plans.py` (plan->limits mapping + apply),
+  `services/billing.py` (persistence + sync contract),
+  `services/usage_summary.py` (billing block)
+- `src/upstream_api/routers/billing.py`, `routers/stripe_webhooks.py`,
+  `app.py`, `schemas/usage.py` (BillingSummary)
+- `tests/test_billing_api.py` (30: auth/roles/tenancy, plan validation,
+  customer create/reuse, URLs, signature, duplicate delivery, plan
+  apply/downgrade/grace/unmapped-price, payment_failed, billing block
+  derivation); test_usage_summary.py billing-aware
+- `pyproject.toml` (+stripe)
+
+### Testing/checks
+`make test` — 1070 passed (+30). `make lint` + `uv run mypy src` clean.
+No real Stripe calls in tests (gateway dependency overridden).
+
+### Follow-up TODOs
+- Pricing/limit values in services/plans.py are placeholders pending a
+  product decision.
+- Stripe Customer Portal must be enabled once in the Stripe dashboard.
+- M3+: metered/usage-based billing, invoice history, plans table if
+  plan count grows.
+
 ## 2026-06-11 - Module 7 M1: usage summary API + monthly minutes quota enforcement
 
 ### Summary

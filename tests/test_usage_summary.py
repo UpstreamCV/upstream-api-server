@@ -84,9 +84,11 @@ class FakeConn:
         *,
         account_row: dict[str, Any] | None,
         usage_row: dict[str, Any],
+        billing_row: dict[str, Any] | None = None,
     ) -> None:
         self.account_row = account_row
         self.usage_row = usage_row
+        self.billing_row = billing_row
         self.usage_args: tuple[Any, ...] | None = None
 
     async def fetchrow(self, query: str, *args: Any) -> dict[str, Any] | None:
@@ -95,6 +97,8 @@ class FakeConn:
         if "stream_seconds_completed" in query:
             self.usage_args = args
             return self.usage_row
+        if "from account_billing" in query:
+            return self.billing_row
         raise AssertionError(f"unexpected fetchrow: {query}")
 
 
@@ -162,7 +166,7 @@ def test_summary_shape_and_values() -> None:
     r = _client(conn, _user(account)).get("/v1/usage/summary", params={"account_id": str(account)})
     assert r.status_code == 200, r.text
     body = r.json()
-    assert set(body) == {"plan", "period", "limits", "usage", "states"}
+    assert set(body) == {"plan", "period", "limits", "usage", "states", "billing"}
     assert body["plan"] == {"key": "free", "label": "Free", "status": "active"}
     assert body["limits"] == {
         "max_cameras": 5,

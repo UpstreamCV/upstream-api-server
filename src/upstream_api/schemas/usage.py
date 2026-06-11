@@ -57,12 +57,32 @@ class UsageStates(BaseModel):
     stream_minutes: UsageState
 
 
+class BillingSummary(BaseModel):
+    """Module 7 M2. Stripe identifiers are deliberately NOT exposed here —
+    the dashboard only needs states and capabilities."""
+
+    provider: Literal["stripe"] = "stripe"
+    # False when the deployment has no Stripe keys: the dashboard renders
+    # its "coming soon" fallback instead of Upgrade buttons.
+    configured: bool
+    # Derived: none | active | trialing | past_due | canceled.
+    status: str
+    # Raw Stripe subscription status (null before first checkout).
+    subscription_status: str | None
+    current_period_start: datetime | None
+    current_period_end: datetime | None
+    cancel_at_period_end: bool
+    # True when a Stripe customer exists -> Manage Billing can open the Portal.
+    management_available: bool
+
+
 class UsageSummaryResponse(BaseModel):
     plan: PlanSummary
     period: UsagePeriod
     limits: UsageLimits
     usage: UsageCounters
     states: UsageStates
+    billing: BillingSummary
 
 
 def usage_state(used: int, limit: int | None) -> UsageState:

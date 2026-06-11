@@ -27,6 +27,7 @@ from upstream_api.routers import (
     agents,
     alerts,
     api_tokens,
+    billing,
     cameras,
     dashboard,
     heartbeats,
@@ -37,6 +38,7 @@ from upstream_api.routers import (
     rules,
     snapshots,
     stream_sessions,
+    stripe_webhooks,
     usage,
     users,
     workflow_evaluator,
@@ -139,5 +141,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(workflow_evaluator.router)  # /v1/internal/workflow-evaluator (M4)
     app.include_router(workflows.router)  # /v1/workflows (Workflow Engine M5)
     app.include_router(usage.router)  # /v1/usage (Module 7 M1)
+    app.include_router(billing.router)  # /v1/billing (Module 7 M2)
+    app.include_router(stripe_webhooks.router)  # /v1/webhooks/stripe (Module 7 M2)
 
     return app

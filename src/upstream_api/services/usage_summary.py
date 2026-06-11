@@ -25,8 +25,10 @@ from uuid import UUID
 
 import asyncpg
 
+from upstream_api.config import get_settings
 from upstream_api.errors import NotFoundError
 from upstream_api.schemas.usage import (
+    BillingSummary,
     PlanSummary,
     UsageCounters,
     UsageLimits,
@@ -35,6 +37,7 @@ from upstream_api.schemas.usage import (
     UsageSummaryResponse,
     usage_state,
 )
+from upstream_api.services.billing import get_billing_row
 from upstream_api.services.usage import current_usage_period
 
 _ACCOUNT_AND_LIMITS_SQL = """
@@ -69,6 +72,35 @@ select
 """
 
 
+def _derive_billing(billing_row: dict[str, Any] | None) -> BillingSummary:
+    """Module 7 M2. Derived status: 'none' before any subscription exists;
+    active/trialing pass through; past_due covers every payment-trouble
+    Stripe status; canceled after the subscription is deleted."""
+    configured = get_settings().stripe_secret_key is not None
+    raw = billing_row.get("stripe_subscription_status") if billing_row else None
+    customer = billing_row.get("stripe_customer_id") if billing_row else None
+    has_subscription = bool(billing_row and billing_row.get("stripe_subscription_id"))
+    if not has_subscription or raw is None:
+        status = "none"
+    elif raw in ("active", "trialing"):
+        status = raw
+    elif raw == "canceled":
+        status = "canceled"
+    else:  # past_due, unpaid, incomplete, incomplete_expired, paused, ...
+        status = "past_due"
+    return BillingSummary(
+        configured=configured,
+        status=status,
+        subscription_status=raw,
+        current_period_start=(billing_row.get("current_period_start") if billing_row else None),
+        current_period_end=(billing_row.get("current_period_end") if billing_row else None),
+        cancel_at_period_end=bool(
+            billing_row.get("cancel_at_period_end") if billing_row else False
+        ),
+        management_available=configured and bool(customer),
+    )
+
+
 async def build_usage_summary(
     conn: asyncpg.Connection,
     *,
@@ -87,6 +119,7 @@ async def build_usage_summary(
         _USAGE_COUNTERS_SQL, account_id, period_start, period_end
     )
     assert usage_row is not None  # aggregate select always returns one row
+    billing_row = await get_billing_row(conn, account_id)
 
     plan_key = account_row["plan"] or "free"
     stream_minutes = int(usage_row["stream_seconds_completed"]) // 60
@@ -114,6 +147,7 @@ async def build_usage_summary(
         period=UsagePeriod(start=period_start, end=period_end),
         limits=limits,
         usage=usage,
+        billing=_derive_billing(billing_row),
         states=UsageStates(
             cameras=usage_state(usage.cameras, limits.max_cameras),
             active_streams=usage_state(usage.active_streams, limits.max_concurrent_sessions),
