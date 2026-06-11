@@ -4,6 +4,524 @@ Reverse chronological. Newest at top. Every meaningful commit gets an entry foll
 
 ---
 
+## 2026-06-11 - merge: main into feat/platform-admin-panel (admin surface rebased onto Module 7 + Workflow Engine)
+
+### Summary
+Conflict resolution for the platform-admin PR after main gained the Workflow
+Engine (M1–M5), stream types/web cameras, and Module 7 (usage quota
+enforcement + Stripe). Both feature sets are additive and coexist.
+
+### Files touched
+- `src/upstream_api/app.py` — keep both router blocks (rules/alerts/workflow/
+  usage/billing/stripe AND platform_admin).
+- `src/upstream_api/services/limits.py` — union of imports;
+  `check_account_active` (admin suspension gate) now runs first in
+  `check_session_start`, before main's stream-type and monthly-quota checks.
+- `supabase/migrations/20260617120000_platform_admins.sql` — RENAMED from
+  20260610130000: prod's migration head is 20260616120000 (account_billing),
+  and `db push` rejects out-of-order local migrations, so the admin migration
+  must sort after it. Content unchanged.
+- `tests/test_usage_summary.py` — Module 7 quota fakes answer the new
+  `select status from accounts` query with 'active'.
+- `docs/commit-log.md` — both sides' entries kept, newest first;
+  `docs/module-map.md` — migration entry updated/moved.
+
+### Testing/checks
+`pytest` 1108 passed; `ruff check` + `format --check` clean; `make db-reset`
+replays the merged migration chain. mypy: 47 pre-existing errors in five of
+main's new test files (identical on origin/main — verified against the
+pristine copies); none introduced by this merge.
+
+---
+
+## 2026-06-11 - Module 7 M2: Stripe Checkout + Customer Portal
+
+### Summary
+First real subscription flow, Stripe-hosted end to end (no card data ever
+touches Upstream; only customer/subscription/price IDs are stored). New
+`account_billing` table (1:1, nullable Stripe refs + subscription state)
++ `stripe_events` idempotency ledger. POST /v1/billing/checkout
+(owner/admin -> subscription-mode Checkout Session, customer created on
+first use, account_id/plan_key stamped in session AND subscription
+metadata) and /v1/billing/portal (409 billing_no_customer before first
+checkout). POST /v1/webhooks/stripe authenticates via Stripe-Signature
+over the RAW body, dedupes by event id (insert-on-conflict guard), and
+syncs: active/trialing + known price overwrite accounts.plan +
+account_limits from the plan mapping (services/plans.py — placeholder
+limits; free mirrors signup defaults); deleted downgrades to free
+(nothing is ever deleted); cancel_at_period_end and past_due record
+state without touching limits (grace). checkout.session.completed
+re-fetches the subscription from Stripe rather than trusting the partial
+payload; period fields read item-level current_period_* with top-level
+fallback (both Stripe API shapes). Usage summary gains a `billing` block
+(derived status + management_available; no Stripe IDs exposed). All env
+optional: unconfigured deployments 503 billing_not_configured.
+
+### Files touched
+- `supabase/migrations/20260616120000_account_billing.sql`
+- `src/upstream_api/config.py` (5 optional Stripe settings)
+- `src/upstream_api/services/stripe_gateway.py` (injectable SDK wrapper,
+  to_thread), `services/plans.py` (plan->limits mapping + apply),
+  `services/billing.py` (persistence + sync contract),
+  `services/usage_summary.py` (billing block)
+- `src/upstream_api/routers/billing.py`, `routers/stripe_webhooks.py`,
+  `app.py`, `schemas/usage.py` (BillingSummary)
+- `tests/test_billing_api.py` (30: auth/roles/tenancy, plan validation,
+  customer create/reuse, URLs, signature, duplicate delivery, plan
+  apply/downgrade/grace/unmapped-price, payment_failed, billing block
+  derivation); test_usage_summary.py billing-aware
+- `pyproject.toml` (+stripe)
+
+### Testing/checks
+`make test` — 1070 passed (+30). `make lint` + `uv run mypy src` clean.
+No real Stripe calls in tests (gateway dependency overridden).
+
+### Follow-up TODOs
+- Pricing/limit values in services/plans.py are placeholders pending a
+  product decision.
+- Stripe Customer Portal must be enabled once in the Stripe dashboard.
+- M3+: metered/usage-based billing, invoice history, plans table if
+  plan count grows.
+
+## 2026-06-11 - Module 7 M1: usage summary API + monthly minutes quota enforcement
+
+### Summary
+First production usage/billing surface. New `GET /v1/usage/summary`
+(user auth, any member) returns plan (title-cased accounts.plan — no
+plans table yet), the current UTC calendar-month period, account limits,
+reliable usage counters, and ok/near_limit/at_limit/over_limit states
+(80%/100% thresholds). Every counter reuses the owning predicate:
+cameras `status <> 'disabled'`, active streams
+`state in ('approved','streaming')`, stream minutes = usage_events
+`session_ended` sum // 60 (the bootstrap convention; `stream_seconds`
+is the streaming-server's duplicate report of the same durations and is
+never added). Completed sessions only — documented undercount while a
+session is live. workflow_runs/alerts counted per period; rules/workflows
+are all current definitions.
+
+Also enforces the day-one-but-never-enforced
+`account_limits.monthly_minutes_quota` at session start: 403
+`limit_exceeded.monthly_minutes_quota` with {limit, used, period_start,
+period_end} once completed minutes reach the quota. Quota 0 = no
+streaming allowed (consistent with other limits). Deliberately deferred:
+Stripe (M2), plans table, rollups, processor minutes (not tracked). No
+migration needed.
+
+### Files touched
+- `src/upstream_api/schemas/usage.py` (response models + usage_state)
+- `src/upstream_api/services/usage_summary.py` (aggregation),
+  `services/usage.py` (+current_usage_period), `services/limits.py`
+  (+check_monthly_minutes_quota in check_session_start)
+- `src/upstream_api/routers/usage.py`, `app.py`
+- `tests/test_usage_summary.py` (39: state table, period math, summary
+  shape/counts/states/label, tenancy + viewer read + unauthenticated,
+  missing-limits 404, SQL pinning, quota allow/reject/zero/round-down,
+  existing checks preserved)
+
+### Testing/checks
+`make test` — 1040 passed (+39). `make lint` + `uv run mypy src` clean.
+
+### Follow-up TODOs
+- M2: Stripe (customer/subscription fields, checkout/portal, webhook
+  sync), plan-driven limits.
+- Processor-minutes usage event before showing compute usage.
+- Consider counting elapsed time of active sessions if the overshoot
+  softness ever matters at real quotas.
+
+## 2026-06-10 - Workflow Engine M5: multi-step sequencing (A → B within N seconds)
+
+### Summary
+The first real multi-step capability and the point where workflows become
+a TOP-LEVEL product object: a new `workflows` table holds sequence
+definitions (start event → expected follow-up within a window, optional
+same-track correlation, on_success/on_timeout outcomes, M3 schedule);
+the `rules` table remains the M1-M4 simple/timer layer untouched.
+Execution state rides the existing `workflow_runs` table with three new
+nullable columns (workflow_id / deadline_at / dedupe_key) — no steps table
+needed for two steps (evidence jsonb holds {start, follow_up|timeout}).
+
+Sequencer (services/workflow_sequencer.py) runs at observation ingest in
+its OWN savepoint after rule evaluation: completions first (guarded
+UPDATE where status='active' — single-shot), then starts (guarded INSERT —
+NOT EXISTS active run per (workflow, dedupe_key), dedupe_key = the start
+observation's processor idempotency key; duplicate deliveries can't
+double-start, distinct physical starts run in parallel). Timeouts close in
+the M4 evaluator loop: guarded fail UPDATE + timeout alert
+(on_timeout.create_alert defaults true), cooldown-guarded ACROSS runs of
+the same workflow via an alerts→workflow_runs join (alerts carry no
+workflow column). Strict authoring validation mirrors the M3 availability
+posture (per-event-type condition keys; same_track_id requires both event
+types track-attributing; within_seconds 5-86400; discrete event types
+only).
+
+### Files touched
+- `supabase/migrations/20260614120000_workflows.sql`
+- `src/upstream_api/schemas/workflows.py` (+ validate_sequence_config)
+- `src/upstream_api/services/workflows.py` (CRUD),
+  `services/workflow_sequencer.py` (start/complete + step matcher),
+  `services/workflow_evaluator.py` (expiry sweep + sequence_runs_expired
+  stat), `services/workflow_runs.py` (+workflow_id/deadline_at columns on
+  reads)
+- `src/upstream_api/routers/workflows.py` (CRUD),
+  `routers/processor.py` (_evaluate_sequences_safe savepoint),
+  `routers/workflow_evaluator.py` (stats field),
+  `routers/workflow_runs.py` (summary fields), `app.py`
+- tests: `tests/test_workflow_sequencer.py` (53: validation truth table,
+  step matcher, start/dedupe/complete/track/deadline, timeout + alert
+  opt-out + no-respam + cross-run cooldown, ingest savepoint contract,
+  /v1/workflows CRUD + roles + tenancy, SQL pinning); updated pinned
+  shapes in test_workflow_runs_api.py + test_workflow_evaluator.py.
+
+### Testing/checks
+`make test` — 1001 passed (+53). `make lint` + `uv run mypy src` clean.
+All M1-M4 suites unchanged and passing (ingest path untouched except the
+added savepoint; no observation type behavior changed).
+
+### Follow-up TODOs
+- >2 steps / branching (a workflow_run_steps table when needed),
+  cross-camera scope, visual builder, recovery/auto-resolve, delivery
+  channels — all deferred by design.
+- Active sequence runs are bounded by start-event volume; if a workflow
+  with no follow-up ever floods, a per-workflow active-run cap is the knob.
+
+## 2026-06-10 - Workflow Engine M4: time-based evaluator (camera_offline, no_detections_for)
+
+### Summary
+First periodic evaluation path. Two new rule types on the existing rules
+system — `camera_offline` (no active session + no heartbeat within
+threshold; never-heartbeated cameras match; disabled cameras skipped) and
+`no_detections_for` (gated on an active streaming session; quiet clock
+anchored at max(last matching observation, session start) so fresh
+sessions never instant-fire; optional observation_types/object_classes
+with the class-attributing constraint). Evaluated by
+services/workflow_evaluator.py — a service function driven by an optional
+in-process lifespan loop (UPSTREAM_WORKFLOW_EVALUATOR_INTERVAL_SECONDS,
+default 60, 0 disables) and an internal endpoint
+POST /v1/internal/workflow-evaluator/run (processor shared-secret auth).
+
+Firing semantics deliberately differ from event rules: the run INSERT
+carries a NOT EXISTS re-fire guard keyed on (rule_id, cooldown window) —
+cooldown is the re-fire interval while the condition persists, ticks
+inside the window create nothing (no suppressed-run flooding), and timer
+rules require cooldown >= 60s at authoring. Duplicate prevention is the
+same best-effort single-statement posture as the M1 alert guard
+(single-instance deployment; documented). Fired runs:
+workflow_type='time_based_rule', trigger_type='timer.<rule_type>',
+evidence with last_seen/threshold/quiet facts, linked alert as usual. No
+migration. The observation-ingest path is untouched (no observation type
+maps to timer rules — test-pinned).
+
+### Files touched
+- `src/upstream_api/schemas/rules.py` — new types, duration bounds
+  (60..604800), observation_types whitelist + class-attributing
+  constraint, validate_rule_cooldown (timer floor 60s).
+- `src/upstream_api/services/workflow_evaluator.py` — condition checks
+  (fail closed on anything unprovable), guarded run insert, alert + run
+  finalize reuse, EvaluatorStats, workflow_evaluator_loop.
+- `src/upstream_api/routers/workflow_evaluator.py` + `app.py` — internal
+  endpoint + config-gated lifespan task (cancelled on shutdown).
+- `src/upstream_api/routers/rules.py` — cooldown floor on create/patch.
+- `src/upstream_api/config.py` — workflow_evaluator_interval_seconds.
+- tests: `tests/test_workflow_evaluator.py` (23: conditions, firing,
+  re-fire guard, schedule gating, per-rule error isolation, endpoint auth
+  + stats shape, SQL pinning); test_rule_evaluation.py (+validation,
+  ingest isolation); test_rules_api.py (+timer create, cooldown floor).
+
+### Testing/checks
+`make test` — 948 passed (+48). `make lint` + `uv run mypy src` clean.
+
+### Follow-up TODOs
+- occupancy_above_for (needs continuous state tracking) — deferred.
+- Multi-instance evaluator leadership (advisory lock) if the deployment
+  ever scales past one api-server replica.
+- Auto-resolve: a run/alert when the condition CLEARS (camera back
+  online) — natural M5 candidate alongside sequencing.
+
+## 2026-06-10 - Per-object line crossing: accept new type, partition matcher, unlock line conditions
+
+### Summary
+Consumer half of the processor side task "Per-Object Line Crossing
+Producer". Accepts `processor.line_crossing_object` (lock-step Literal
+widening), maps it to the `line_crossing` rule family, and partitions the
+matcher on payload `event_mode` so one physical crossing — which now
+produces BOTH an aggregate count event and a per-object evidence event —
+fires any given rule at most once: per-object-conditioned rules
+(`object_classes` / `require_track_id` / `min_confidence`, newly allowed on
+line_crossing) match only per-object events; plain rules keep their exact
+pre-existing aggregate behavior. Direction filters stay deferred
+(`analytics_direction_label` is a direction-rule name, not a_to_b).
+
+### Files touched
+- `src/upstream_api/schemas/processor.py` — ProcessorObservationType +=
+  processor.line_crossing_object.
+- `src/upstream_api/services/rules.py` — observation-type mapping; matcher
+  partition + per-object condition checks on the line_crossing branch.
+- `src/upstream_api/schemas/rules.py` — line_crossing allowed keys +=
+  the three per-object conditions; availability comments updated.
+- `tests/test_rule_evaluation.py` — +15: partition truth table (plain vs
+  conditioned x aggregate vs object events, missing-field no-match),
+  validation moves, and two integration tests: one physical crossing
+  (both observations) against both rule styles → exactly one run + alert
+  per rule; a conditioned rule alone ignores aggregate events entirely.
+- `docs/api-contracts.md` — "per-object line crossing unlock" section.
+
+### Testing/checks
+`make test` — 900 passed. `make lint` + `uv run mypy src` clean. No
+migration; savepoint ingest contract untouched (still test-pinned).
+
+## 2026-06-10 - Payload-enrichment unlock: min_confidence + object_class count bounds
+
+### Summary
+Consumer half of the processor side task "Workflow Condition Payload
+Enrichment" (upstream-processor enriches zone/dwell payloads with per-object
+`confidence` and populates object-attributed `class_counts` on ROI
+occupancy). Unlocks two conditions M3 deferred: `min_confidence` on
+zone_entered/dwell_exceeded (inclusive threshold in (0, 1]; missing
+confidence never matches — the processor omits it when the track wasn't
+detected in the triggering frame) and `object_class` on roi_occupancy
+(scopes min/max_total_count to that class's count; no class_counts dict →
+no match; absent class counts as zero, safe because min's floor is 1, so
+pre-enrichment events can never match). Still deferred honestly: all
+line_crossing conditions beyond line_id + schedule (cumulative counters
+have no per-object attribution — per-object producer is the documented
+processor follow-up).
+
+### Files touched
+- `src/upstream_api/schemas/rules.py` — allowed-key maps (+min_confidence on
+  zone/dwell, +object_class on roi) + value validators; availability
+  rationale updated.
+- `src/upstream_api/services/rules.py` — `_confidence_ok` helper;
+  roi matcher counts against `class_counts[object_class]` when set.
+- `tests/test_rule_evaluation.py` — +30 truth-table/validation cases
+  (inclusive threshold, missing/odd confidence, class-scoped bounds,
+  empty/missing breakdown, composition with M3 conditions, rejected keys on
+  unprovable types).
+- `docs/api-contracts.md` — M3 deferral list amended + "payload-enrichment
+  unlock" section.
+
+### Testing/checks
+`make test` — 885 passed (+30). `make lint` + `uv run mypy src` clean.
+No migration (config is jsonb; observation payloads are open-shape JSON —
+old observations ingest unchanged, the savepoint contract is untouched).
+
+### Follow-up TODOs
+- Per-object line-crossing producer in the processor → unlocks
+  direction/class/track/confidence on line_crossing.
+
+## 2026-06-10 - Workflow Engine M3: richer rule conditions
+
+### Summary
+Third milestone of the Workflow Engine track. Makes one-step rules more
+expressive WITHOUT multi-step sequencing: object-class filters and
+require_track_id (zone_entered + dwell_exceeded), max_total_count bounds
+(roi_occupancy), and schedule time-window gating (all types, evaluated
+inline from the observation timestamp — no periodic evaluator). Conditions
+are allowed only on rule types whose PRODUCTION observation payloads can
+prove the needed field (audited in the DeepStream worker, not just the
+payload contract): zone/dwell events carry class_label + track_id; line
+crossings are cumulative direction-blind counters with no per-object
+attribution; ROI counts are cross-class aggregates. min_confidence and
+direction are deferred with documented processor follow-ups rather than
+faked. No migration; no new endpoints; M1/M2 rules unchanged; M2 run
+snapshots automatically capture the richer config.
+
+### Files touched
+- `src/upstream_api/schemas/rules.py` — per-type allowed-key map extended
+  (object_classes / require_track_id / max_total_count / schedule);
+  validators for each (class list 1-20 unique non-empty; max >= min;
+  schedule: HH:MM times, distinct, IANA timezone via ZoneInfo, unique day
+  keys); availability rationale documented inline.
+- `src/upstream_api/services/rules.py` — matcher gains `_classes_allowed` /
+  `_track_ok` (zone/dwell), max_total_count bound (roi); new pure
+  `schedule_allows` (timezone conversion, start-inclusive/end-exclusive,
+  overnight wrap where the tail belongs to the window's start day, naive
+  timestamps treated as UTC, malformed stored schedules degrade to
+  no-match — never raise inside the ingest savepoint).
+  `evaluate_observation` takes `observed_at` and gates on the schedule
+  before matching; out-of-window = NON-MATCH (no run, no alert).
+- `src/upstream_api/routers/processor.py` — passes `body.observed_at`.
+- `tests/test_rule_evaluation.py` — truth table +25 cases (class/track/
+  count bounds incl. missing-field no-match), 12 schedule_allows tests
+  (bounds, days default, timezone, overnight wrap, malformed degrade),
+  validation +30 cases (incl. conditions rejected on unprovable types and
+  deferred keys), 2 integration tests (out-of-schedule creates no run/alert;
+  in-schedule richer rule creates run with full config snapshot + linked
+  alert).
+- `docs/api-contracts.md` — "Workflow Engine M3" section with the
+  availability table and deferral reasons.
+
+### System interaction notes
+Same ingest path as M2; the only flow change is
+`schedule_allows(config, observed_at)` running before `rule_matches` per
+rule. The savepoint contract is untouched (route-level test still pins it).
+
+### Testing/checks
+`make test` — 855 passed (67 new). `make lint` clean; `uv run mypy src`
+clean. No live-DB step needed (no migration).
+
+### Follow-up TODOs
+- Processor: stamp per-detection `confidence` onto zone/dwell payloads →
+  unlocks `min_confidence`.
+- Processor: per-object line-crossing attribution (class/track/direction)
+  → unlocks those conditions on line_crossing.
+- Processor: per-class ROI counts → unlocks class-specific occupancy
+  thresholds.
+- DST edge: schedule windows during a skipped/repeated local hour follow
+  ZoneInfo's mapping; acceptable for M3, document if users hit it.
+
+## 2026-06-10 - Workflow Engine M2: workflow runs + internal event history
+
+### Summary
+Second milestone of the Workflow Engine product track (NOT a reliability
+milestone, and not an alerts feature). M1 — originally labeled
+"Rules/Triggers M1", re-labeled "Workflow Engine M1 — Simple Rules + In-App
+Alerts" — made rules send alerts. M2 makes Upstream the system of record for
+camera workflows: every rule match now produces a `workflow_run` with
+evidence (the triggering observation payload), a rule-definition snapshot,
+status, and action outcome — recorded whether or not an alert was sent. A
+cooldown-suppressed match still produces a run
+(suppressed/alert_suppressed_cooldown); alerts are now one action/output of
+a run, linked via `alerts.workflow_run_id`. The rules table acts as the
+workflow definition layer (`workflow_type='simple_rule'`) — no separate
+workflows table, no M1 rename/refactor.
+
+### Files touched
+- `supabase/migrations/20260613120000_workflow_runs.sql` — `workflow_runs`
+  table (status CHECK incl. reserved 'failed'/'action_required'; open-vocab
+  workflow_type/trigger_type/action_result; nullable camera_id so future
+  account-wide workflows need no migration; RLS + grant) and
+  `alerts.workflow_run_id` (FK on alerts side — insert-run → insert-alert →
+  finalize-run, no circular reference).
+- `src/upstream_api/schemas/workflow_runs.py` — run summary/list models +
+  `WorkflowRunAlertRef`; read fields are plain `str` where the column is
+  open vocabulary.
+- `src/upstream_api/services/workflow_runs.py` — run lifecycle SQL
+  (insert/finalize, used only by the evaluator) + history reads (left join
+  to the related alert).
+- `src/upstream_api/services/rules.py` — `evaluate_observation` now wraps
+  the alert action in a run: insert run (active) → cooldown-guarded alert
+  insert carrying workflow_run_id → finalize (completed/alert_created or
+  suppressed/alert_suppressed_cooldown). Alert insert SQL renumbered for the
+  new column. Non-matching and disabled rules produce no run.
+- `src/upstream_api/services/alerts.py`, `schemas/alerts.py`,
+  `routers/alerts.py` — alert responses expose `workflow_run_id`.
+- `src/upstream_api/routers/workflow_runs.py` — `GET /v1/workflow-runs`
+  (status/camera/rule/limit filters) + `GET /v1/workflow-runs/{id}`; any
+  member; read-path only.
+- `src/upstream_api/app.py` — register router; M1 router comments
+  re-labeled Workflow Engine M1.
+- `docs/api-contracts.md` — M1 section re-label note + new
+  "Endpoints — Workflow Engine M2" section.
+
+### Functions/classes changed
+- `evaluate_observation` — same matcher, same return value (alerts
+  created); now records a run per match and finalizes it with the action
+  outcome.
+- `insert_workflow_run` / `finalize_workflow_run` — two-step lifecycle so
+  the alert can reference the run id, and so future multi-step workflows
+  can hold runs open across requests.
+
+### System interaction notes
+`current_processor → POST /v1/internal/processor/observations →
+insert_observation → savepoint[rules fetch → rule_matches →
+insert_workflow_run → cooldown-guarded alert insert (workflow_run_id) →
+finalize_workflow_run]`. The M1 savepoint contract is untouched: run and
+alert writes roll back together, and a failing/unmigrated workflow layer
+can never fail observation ingest (route-level test pins this). Dashboard
+reads via `current_user`: `/v1/workflow-runs`.
+
+### Testing/checks
+`make test` — 788 passed (14 new in `tests/test_workflow_runs_api.py`:
+filters, tenancy, member access, invalid status/limit 422s, response shape,
+SQL pinning; `tests/test_rule_evaluation.py` extended: run created with
+evidence + rule snapshot, alert linked to run, cooldown still records a
+suppressed run with no duplicate alert, non-matching/disabled rules record
+nothing, savepoint contract). `make lint` clean; `uv run mypy src` clean.
+Migration not applied to a live DB in this pass — `db push` is a deploy
+step; until then the savepoint absorbs the missing tables.
+
+### Follow-up TODOs
+- `workflow_run_events` step table when multi-step sequencing lands
+  (deferred; evidence/payload jsonb covers M2).
+- Review/acknowledge mutation (`action_required` is reserved in the CHECK
+  but nothing produces it; reviewed_at/reviewed_by columns deferred with it).
+- Multi-step sequencing, multi-camera/account-wide workflows, visual
+  builder, delivery channels — all still deferred by design.
+- Run retention/pruning (same posture as alerts/observations).
+
+## 2026-06-10 - Rules/Triggers M1: user-authored alert rules + alert inbox API
+
+### Summary
+First milestone of the Rules/Triggers + Alerts product track (numbered
+separately from the reliability milestone sequence). Users author per-camera
+rules over processor observations (`line_crossing`, `roi_occupancy`,
+`zone_entered`, `dwell_exceeded`); a matched rule raises an alert with a
+per-rule cooldown. Evaluation runs inline on the observation ingest path,
+savepoint-isolated exactly like the M5 detection-metrics write, so a failing
+(or not-yet-migrated) rules layer can never fail observation ingest. This
+closes the core MVP loop: connect camera → draw geometry → create rule →
+get alert.
+
+### Files touched
+- `supabase/migrations/20260612120000_rules_and_alerts.sql` — `rules` +
+  `alerts` tables; RLS member-select; `GRANT SELECT TO authenticated`;
+  `rule_type` open-vocab at the DB layer (CHECKs only on severity/status,
+  which the dashboard switches on); partial index on enabled rules per
+  camera for the evaluation hot path.
+- `src/upstream_api/schemas/rules.py` — `RuleType` Literal, create/patch/
+  summary models, pure `validate_rule_config` (per-type allowed keys +
+  value checks).
+- `src/upstream_api/schemas/alerts.py` — `AlertSummary`, list response.
+- `src/upstream_api/services/rules.py` — rule CRUD SQL + functions; pure
+  `rule_matches` / `build_alert_message`; `evaluate_observation` (enabled
+  rules fetch → matcher → cooldown-guarded alert insert via same-statement
+  `NOT EXISTS` + `make_interval`).
+- `src/upstream_api/services/alerts.py` — inbox list + idempotent
+  read/resolve transitions (coalesce-once timestamps).
+- `src/upstream_api/routers/rules.py` — `/v1/rules` CRUD; owner/admin
+  mutations, member reads; camera-ownership 404 (anti-enumeration);
+  `rule_type` immutable on PATCH (config re-validated against stored type);
+  422 `invalid_rule_config`.
+- `src/upstream_api/routers/alerts.py` — `/v1/alerts` list (status/camera/
+  limit filters), `POST {id}/read` (any member), `POST {id}/resolve`
+  (owner/admin).
+- `src/upstream_api/routers/processor.py` — `_evaluate_rules_safe` hook in
+  `post_observation` (own savepoint, scalar-id-only warning log).
+- `src/upstream_api/app.py` — register both routers.
+- `docs/api-contracts.md` — new "Endpoints — Rules/Triggers M1" section.
+
+### Functions/classes changed
+- `evaluate_observation` — maps observation type → rule type, fetches
+  enabled rules for the camera, inserts one alert per matching rule unless
+  the rule's latest alert is inside `cooldown_seconds`.
+- `rule_matches` — pure; missing optional filter = match-any; a payload
+  missing a filtered field never matches.
+- `post_observation` — unchanged contract; now best-effort evaluates rules
+  after the observation insert.
+
+### System interaction notes
+`current_processor → POST /v1/internal/processor/observations →
+insert_observation → savepoint[evaluate_observation → rules fetch →
+rule_matches → cooldown-guarded alerts insert]`. Dashboard reads/writes via
+`current_user`: `/v1/rules` (authoring) and `/v1/alerts` (inbox).
+
+### Testing/checks
+`make test` — 774 passed (88 new across `tests/test_rules_api.py`,
+`tests/test_rule_evaluation.py`, `tests/test_alerts_api.py`: CRUD + role
+gating + cross-tenant 404s + config validation; matcher truth table;
+service-level cooldown; route-level savepoint contract; SQL-pinning tests).
+`make lint` clean; `uv run mypy src` clean. Migration not applied to a live
+DB in this pass (no local Supabase running) — `db push` is a deploy step.
+
+### Follow-up TODOs
+- `camera_offline` / `no_detections_for_n_minutes` rule types need a
+  periodic evaluator (none exists; reliability evaluates on-read).
+- Email/webhook delivery (Module 6); the inbox is in-app only.
+- Cooldown guard can double-fire across two concurrent connections; a
+  unique time-bucket key tightens it without an API change.
+- Alert retention/pruning (same posture as heartbeats/observations).
+- Realtime publication for `alerts` if the dashboard wants push instead of
+  the 10s poll.
 ## 2026-06-10 - feat(admin): seed_platform_admin script + Makefile targets
 
 ### Summary
@@ -148,7 +666,7 @@ usage windows, latest-heartbeat-per-session lateral joins, global recent
 sessions).
 
 ### Files touched
-- `supabase/migrations/20260610130000_platform_admins.sql` — new tables
+- `supabase/migrations/20260617120000_platform_admins.sql` — new tables
   `platform_admins` (user_id pk, note, created_by; RLS enabled, zero policies
   so PostgREST exposes nothing) and `admin_audit_log` (admin_user_id, dotted
   `action` vocabulary, target_type/target_id, `{before, after}` payload,

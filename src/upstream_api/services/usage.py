@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
@@ -72,3 +73,22 @@ async def record_event(
         unit,
         "{}" if metadata is None else json.dumps(metadata),
     )
+
+
+def current_usage_period(now: datetime | None = None) -> tuple[datetime, datetime]:
+    """Current calendar-month usage period in UTC: [month start, next month).
+
+    Matches the bootstrap endpoint's ``date_trunc('month', now())``
+    convention. Naive ``now`` is treated as UTC.
+    """
+    moment = now or datetime.now(tz=UTC)
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=UTC)
+    moment = moment.astimezone(UTC)
+    start = moment.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    end = (
+        start.replace(year=start.year + 1, month=1)
+        if start.month == 12
+        else start.replace(month=start.month + 1)
+    )
+    return start, end

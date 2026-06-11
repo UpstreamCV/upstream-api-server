@@ -45,6 +45,29 @@ class Settings(BaseSettings):
     db_pool_min_size: int = 5
     db_pool_max_size: int = 20
 
+    # Workflow Engine M4: interval for the in-process time-based rule
+    # evaluator loop (camera_offline / no_detections_for). 0 disables the
+    # loop entirely — the internal endpoint
+    # (POST /v1/internal/workflow-evaluator/run) still works for external
+    # cron. Single-instance deployments only; with multiple api-server
+    # replicas, disable the loop on all but one (the NOT-EXISTS firing
+    # guard makes overlap safe, but redundant evaluation is wasted work).
+    workflow_evaluator_interval_seconds: int = 60
+
+    # Module 7 M2 — Stripe Checkout + Customer Portal. ALL optional: with
+    # stripe_secret_key unset, /v1/billing/* and /v1/webhooks/stripe return
+    # 503 billing_not_configured and the dashboard shows its "coming soon"
+    # fallback — local/dev deployments need no Stripe account. Env names:
+    # UPSTREAM_STRIPE_SECRET_KEY, UPSTREAM_STRIPE_WEBHOOK_SECRET,
+    # UPSTREAM_STRIPE_PRICE_STARTER_MONTHLY, UPSTREAM_STRIPE_PRICE_PRO_MONTHLY,
+    # UPSTREAM_DASHBOARD_BASE_URL.
+    stripe_secret_key: SecretStr | None = None
+    stripe_webhook_secret: SecretStr | None = None
+    stripe_price_starter_monthly: str | None = None
+    stripe_price_pro_monthly: str | None = None
+    # Where Checkout/Portal send the user back to (no trailing slash).
+    dashboard_base_url: str = "http://localhost:3000"
+
     supabase_storage_bucket: str = "snapshots"
     snapshot_max_bytes: int = 5 * 1024 * 1024  # 5 MB; Caddy must allow >= this on /v1/snapshots
 

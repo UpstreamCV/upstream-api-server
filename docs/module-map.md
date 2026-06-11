@@ -48,7 +48,7 @@ Applied in lexical order. Adding a migration means picking a timestamp strictly 
 - `20260601120000_camera_processing_configs.sql` — model-config M3/M4 `camera_processing_configs` (upsert one model/processing config per camera; `revision` bumps on every save).
 - `20260609120000_processing_config_dimensions.sql` — model-config M9: applied-processing-config dimension columns on the M5/M6 metrics tables (extracted from the processor's lineage stamp at ingest).
 - `20260610120000_processing_fps_dimensions.sql` — model-config M9.1: dedicated `requested_processing_fps` / `applied_processing_fps` dimension columns (M7E output-cadence FPS).
-- `20260610130000_platform_admins.sql` — `platform_admins` allowlist + `admin_audit_log` (both RLS-enabled with zero policies; service-role only) + cross-account aggregate indexes (`usage_events(occurred_at desc)`, ordered heartbeats-per-session, `stream_sessions(created_at desc)`).
+- `20260617120000_platform_admins.sql` — `platform_admins` allowlist + `admin_audit_log` (both RLS-enabled with zero policies; service-role only) + cross-account aggregate indexes (`usage_events(occurred_at desc)`, ordered heartbeats-per-session, `stream_sessions(created_at desc)`).
 
 ## `src/upstream_api/`
 

@@ -2344,6 +2344,19 @@ wheels = [
 ]
 
 [[package]]
+name = "stripe"
+version = "15.2.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "requests" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/d0/28/c3550f39d9e258c21bcba81a89ef3ca7af352ad2cb14fe16b80248841644/stripe-15.2.0.tar.gz", hash = "sha256:f795d8a8ff27433e9ab03099afc0f5c4e992a8a6f92b9f839dc0048bb12f76f6", size = 1520207, upload-time = "2026-05-27T20:34:44.256Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d8/2b/697003ba6349058b65a5cb6b0bd8a8b0e909ed35911f7beebfc24b0563ee/stripe-15.2.0-py3-none-any.whl", hash = "sha256:e74d45bb07bb912fdc4ce81ffbdf184bcb92ce6e210cb7939966e537021c1842", size = 2168459, upload-time = "2026-05-27T20:34:42.312Z" },
+]
+
+[[package]]
 name = "structlog"
 version = "25.5.0"
 source = { registry = "https://pypi.org/simple" }
@@ -2482,6 +2495,7 @@ dependencies = [
     { name = "sentry-sdk", extra = ["fastapi"] },
     { name = "slowapi" },
     { name = "sqlalchemy", extra = ["asyncio"] },
+    { name = "stripe" },
     { name = "structlog" },
     { name = "supabase" },
     { name = "tenacity" },
@@ -2517,6 +2531,7 @@ requires-dist = [
     { name = "sentry-sdk", extras = ["fastapi"], specifier = ">=2.0" },
     { name = "slowapi", specifier = ">=0.1.9" },
     { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0" },
+    { name = "stripe", specifier = ">=15.2.0" },
     { name = "structlog", specifier = ">=24" },
     { name = "supabase", specifier = ">=2.7" },
     { name = "tenacity", specifier = ">=9.0" },
