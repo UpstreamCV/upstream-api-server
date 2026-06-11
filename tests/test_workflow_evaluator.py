@@ -170,7 +170,7 @@ async def test_offline_above_threshold_matches_with_evidence() -> None:
     camera = uuid4()
     conn = FakeConn(last_heartbeat_by_camera={camera: _NOW - timedelta(seconds=420)})
     result = await _check_camera_offline(
-        conn,  # type: ignore[arg-type]
+        conn,
         camera_id=camera,
         config={"offline_for_seconds": 300},
         now=_NOW,
@@ -187,7 +187,7 @@ async def test_offline_below_threshold_does_not_match() -> None:
     conn = FakeConn(last_heartbeat_by_camera={camera: _NOW - timedelta(seconds=100)})
     assert (
         await _check_camera_offline(
-            conn,  # type: ignore[arg-type]
+            conn,
             camera_id=camera,
             config={"offline_for_seconds": 300},
             now=_NOW,
@@ -205,7 +205,7 @@ async def test_active_session_means_online() -> None:
     )
     assert (
         await _check_camera_offline(
-            conn,  # type: ignore[arg-type]
+            conn,
             camera_id=camera,
             config={"offline_for_seconds": 300},
             now=_NOW,
@@ -218,7 +218,7 @@ async def test_never_heartbeated_camera_matches() -> None:
     camera = uuid4()
     conn = FakeConn()
     result = await _check_camera_offline(
-        conn,  # type: ignore[arg-type]
+        conn,
         camera_id=camera,
         config={"offline_for_seconds": 300},
         now=_NOW,
@@ -234,7 +234,7 @@ async def test_malformed_threshold_fails_closed() -> None:
     for bad in ({}, {"offline_for_seconds": "300"}, {"offline_for_seconds": True}):
         assert (
             await _check_camera_offline(
-                conn,  # type: ignore[arg-type]
+                conn,
                 camera_id=camera,
                 config=bad,
                 now=_NOW,
@@ -259,7 +259,7 @@ async def test_quiet_above_threshold_matches() -> None:
         last_observation_by_camera={camera: _NOW - timedelta(seconds=2400)},
     )
     result = await _check_no_detections(
-        conn,  # type: ignore[arg-type]
+        conn,
         camera_id=camera,
         config={"quiet_for_seconds": 1800},
         now=_NOW,
@@ -277,7 +277,7 @@ async def test_recent_observation_prevents_match() -> None:
     )
     assert (
         await _check_no_detections(
-            conn,  # type: ignore[arg-type]
+            conn,
             camera_id=camera,
             config={"quiet_for_seconds": 1800},
             now=_NOW,
@@ -292,7 +292,7 @@ async def test_not_streaming_camera_is_not_quiet() -> None:
     conn = FakeConn(last_observation_by_camera={camera: _NOW - timedelta(hours=9)})
     assert (
         await _check_no_detections(
-            conn,  # type: ignore[arg-type]
+            conn,
             camera_id=camera,
             config={"quiet_for_seconds": 1800},
             now=_NOW,
@@ -312,7 +312,7 @@ async def test_fresh_session_never_instant_fires() -> None:
     )
     assert (
         await _check_no_detections(
-            conn,  # type: ignore[arg-type]
+            conn,
             camera_id=camera,
             config={"quiet_for_seconds": 1800},
             now=_NOW,
@@ -328,7 +328,7 @@ async def test_class_filter_defaults_to_class_attributing_types() -> None:
         last_observation_by_camera={camera: None},
     )
     result = await _check_no_detections(
-        conn,  # type: ignore[arg-type]
+        conn,
         camera_id=camera,
         config={"quiet_for_seconds": 1800, "object_classes": ["person"]},
         now=_NOW,
@@ -351,7 +351,7 @@ async def test_explicit_observation_types_are_forwarded() -> None:
         last_observation_by_camera={camera: None},
     )
     await _check_no_detections(
-        conn,  # type: ignore[arg-type]
+        conn,
         camera_id=camera,
         config={
             "quiet_for_seconds": 1800,
@@ -374,7 +374,7 @@ async def test_offline_rule_fires_run_and_linked_alert() -> None:
         rules=[rule],
         last_heartbeat_by_camera={rule["camera_id"]: _NOW - timedelta(seconds=900)},
     )
-    stats = await run_workflow_evaluator(FakePool(conn), now=_NOW)  # type: ignore[arg-type]
+    stats = await run_workflow_evaluator(FakePool(conn), now=_NOW)
     assert stats.evaluated_rules == 1
     assert stats.matched_rules == 1
     assert stats.workflow_runs_created == 1
@@ -407,7 +407,7 @@ async def test_cooldown_window_creates_nothing_per_tick() -> None:
         last_heartbeat_by_camera={rule["camera_id"]: _NOW - timedelta(seconds=900)},
         rules_in_cooldown={rule["id"]},
     )
-    stats = await run_workflow_evaluator(FakePool(conn), now=_NOW)  # type: ignore[arg-type]
+    stats = await run_workflow_evaluator(FakePool(conn), now=_NOW)
     assert stats.matched_rules == 1
     assert stats.suppressed_by_cooldown == 1
     assert stats.workflow_runs_created == 0
@@ -424,11 +424,11 @@ async def test_repeated_ticks_do_not_spam() -> None:
         last_heartbeat_by_camera={rule["camera_id"]: _NOW - timedelta(seconds=900)},
     )
     pool = FakePool(conn)
-    await run_workflow_evaluator(pool, now=_NOW)  # type: ignore[arg-type]
+    await run_workflow_evaluator(pool, now=_NOW)
     # The fired run now sits inside the cooldown window.
     conn.rules_in_cooldown = {rule["id"]}
     for _ in range(3):
-        await run_workflow_evaluator(pool, now=_NOW)  # type: ignore[arg-type]
+        await run_workflow_evaluator(pool, now=_NOW)
     assert len(conn.run_inserts) == 1
     assert len(conn.alert_inserts) == 1
 
@@ -475,7 +475,7 @@ async def test_one_rule_error_does_not_stop_the_tick() -> None:
         return await original_fetchrow(query, *args)
 
     conn.fetchrow = flaky_fetchrow  # type: ignore[method-assign]
-    stats = await run_workflow_evaluator(FakePool(conn), now=_NOW)  # type: ignore[arg-type]
+    stats = await run_workflow_evaluator(FakePool(conn), now=_NOW)
     assert stats.errors == 1
     assert stats.workflow_runs_created == 1  # the good rule still fired
 

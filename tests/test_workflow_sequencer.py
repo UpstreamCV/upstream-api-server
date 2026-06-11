@@ -255,21 +255,23 @@ class FakeConn:
             )
             return run_id
         if "set status = 'completed'" in query:
-            run = next((r for r in self.runs if r["id"] == args[0]), None)
-            if run is None or run["status"] != "active":
+            matches = [r for r in self.runs if r["id"] == args[0]]
+            completed_run = matches[0] if matches else None
+            if completed_run is None or completed_run["status"] != "active":
                 return None
-            run["status"] = "completed"
-            run["evidence"] = json.loads(args[3])
+            completed_run["status"] = "completed"
+            completed_run["evidence"] = json.loads(args[3])
             self.completions.append(args)
-            return run["id"]
+            return completed_run["id"]
         if "set status = 'failed'" in query:
-            run = next((r for r in self.runs if r["id"] == args[0]), None)
-            if run is None or run["status"] != "active":
+            matches = [r for r in self.runs if r["id"] == args[0]]
+            failed_run = matches[0] if matches else None
+            if failed_run is None or failed_run["status"] != "active":
                 return None
-            run["status"] = "failed"
-            run["evidence"] = json.loads(args[3])
+            failed_run["status"] = "failed"
+            failed_run["evidence"] = json.loads(args[3])
             self.failures.append(args)
-            return run["id"]
+            return failed_run["id"]
         if "insert into alerts" in query:
             workflow_id = args[8]
             if workflow_id in self.alerts_in_cooldown_for_workflows:
@@ -331,7 +333,7 @@ async def _ingest(
     observed_at: datetime,
 ) -> None:
     await evaluate_sequences(
-        conn,  # type: ignore[arg-type]
+        conn,
         account_id=account_id,
         camera_id=camera_id,
         observation_id=uuid4(),
@@ -549,7 +551,7 @@ async def test_timeout_fails_run_and_creates_alert() -> None:
     await _start_one(conn, account, camera)
     stats = EvaluatorStats()
     await expire_sequence_runs(
-        conn,  # type: ignore[arg-type]
+        conn,
         now=_NOW + timedelta(seconds=60),
         stats=stats,
     )
@@ -570,7 +572,7 @@ async def test_timeout_no_alert_when_disabled() -> None:
     await _start_one(conn, account, camera)
     stats = EvaluatorStats()
     await expire_sequence_runs(
-        conn,  # type: ignore[arg-type]
+        conn,
         now=_NOW + timedelta(seconds=60),
         stats=stats,
     )
@@ -587,7 +589,7 @@ async def test_repeated_sweep_does_not_refail_or_realert() -> None:
     stats = EvaluatorStats()
     for _ in range(3):
         await expire_sequence_runs(
-            conn,  # type: ignore[arg-type]
+            conn,
             now=_NOW + timedelta(seconds=60),
             stats=stats,
         )
@@ -614,7 +616,7 @@ async def test_timeout_alert_cooldown_across_runs() -> None:
     assert len(conn.start_inserts) == 2
     stats = EvaluatorStats()
     await expire_sequence_runs(
-        conn,  # type: ignore[arg-type]
+        conn,
         now=_NOW + timedelta(seconds=60),
         stats=stats,
     )
@@ -634,7 +636,7 @@ async def test_timeout_alert_suppressed_when_workflow_in_cooldown() -> None:
     await _start_one(conn, account, camera)
     stats = EvaluatorStats()
     await expire_sequence_runs(
-        conn,  # type: ignore[arg-type]
+        conn,
         now=_NOW + timedelta(seconds=60),
         stats=stats,
     )

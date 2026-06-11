@@ -750,7 +750,7 @@ async def test_matching_rule_creates_alert() -> None:
     conn = FakeEvalConn(rules=[rule])
     observation_id = uuid4()
     created = await evaluate_observation(
-        conn,  # type: ignore[arg-type]
+        conn,
         account_id=account,
         camera_id=camera,
         observation_id=observation_id,
@@ -779,7 +779,7 @@ async def test_matching_rule_creates_workflow_run() -> None:
     conn = FakeEvalConn(rules=[rule])
     observation_id = uuid4()
     await evaluate_observation(
-        conn,  # type: ignore[arg-type]
+        conn,
         account_id=account,
         camera_id=camera,
         observation_id=observation_id,
@@ -809,7 +809,7 @@ async def test_matching_rule_creates_workflow_run() -> None:
 async def test_unmapped_observation_type_is_a_noop() -> None:
     conn = FakeEvalConn(rules=[])
     created = await evaluate_observation(
-        conn,  # type: ignore[arg-type]
+        conn,
         account_id=uuid4(),
         camera_id=uuid4(),
         observation_id=uuid4(),
@@ -825,7 +825,7 @@ async def test_non_matching_config_creates_nothing() -> None:
     rule = _eval_rule(account_id=account, camera_id=camera, config={"line_id": "line-1"})
     conn = FakeEvalConn(rules=[rule])
     created = await evaluate_observation(
-        conn,  # type: ignore[arg-type]
+        conn,
         account_id=account,
         camera_id=camera,
         observation_id=uuid4(),
@@ -848,7 +848,7 @@ async def test_cooldown_suppresses_repeat_alert_but_still_records_run() -> None:
     rule = _eval_rule(account_id=account, camera_id=camera)
     conn = FakeEvalConn(rules=[rule], recent_alert_rule_ids={rule["id"]})
     created = await evaluate_observation(
-        conn,  # type: ignore[arg-type]
+        conn,
         account_id=account,
         camera_id=camera,
         observation_id=uuid4(),
@@ -880,7 +880,7 @@ async def test_out_of_schedule_rule_creates_no_run_and_no_alert() -> None:
     )
     conn = FakeEvalConn(rules=[rule])
     created = await evaluate_observation(
-        conn,  # type: ignore[arg-type]
+        conn,
         account_id=account,
         camera_id=camera,
         observation_id=uuid4(),
@@ -910,7 +910,7 @@ async def test_in_schedule_richer_rule_creates_linked_run_and_alert() -> None:
     rule = _eval_rule(account_id=account, camera_id=camera, rule_type="zone_entered", config=config)
     conn = FakeEvalConn(rules=[rule])
     created = await evaluate_observation(
-        conn,  # type: ignore[arg-type]
+        conn,
         account_id=account,
         camera_id=camera,
         observation_id=uuid4(),
@@ -956,7 +956,7 @@ async def test_one_physical_crossing_never_double_fires_a_rule() -> None:
         "confidence": 0.84,
     }
     created_aggregate = await evaluate_observation(
-        conn,  # type: ignore[arg-type]
+        conn,
         account_id=account,
         camera_id=camera,
         observation_id=uuid4(),
@@ -965,7 +965,7 @@ async def test_one_physical_crossing_never_double_fires_a_rule() -> None:
         observed_at=_EVAL_NOW,
     )
     created_object = await evaluate_observation(
-        conn,  # type: ignore[arg-type]
+        conn,
         account_id=account,
         camera_id=camera,
         observation_id=uuid4(),
@@ -989,7 +989,7 @@ async def test_conditioned_line_rule_ignores_aggregate_even_when_alone() -> None
     rule = _eval_rule(account_id=account, camera_id=camera, config={"require_track_id": True})
     conn = FakeEvalConn(rules=[rule])
     created = await evaluate_observation(
-        conn,  # type: ignore[arg-type]
+        conn,
         account_id=account,
         camera_id=camera,
         observation_id=uuid4(),
@@ -1009,7 +1009,7 @@ async def test_two_matching_rules_create_two_alerts() -> None:
     ]
     conn = FakeEvalConn(rules=rules)
     created = await evaluate_observation(
-        conn,  # type: ignore[arg-type]
+        conn,
         account_id=account,
         camera_id=camera,
         observation_id=uuid4(),
