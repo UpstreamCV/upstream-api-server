@@ -541,14 +541,18 @@ def test_plan_for_price_id_mapping() -> None:
 def _derive(row: dict[str, Any] | None, *, configured: bool = True) -> BillingSummary:
     import upstream_api.services.usage_summary as mod
 
-    original = mod.get_settings
-    mod.get_settings = lambda: SimpleNamespace(  # type: ignore[assignment]
+    # usage_summary re-imports get_settings from config; strict mypy flags
+    # the attribute as non-exported (attr-defined) and the lambda's shape as
+    # incompatible with the Settings factory (assignment). Both are fine for
+    # a scoped test monkeypatch.
+    original = mod.get_settings  # type: ignore[attr-defined]
+    mod.get_settings = lambda: SimpleNamespace(  # type: ignore[attr-defined, assignment]
         stripe_secret_key="sk" if configured else None
     )
     try:
         return _derive_billing(row)
     finally:
-        mod.get_settings = original  # type: ignore[assignment]
+        mod.get_settings = original  # type: ignore[attr-defined]
 
 
 def test_billing_block_none_before_any_checkout() -> None:

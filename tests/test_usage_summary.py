@@ -364,7 +364,7 @@ _REQUESTED = RequestedStream(width=1280, height=720, fps=30, codec="h264", bitra
 async def test_session_start_allowed_below_quota() -> None:
     conn = QuotaFakeConn(quota=600, used_seconds=300 * 60)
     snapshot = await check_session_start(
-        conn,  # type: ignore[arg-type]
+        conn,
         account_id=uuid4(),
         requested=_REQUESTED,
         camera_source_type="webcam",
@@ -376,7 +376,7 @@ async def test_session_start_rejected_at_quota() -> None:
     conn = QuotaFakeConn(quota=600, used_seconds=600 * 60)
     with pytest.raises(LimitExceeded) as exc:
         await check_session_start(
-            conn,  # type: ignore[arg-type]
+            conn,
             account_id=uuid4(),
             requested=_REQUESTED,
             camera_source_type="webcam",
@@ -394,7 +394,7 @@ async def test_session_start_rejected_over_quota() -> None:
     conn = QuotaFakeConn(quota=600, used_seconds=900 * 60)
     with pytest.raises(LimitExceeded) as exc:
         await check_session_start(
-            conn,  # type: ignore[arg-type]
+            conn,
             account_id=uuid4(),
             requested=_REQUESTED,
             camera_source_type="webcam",
@@ -406,7 +406,7 @@ async def test_session_start_zero_quota_always_rejected() -> None:
     conn = QuotaFakeConn(quota=0, used_seconds=0)
     with pytest.raises(LimitExceeded) as exc:
         await check_session_start(
-            conn,  # type: ignore[arg-type]
+            conn,
             account_id=uuid4(),
             requested=_REQUESTED,
             camera_source_type="webcam",
@@ -418,7 +418,7 @@ async def test_session_start_partial_minutes_round_down() -> None:
     """599m59s used of a 600m quota is still below the cap (//60)."""
     conn = QuotaFakeConn(quota=600, used_seconds=600 * 60 - 1)
     snapshot = await check_session_start(
-        conn,  # type: ignore[arg-type]
+        conn,
         account_id=uuid4(),
         requested=_REQUESTED,
         camera_source_type="webcam",
@@ -431,7 +431,7 @@ async def test_concurrent_session_limit_still_enforced() -> None:
     conn = QuotaFakeConn(quota=600, used_seconds=0, active=5)
     with pytest.raises(LimitExceeded) as exc:
         await check_session_start(
-            conn,  # type: ignore[arg-type]
+            conn,
             account_id=uuid4(),
             requested=_REQUESTED,
             camera_source_type="webcam",
@@ -443,7 +443,7 @@ async def test_stream_type_check_still_enforced_before_quota() -> None:
     conn = QuotaFakeConn(quota=600, used_seconds=600 * 60)
     with pytest.raises(LimitExceeded) as exc:
         await check_session_start(
-            conn,  # type: ignore[arg-type]
+            conn,
             account_id=uuid4(),
             requested=_REQUESTED,
             camera_source_type="hdmi",
@@ -458,7 +458,7 @@ async def test_missing_limits_row_unchanged() -> None:
 
     with pytest.raises(NotFoundError):
         await check_session_start(
-            NoLimitsConn(quota=600, used_seconds=0),  # type: ignore[arg-type]
+            NoLimitsConn(quota=600, used_seconds=0),
             account_id=uuid4(),
             requested=_REQUESTED,
             camera_source_type="webcam",

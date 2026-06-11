@@ -96,6 +96,42 @@ platform-admin work landed concurrently in the same tree).
 - Counters increment even if the surrounding DB transaction later rolls
   back — acceptable for trend metrics, documented here for honesty.
 
+### Addendum (2026-06-11, cross-review fixes)
+- `routers/snapshots.py` — `@track_ingest("snapshots")` on the webhook-authed
+  `POST /v1/ingest/snapshots` handler (same decorator ordering as the
+  ingest.py handlers), closing the one ingest endpoint missing from
+  `ingest_webhook_total`.
+- `services/stream_validation.py` — the time-to-streaming guard is now
+  symmetric: a tz-naive `created_at` (not just a naive `started_at`) skips
+  the histogram observation instead of raising inside the webhook handler.
+- `tests/test_metrics_endpoint.py` — counter-delta tests for the snapshots
+  endpoint (ok + client_error) and a naive-`created_at` skip test.
+
+---
+
+## 2026-06-11 - ci: fix the 47 mypy errors in workflow/billing test files
+
+### Summary
+CI's type-check step has been red since the Workflow Engine and Module 7
+commits landed. Three error classes: 42 stale `# type: ignore` comments that
+mypy 2.1 flags as unused (stripped); a `next(gen, None)` default that fought
+the dict-typed `run` loop variable bound earlier in the same method in
+test_workflow_sequencer's fake (replaced with list-match locals
+`completed_run`/`failed_run`, which also fixes a latent bug where the
+completed/failed branches mutated the WRONG variable — the leftover `run`
+from the duplicate-guard loop — instead of the looked-up row); and the
+test_billing_api monkeypatch of the re-imported `get_settings`, which needs
+`attr-defined` in its ignore codes under no-implicit-reexport.
+
+### Files touched
+- `tests/test_workflow_sequencer.py`, `tests/test_workflow_evaluator.py`,
+  `tests/test_usage_summary.py`, `tests/test_rule_evaluation.py`,
+  `tests/test_billing_api.py`.
+
+### Testing/checks
+`uv run mypy src tests` — 0 errors in 179 files; `ruff check` +
+`format --check` clean; `pytest` 1151 passed.
+
 ---
 
 ## 2026-06-11 - feat(admin): server-side health sampler + history endpoint
