@@ -111,6 +111,7 @@ class FakeConn:
             # mark_failed path. Return enough to satisfy the helper.
             return {
                 "state": "failed",
+                "started_at": None,
                 "lim_width": 1280,
                 "lim_height": 720,
                 "lim_fps": 30,

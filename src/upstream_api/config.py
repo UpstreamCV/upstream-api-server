@@ -29,7 +29,9 @@ class Settings(BaseSettings):
 
     mediamtx_webhook_secret: SecretStr
     processor_webhook_secret: SecretStr
-    prometheus_auth_token: SecretStr
+    # M9.3: optional — when unset, GET /metrics 404s (the endpoint does not
+    # exist for that deployment). Deployed envs keep it set.
+    prometheus_auth_token: SecretStr | None = None
 
     # Comma-separated list in env (UPSTREAM_ALLOWED_ORIGINS=a,b,c).
     # Surfaced as ``allowed_origins: list[str]`` below.

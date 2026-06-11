@@ -17,6 +17,7 @@ import asyncpg
 
 from upstream_api.config import Settings
 from upstream_api.errors import ConflictError, NotFoundError
+from upstream_api.observability.metrics import record_transition
 from upstream_api.security.session_jwt import (
     SessionLimits,
     SessionTokenClaims,
@@ -234,6 +235,8 @@ async def start_session(
         ) from exc
     assert row is not None  # insert ... returning always returns a row
 
+    record_transition("created", "approved")
+
     await record_event(
         conn,
         account_id=account_id,
@@ -305,6 +308,9 @@ async def stop_session(
         assert updated is not None
         state = updated["state"]
         ended_at = updated["ended_at"]
+
+        # row["state"] is the pre-update select, i.e. the real from-state.
+        record_transition(row["state"], "ended")
 
         # Mirror to cameras.status so the cameras list view returns to "idle".
         # The streaming-server's runOnNotReady hook only fires after MediaMTX

@@ -12,6 +12,7 @@ def test_expected_routes_are_mounted() -> None:
         "/:GET",
         "/healthz:GET",
         "/readyz:GET",
+        "/metrics:GET",
         "/v1/agents/register:POST",
         "/v1/agents:GET",
         "/v1/agents/{agent_id}:GET",
