@@ -18,8 +18,12 @@ from upstream_api.config import get_settings
 from upstream_api.errors import ForbiddenError, UnauthorizedError
 from upstream_api.security.deps import current_platform_admin
 
-# Must match UPSTREAM_SUPABASE_JWT_SECRET in tests/conftest.py.
-_SECRET = "test-supabase-jwt-secret"
+def _secret() -> str:
+    """The active Supabase JWT secret. CI exports its own UPSTREAM_* values
+    (which beat conftest's setdefault fallbacks), so tokens must be minted
+    with whatever the settings actually resolve to — never a hardcoded
+    copy of the local default."""
+    return get_settings().supabase_jwt_secret.get_secret_value()
 
 
 class FakeConn:
@@ -60,7 +64,7 @@ def _mint(**overrides: object) -> str:
         "email": "admin@example.com",
     }
     payload.update(overrides)
-    return jwt.encode(payload, _SECRET, algorithm="HS256")
+    return jwt.encode(payload, _secret(), algorithm="HS256")
 
 
 async def test_allowlisted_user_resolves() -> None:

@@ -380,9 +380,11 @@ def test_force_stop_unknown_session_is_404() -> None:
 async def test_create_auth_user_ok() -> None:
     user_id = uuid4()
 
+    expected_key = get_settings().supabase_service_role_key.get_secret_value()
+
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/auth/v1/admin/users"
-        assert request.headers["apikey"] == "test-service"
+        assert request.headers["apikey"] == expected_key
         return httpx.Response(200, json={"id": str(user_id), "email": "a@b.co"})
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
