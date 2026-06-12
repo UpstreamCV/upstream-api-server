@@ -208,6 +208,10 @@ def test_timeseries_returns_zero_filled_points() -> None:
                 "validation_failures": 0,
                 "streaming_minutes": 0.0,
                 "avg_fps": None,
+                "alerts_fired": 0,
+                "workflow_runs": 0,
+                "objects_detected": 0,
+                "avg_detection_confidence": None,
             },
             {
                 "bucket": datetime(2026, 6, 11, 11, tzinfo=UTC),
@@ -215,6 +219,10 @@ def test_timeseries_returns_zero_filled_points() -> None:
                 "validation_failures": 1,
                 "streaming_minutes": 42.5,
                 "avg_fps": 29.97,
+                "alerts_fired": 4,
+                "workflow_runs": 7,
+                "objects_detected": 152,
+                "avg_detection_confidence": 0.87654,
             },
         ]
     )
@@ -225,9 +233,14 @@ def test_timeseries_returns_zero_filled_points() -> None:
     assert body["hours"] == 2
     assert conn.args == (2,)
     assert body["points"][0]["avg_fps"] is None  # no heartbeats != 0 fps
+    assert body["points"][0]["avg_detection_confidence"] is None  # no metrics != 0
     assert body["points"][1]["sessions_started"] == 3
     assert body["points"][1]["streaming_minutes"] == 42.5
     assert body["points"][1]["avg_fps"] == 30.0  # rounded to 1dp
+    assert body["points"][1]["alerts_fired"] == 4
+    assert body["points"][1]["workflow_runs"] == 7
+    assert body["points"][1]["objects_detected"] == 152
+    assert body["points"][1]["avg_detection_confidence"] == 0.877  # rounded to 3dp
 
 
 def test_timeseries_clamps_hours() -> None:
@@ -336,3 +349,95 @@ async def test_record_sample_inserts_row(monkeypatch: pytest.MonkeyPatch) -> Non
     assert len(inserts) == 1
     # (db_ok, latency, mediamtx_status, paths, active, stale, failed, sessions)
     assert inserts[0] == (True, 2.5, "unreachable", None, 1, 0, 0, 3)
+
+
+# ---------------------------------------------------------------------------
+# GET /v1/admin/system/metrics — control-plane counter snapshot
+#
+# The Prometheus registry is module-level and shared across the whole test
+# process, so assertions are delta-based: record, snapshot, compare deltas.
+# ---------------------------------------------------------------------------
+
+
+def _metrics_client() -> TestClient:
+    app = create_app()
+    app.state.http_client = object()
+    app.dependency_overrides[get_pool] = FakePool
+    app.dependency_overrides[current_platform_admin] = lambda: _ADMIN
+    return TestClient(app)
+
+
+def test_system_metrics_reflects_recorded_counters() -> None:
+    from upstream_api.observability.metrics import (
+        record_auth,
+        record_ingest,
+        record_transition,
+        snapshot,
+    )
+
+    before = snapshot()
+    record_ingest("stream_started", "ok")
+    record_ingest("stream_started", "server_error")
+    record_auth("allow")
+    record_auth("deny")
+    record_transition("approved", "streaming")
+    record_transition("streaming", "failed")
+
+    client = _metrics_client()
+    r = client.get("/v1/admin/system/metrics")
+    assert r.status_code == 200, r.text
+    body = r.json()
+
+    assert body["ingest_webhooks"]["ok"] - before["ingest_webhooks"]["ok"] == 1
+    assert (
+        body["ingest_webhooks"]["server_error"] - before["ingest_webhooks"]["server_error"] == 1
+    )
+    assert body["stream_auth"]["allowed"] - before["stream_auth"]["allowed"] == 1
+    assert body["stream_auth"]["denied"] - before["stream_auth"]["denied"] == 1
+    assert body["session_transitions_total"] - before["session_transitions_total"] == 2
+    assert body["sessions_failed_total"] - before["sessions_failed_total"] == 1
+    assert body["process_uptime_seconds"] > 0
+    # Under TestClient there is no app.state.db_pool; gauges keep their last value.
+    assert body["db_pool"]["size"] >= 0
+
+
+def test_system_metrics_time_to_streaming_quantiles() -> None:
+    from upstream_api.observability.metrics import observe_time_to_streaming, snapshot
+
+    before = snapshot()
+    for seconds in (1.0, 1.5, 2.0, 3.0, 6.0):
+        observe_time_to_streaming(seconds)
+    after = snapshot()
+
+    tts = after["time_to_streaming"]
+    assert tts["count"] - before["time_to_streaming"]["count"] == 5
+    # With observations recorded, both quantile estimates exist and order.
+    assert tts["p50_seconds"] is not None
+    assert tts["p95_seconds"] is not None
+    assert tts["p50_seconds"] <= tts["p95_seconds"]
+
+
+def test_histogram_quantile_estimation() -> None:
+    from upstream_api.observability.metrics import _histogram_quantile
+
+    inf = float("inf")
+    # 10 observations: cumulative 4 by le=1, 8 by le=2, 10 by le=4.
+    buckets = [(1.0, 4.0), (2.0, 8.0), (4.0, 10.0), (inf, 10.0)]
+    p50 = _histogram_quantile(buckets, 0.50)
+    assert p50 is not None and 1.0 <= p50 <= 2.0
+    p95 = _histogram_quantile(buckets, 0.95)
+    assert p95 is not None and 2.0 <= p95 <= 4.0
+    # Empty histogram → no estimate, not a crash.
+    assert _histogram_quantile([], 0.5) is None
+    assert _histogram_quantile([(1.0, 0.0), (inf, 0.0)], 0.5) is None
+    # Quantile landing in +Inf returns the last finite bound (a floor).
+    assert _histogram_quantile([(1.0, 0.0), (inf, 10.0)], 0.5) == 1.0
+
+
+def test_system_metrics_requires_platform_admin() -> None:
+    app = create_app()
+    app.state.http_client = object()
+    app.dependency_overrides[get_pool] = FakePool
+    client = TestClient(app)
+    r = client.get("/v1/admin/system/metrics")
+    assert r.status_code == 401

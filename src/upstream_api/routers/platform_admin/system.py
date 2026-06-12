@@ -5,8 +5,10 @@ from typing import Annotated
 from fastapi import APIRouter, Query, Request
 
 from upstream_api import __version__
+from upstream_api.observability import metrics as control_plane_metrics
 from upstream_api.schemas.platform_admin import (
     ApiHealth,
+    ControlPlaneMetricsResponse,
     HealthHistoryResponse,
     HealthSample,
     ProcessorsHealth,
@@ -56,6 +58,28 @@ async def get_system_health(
     )
 
 
+@router.get("/system/metrics", response_model=ControlPlaneMetricsResponse)
+async def get_system_metrics(
+    _admin: CurrentPlatformAdmin,
+    request: Request,
+) -> ControlPlaneMetricsResponse:
+    """Control-plane counters for the panel — a parsed view of the same
+    in-process Prometheus registry GET /metrics serves, so admins see the
+    M9.3 observability data without scrape access to the monitoring box.
+
+    Values are process-lifetime (reset on restart); the panel renders them
+    as "since restart" using ``process_uptime_seconds``.
+    """
+    # Refresh pool-saturation gauges inline, same as routers/metrics.py
+    # (absent under TestClient without lifespan — gauges just keep 0).
+    pool = getattr(request.app.state, "db_pool", None)
+    if pool is not None:
+        size = pool.get_size()
+        control_plane_metrics.db_pool_size.set(size)
+        control_plane_metrics.db_pool_in_use.set(size - pool.get_idle_size())
+    return ControlPlaneMetricsResponse(**control_plane_metrics.snapshot())
+
+
 @router.get("/system/timeseries", response_model=SystemTimeseriesResponse)
 async def get_system_timeseries(
     _admin: CurrentPlatformAdmin,
@@ -96,7 +120,23 @@ async def get_system_timeseries(
                    (select avg(hb.fps)::float from heartbeats hb
                      where hb.reported_at >= h.bucket
                        and hb.reported_at < h.bucket + interval '1 hour'
-                       and hb.fps is not null) as avg_fps
+                       and hb.fps is not null) as avg_fps,
+                   (select count(*)::int from alerts a
+                     where a.created_at >= h.bucket
+                       and a.created_at < h.bucket + interval '1 hour') as alerts_fired,
+                   (select count(*)::int from workflow_runs w
+                     where w.started_at >= h.bucket
+                       and w.started_at < h.bucket + interval '1 hour') as workflow_runs,
+                   coalesce((select sum(m.object_count)::int
+                      from snapshot_detection_metrics m
+                     where m.observed_at >= h.bucket
+                       and m.observed_at < h.bucket + interval '1 hour'), 0)
+                     as objects_detected,
+                   (select avg(m.avg_confidence)::float
+                      from snapshot_detection_metrics m
+                     where m.observed_at >= h.bucket
+                       and m.observed_at < h.bucket + interval '1 hour'
+                       and m.avg_confidence is not null) as avg_detection_confidence
               from hours h
              order by h.bucket
             """,
@@ -111,6 +151,14 @@ async def get_system_timeseries(
                 validation_failures=r["validation_failures"],
                 streaming_minutes=round(r["streaming_minutes"], 1),
                 avg_fps=round(r["avg_fps"], 1) if r["avg_fps"] is not None else None,
+                alerts_fired=r["alerts_fired"],
+                workflow_runs=r["workflow_runs"],
+                objects_detected=r["objects_detected"],
+                avg_detection_confidence=(
+                    round(r["avg_detection_confidence"], 3)
+                    if r["avg_detection_confidence"] is not None
+                    else None
+                ),
             )
             for r in rows
         ],
