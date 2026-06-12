@@ -4,6 +4,23 @@ Reverse chronological. Newest at top. Every meaningful commit gets an entry foll
 
 ---
 
+## 2026-06-11 - Review fix: empty fanout_token_secret counts as unconfigured
+
+### Summary
+Post-deploy code-review finding: `UPSTREAM_FANOUT_TOKEN_SECRET=""` yields
+`SecretStr("")` (not None), so the stream-token endpoint's `is None` gate
+passed and minted tokens signed with an empty secret — while the sidecar
+fail-louds on the same empty value. Confusing broken deployment instead
+of the clean 503. The gate now also treats an empty
+`get_secret_value()` as unconfigured.
+
+Also hardened the tests themselves: `Settings` reads the repo `.env`
+file, so the two unconfigured-path tests that used `monkeypatch.delenv`
+silently flipped to 200 on any dev machine whose `.env` sets the fanout
+vars (as local-dev setups now do). They now `setenv("")` — explicit
+empty overrides `.env` and, by design, counts as unconfigured. New
+test pins the empty-secret 503. Suite: 1187 passed.
+
 ## 2026-06-11 - feat(admin): API process vitals on the health rollup
 
 ### Summary

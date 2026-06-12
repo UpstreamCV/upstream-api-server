@@ -165,8 +165,25 @@ def test_mint_unauthenticated_401(fanout_env: None) -> None:
 
 
 def test_mint_unconfigured_503(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("UPSTREAM_FANOUT_TOKEN_SECRET", raising=False)
-    monkeypatch.delenv("UPSTREAM_FANOUT_PUBLIC_WS_URL", raising=False)
+    # setenv("") rather than delenv: Settings also reads the repo .env file,
+    # so deleting the OS env var alone is not hermetic on a dev machine whose
+    # .env sets the fanout vars. An explicit empty value overrides .env and
+    # (by design) counts as unconfigured.
+    monkeypatch.setenv("UPSTREAM_FANOUT_TOKEN_SECRET", "")
+    monkeypatch.setenv("UPSTREAM_FANOUT_PUBLIC_WS_URL", "")
+    account = uuid4()
+    conn = FakeCameraConn(camera_account_id=account)
+    r = _user_client(conn, account_id=account).post(_PATH.format(camera_id=uuid4()))
+    assert r.status_code == 503
+    assert r.json()["error"]["code"] == "perception_stream_not_configured"
+
+
+def test_mint_empty_secret_is_unconfigured(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An empty-string env var yields SecretStr("") rather than None; it must
+    503 like an unset secret — the sidecar refuses to start on the same empty
+    value, so minting would produce tokens nothing can verify."""
+    monkeypatch.setenv("UPSTREAM_FANOUT_TOKEN_SECRET", "")
+    monkeypatch.setenv("UPSTREAM_FANOUT_PUBLIC_WS_URL", WS_BASE)
     account = uuid4()
     conn = FakeCameraConn(camera_account_id=account)
     r = _user_client(conn, account_id=account).post(_PATH.format(camera_id=uuid4()))
@@ -178,7 +195,7 @@ def test_mint_secret_alone_is_not_enough(monkeypatch: pytest.MonkeyPatch) -> Non
     """Both settings are required: a secret without a public ws_url would
     mint tokens the browser has no address for."""
     monkeypatch.setenv("UPSTREAM_FANOUT_TOKEN_SECRET", TOKEN_SECRET)
-    monkeypatch.delenv("UPSTREAM_FANOUT_PUBLIC_WS_URL", raising=False)
+    monkeypatch.setenv("UPSTREAM_FANOUT_PUBLIC_WS_URL", "")
     account = uuid4()
     conn = FakeCameraConn(camera_account_id=account)
     r = _user_client(conn, account_id=account).post(_PATH.format(camera_id=uuid4()))
