@@ -4,6 +4,70 @@ Reverse chronological. Newest at top. Every meaningful commit gets an entry foll
 
 ---
 
+## 2026-06-11 - feat(admin): control-plane metrics endpoint + richer system timeseries
+
+### Summary
+Surfaces the M9.3 observability data in the admin panel. New
+`GET /v1/admin/system/metrics` parses the same in-process Prometheus
+registry `GET /metrics` serves the monitoring box — ingest webhook
+outcomes (ok/4xx/5xx), MediaMTX auth allow/deny, session transitions +
+failures, time-to-streaming p50/p95 (bucket-interpolated), db pool
+size/in-use — so platform admins see control-plane counters without
+scrape access. Counters are process-lifetime (reset on restart);
+`process_uptime_seconds` is in the response so the panel can render
+"since restart" honestly, which doubles as a restart detector.
+
+`GET /v1/admin/system/timeseries` gains four hourly series: alerts_fired
+(alerts.created_at), workflow_runs (workflow_runs.started_at),
+objects_detected (sum of snapshot_detection_metrics.object_count), and
+avg_detection_confidence (null = no detection metrics that hour,
+distinct from low confidence — same null posture as avg_fps).
+
+### Files touched
+- `src/upstream_api/observability/metrics.py` — `snapshot()` + registry
+  readers (`_collect_samples`, `_counter_by_label`, `_gauge_value`,
+  `_histogram_read`, `_histogram_quantile`), `process_started_at`.
+- `src/upstream_api/routers/platform_admin/system.py` — new
+  `/system/metrics` handler (refreshes pool gauges inline, same as
+  routers/metrics.py); timeseries SQL + response gain the four series.
+- `src/upstream_api/schemas/platform_admin.py` —
+  `ControlPlaneMetricsResponse` (+ Ingest/StreamAuth/TimeToStreaming/
+  DbPool sub-models); `SystemTimeseriesPoint` new fields.
+- `docs/api-contracts.md` — both endpoint rows.
+- `tests/test_platform_admin_system.py` — new fields in timeseries
+  fixtures + 4 new tests.
+
+### Functions/classes changed
+- `snapshot()` — point-in-time dict of the registry for the admin
+  endpoint; no DB, no I/O.
+- `_histogram_quantile()` — Prometheus-style linear interpolation over
+  cumulative buckets; +Inf bucket returns the last finite bound (a
+  floor, not a fabricated estimate); empty/zero histograms → None.
+- `get_system_metrics()` — CurrentPlatformAdmin-gated; refreshes
+  db_pool gauges from app.state.db_pool when present.
+
+### System interaction notes
+Panel → `GET /v1/admin/system/metrics` (Supabase JWT, platform_admins
+allowlist) → observability.metrics.snapshot() → in-process registry
+(no asyncpg). The registry is fed by record_ingest/record_auth/
+record_transition/observe_time_to_streaming at the existing call sites;
+this commit adds no new instrumentation, only the read path.
+
+### Testing/checks
+`uv run pytest` — 1183 passed; the 2 pre-existing failures in
+test_perception_stream_token.py also fail on the parent commit (not
+introduced here). `ruff check` clean on touched files, `mypy src`
+clean. New metrics tests are delta-based because the registry is
+module-level and shared across the test process.
+
+### Follow-up TODOs
+- Pre-existing: fix the 2 test_perception_stream_token.py failures and
+  the 3 ruff errors in config.py/cameras.py from the fanout commit.
+- Consider persisting counter snapshots if "since restart" framing
+  proves too volatile for ops use.
+
+---
+
 ## 2026-06-11 - Perception-fanout stream-token endpoint (10-15 Hz overlay hot path)
 
 ### Summary

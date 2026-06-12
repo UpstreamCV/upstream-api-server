@@ -13,8 +13,9 @@ Call sites stay one-line via the ``record_*`` helpers and the
 from __future__ import annotations
 
 import functools
+import time
 from collections.abc import Awaitable, Callable
-from typing import ParamSpec, TypeVar
+from typing import Any, ParamSpec, TypeVar
 
 from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram
 
@@ -22,6 +23,11 @@ P = ParamSpec("P")
 R = TypeVar("R")
 
 registry = CollectorRegistry()
+
+# Wall-clock process start, for the admin panel's "counters since restart"
+# framing. Module import time ≈ process start (the app imports this module
+# during startup), which is close enough for an uptime readout.
+process_started_at = time.time()
 
 ingest_webhook_total = Counter(
     "ingest_webhook_total",
@@ -80,6 +86,113 @@ def record_transition(frm: str, to: str) -> None:
 
 def observe_time_to_streaming(seconds: float) -> None:
     session_start_to_streaming_seconds.observe(seconds)
+
+
+def _collect_samples(metric_name: str) -> list[tuple[dict[str, str], float]]:
+    """Return (labels, value) pairs for one metric family in the registry.
+
+    prometheus_client strips the ``_total`` suffix from counter family
+    names, so match on the family and filter to the value-carrying sample
+    names (``_total`` for counters, exact name for gauges, ``_bucket``
+    handled separately by the histogram reader).
+    """
+    family = metric_name.removesuffix("_total")
+    out: list[tuple[dict[str, str], float]] = []
+    for metric in registry.collect():
+        if metric.name != family:
+            continue
+        for sample in metric.samples:
+            if sample.name in (metric_name, family):
+                out.append((dict(sample.labels), sample.value))
+    return out
+
+
+def _gauge_value(metric_name: str) -> float:
+    samples = _collect_samples(metric_name)
+    return samples[0][1] if samples else 0.0
+
+
+def _counter_by_label(metric_name: str, label: str) -> dict[str, int]:
+    totals: dict[str, int] = {}
+    for labels, value in _collect_samples(metric_name):
+        key = labels.get(label, "")
+        totals[key] = totals.get(key, 0) + int(value)
+    return totals
+
+
+def _histogram_read(metric_name: str) -> tuple[int, list[tuple[float, float]]]:
+    """Return (count, cumulative buckets sorted by le) for a histogram."""
+    count = 0
+    buckets: list[tuple[float, float]] = []
+    for metric in registry.collect():
+        if metric.name != metric_name:
+            continue
+        for sample in metric.samples:
+            if sample.name == f"{metric_name}_count":
+                count = int(sample.value)
+            elif sample.name == f"{metric_name}_bucket":
+                buckets.append((float(sample.labels["le"]), sample.value))
+    buckets.sort(key=lambda b: b[0])
+    return count, buckets
+
+
+def _histogram_quantile(buckets: list[tuple[float, float]], q: float) -> float | None:
+    """Estimate a quantile from cumulative histogram buckets (Prometheus-style
+    linear interpolation). Returns the lower bound of the +Inf bucket when the
+    quantile lands there — a floor, not a fabricated point estimate."""
+    if not buckets:
+        return None
+    total = buckets[-1][1]
+    if total <= 0:
+        return None
+    target = q * total
+    prev_le, prev_count = 0.0, 0.0
+    for le, count in buckets:
+        if count >= target:
+            if le == float("inf"):
+                return prev_le
+            span = count - prev_count
+            if span <= 0:
+                return le
+            return prev_le + (le - prev_le) * ((target - prev_count) / span)
+        prev_le, prev_count = le, count
+    return None
+
+
+def snapshot() -> dict[str, Any]:
+    """Parsed point-in-time view of the registry for /v1/admin/system/metrics.
+
+    Counters are process-lifetime (they reset on restart) — the response
+    carries ``process_uptime_seconds`` so the panel can say "since restart"
+    honestly. Reads the same registry GET /metrics serves; no DB, no I/O.
+    """
+    ingest = _counter_by_label("ingest_webhook_total", "outcome")
+    auth = _counter_by_label("mediamtx_auth_total", "decision")
+    transitions = _counter_by_label("session_transitions_total", "to_state")
+    tts_count, tts_buckets = _histogram_read("session_start_to_streaming_seconds")
+    return {
+        "process_uptime_seconds": max(0.0, time.time() - process_started_at),
+        "ingest_webhooks": {
+            "ok": ingest.get("ok", 0),
+            "client_error": ingest.get("client_error", 0),
+            "server_error": ingest.get("server_error", 0),
+        },
+        "stream_auth": {
+            "allowed": auth.get("allow", 0),
+            "denied": auth.get("deny", 0),
+        },
+        "session_transitions_total": sum(transitions.values()),
+        "sessions_failed_total": transitions.get("failed", 0),
+        "time_to_streaming": {
+            "count": tts_count,
+            "p50_seconds": _histogram_quantile(tts_buckets, 0.50),
+            "p95_seconds": _histogram_quantile(tts_buckets, 0.95),
+        },
+        "db_pool": {
+            "size": int(_gauge_value("db_pool_size")),
+            "in_use": int(_gauge_value("db_pool_in_use")),
+        },
+    }
 
 
 def _outcome_from_status(status_code: int) -> str:

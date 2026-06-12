@@ -66,11 +66,56 @@ class SystemTimeseriesPoint(BaseModel):
     validation_failures: int
     streaming_minutes: float
     avg_fps: float | None
+    alerts_fired: int
+    workflow_runs: int
+    objects_detected: int
+    # Hourly mean of per-snapshot avg confidence; null = no detection metrics
+    # that hour (distinct from low confidence).
+    avg_detection_confidence: float | None
 
 
 class SystemTimeseriesResponse(BaseModel):
     hours: int
     points: list[SystemTimeseriesPoint]
+
+
+# ---------------------------------------------------------------------------
+# /v1/admin/system/metrics — control-plane counters (in-process Prometheus
+# registry, the same one GET /metrics serves). Process-lifetime values: they
+# reset on restart, which is why the response carries the uptime.
+# ---------------------------------------------------------------------------
+
+
+class IngestWebhookMetrics(BaseModel):
+    ok: int
+    client_error: int
+    server_error: int
+
+
+class StreamAuthMetrics(BaseModel):
+    allowed: int
+    denied: int
+
+
+class TimeToStreamingMetrics(BaseModel):
+    count: int
+    p50_seconds: float | None
+    p95_seconds: float | None
+
+
+class DbPoolMetrics(BaseModel):
+    size: int
+    in_use: int
+
+
+class ControlPlaneMetricsResponse(BaseModel):
+    process_uptime_seconds: float
+    ingest_webhooks: IngestWebhookMetrics
+    stream_auth: StreamAuthMetrics
+    session_transitions_total: int
+    sessions_failed_total: int
+    time_to_streaming: TimeToStreamingMetrics
+    db_pool: DbPoolMetrics
 
 
 class HealthSample(BaseModel):
