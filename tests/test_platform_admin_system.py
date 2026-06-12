@@ -392,9 +392,7 @@ def test_system_metrics_reflects_recorded_counters() -> None:
     body = r.json()
 
     assert body["ingest_webhooks"]["ok"] - before["ingest_webhooks"]["ok"] == 1
-    assert (
-        body["ingest_webhooks"]["server_error"] - before["ingest_webhooks"]["server_error"] == 1
-    )
+    assert body["ingest_webhooks"]["server_error"] - before["ingest_webhooks"]["server_error"] == 1
     assert body["stream_auth"]["allowed"] - before["stream_auth"]["allowed"] == 1
     assert body["stream_auth"]["denied"] - before["stream_auth"]["denied"] == 1
     assert body["session_transitions_total"] - before["session_transitions_total"] == 2

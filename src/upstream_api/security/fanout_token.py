@@ -74,15 +74,11 @@ def mint_fanout_token(
         "iat": issued_at,
         "exp": expires_at,
     }
-    payload_b64 = _b64url_encode(
-        json.dumps(payload, separators=(",", ":")).encode("utf-8")
-    )
+    payload_b64 = _b64url_encode(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
     return f"{TOKEN_PREFIX}.{payload_b64}.{_sign(payload_b64, secret)}"
 
 
-def verify_fanout_token(
-    token: str, secret: str, now: float
-) -> FanoutTokenClaims | None:
+def verify_fanout_token(token: str, secret: str, now: float) -> FanoutTokenClaims | None:
     """Return claims when authentic and unexpired, else None. Never raises."""
     if not isinstance(token, str) or not token:
         return None

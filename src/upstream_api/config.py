@@ -114,7 +114,7 @@ class Settings(BaseSettings):
     #   deployed:        rtsp://<internal-streaming-host>:8554
     mediamtx_rtsp_base: str = "rtsp://host.docker.internal:8554"
 
-    # Perception fan-out hot path (live detection overlays at 10–15 Hz).
+    # Perception fan-out hot path (live detection overlays at 10-15 Hz).
     # Both optional: with either unset,
     # POST /v1/cameras/{id}/perception/stream-token returns 503
     # perception_stream_not_configured (same pattern as

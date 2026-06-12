@@ -9,7 +9,6 @@ from uuid import UUID
 from fastapi import APIRouter, Query
 
 from upstream_api.config import get_settings
-
 from upstream_api.errors import ApiError, ConflictError, ForbiddenError, NotFoundError
 from upstream_api.schemas.cameras import (
     CameraClaimRequest,
@@ -634,7 +633,7 @@ async def mint_perception_stream_token(
     """Mint a short-lived token for the perception-fanout WS hot path.
 
     The perception-fanout sidecar (upstream-streaming-server) relays
-    processor snapshots to browsers at 10–15 Hz, bypassing the DB; this
+    processor snapshots to browsers at 10-15 Hz, bypassing the DB; this
     endpoint is where its subscriber auth happens. Supabase JWT auth +
     the same camera-ownership check as ``perception/latest`` run HERE,
     then the browser presents the resulting HMAC token to the sidecar,
