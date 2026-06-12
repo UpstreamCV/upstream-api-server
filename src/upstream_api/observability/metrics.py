@@ -5,6 +5,8 @@ of ``prometheus_client.REGISTRY`` — tests build many app instances (and may
 re-import modules) within one process, and the process-global default
 registry would raise duplicate-timeseries errors on re-registration.
 ``GET /metrics`` (routers/metrics.py) exposes exactly this registry.
+The registry is per-process (single-instance deployment posture); a
+multi-worker deployment would need prometheus_client's multiprocess collector.
 
 Call sites stay one-line via the ``record_*`` helpers and the
 ``track_ingest`` decorator; nothing here touches the DB or blocks.
@@ -15,6 +17,7 @@ from __future__ import annotations
 import functools
 import time
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import Any, ParamSpec, TypeVar
 
 from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram
@@ -86,6 +89,36 @@ def record_transition(frm: str, to: str) -> None:
 
 def observe_time_to_streaming(seconds: float) -> None:
     session_start_to_streaming_seconds.observe(seconds)
+
+
+@dataclass(frozen=True, slots=True)
+class TransitionRecord:
+    """Deferred metric facts for one session state-machine transition.
+
+    Services that write a transition inside a caller-owned DB transaction
+    return one of these instead of incrementing counters inline: a counter
+    bumped inside the transaction survives a rollback (a phantom transition),
+    and the webhook retry then counts the same transition twice. The caller
+    calls ``record()`` exactly once, just after its ``conn.transaction()``
+    block exits (i.e. after COMMIT).
+
+    The default-constructed instance (``NO_TRANSITION``) is a no-op so
+    idempotent paths (reconnects, already-terminal sessions) keep the call
+    site a one-liner.
+    """
+
+    from_state: str | None = None
+    to_state: str | None = None
+    time_to_streaming_seconds: float | None = None
+
+    def record(self) -> None:
+        if self.from_state is not None and self.to_state is not None:
+            record_transition(self.from_state, self.to_state)
+        if self.time_to_streaming_seconds is not None:
+            observe_time_to_streaming(self.time_to_streaming_seconds)
+
+
+NO_TRANSITION = TransitionRecord()
 
 
 def _collect_samples(metric_name: str) -> list[tuple[dict[str, str], float]]:

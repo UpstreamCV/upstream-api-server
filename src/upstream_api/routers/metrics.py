@@ -2,8 +2,8 @@
 
 Gating contract:
 
-- ``UPSTREAM_PROMETHEUS_AUTH_TOKEN`` unset → 404 (the endpoint does not
-  exist for this deployment; nothing to probe).
+- ``UPSTREAM_PROMETHEUS_AUTH_TOKEN`` unset (or empty — config.py coerces
+  ``""`` to None) → 404: the endpoint is not configured for this deployment.
 - set → require exactly ``Authorization: Bearer <token>``, compared in
   constant time (same primitive as the webhook-secret checks in
   ``security/shared_secret.py``).
@@ -39,7 +39,8 @@ async def metrics(
 ) -> Response:
     token = settings.prometheus_auth_token
     if token is None:
-        # Indistinguishable from a route that was never mounted.
+        # Unconfigured deployments report not-found; unauthenticated callers
+        # cannot retrieve metrics either way.
         raise NotFoundError("Not found.", code="not_found")
 
     scheme, presented = get_authorization_scheme_param(authorization or "")

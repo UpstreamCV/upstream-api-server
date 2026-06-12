@@ -354,6 +354,8 @@ async def force_stop_stream(
             before={"state": owner["state"]},
             after={"state": stopped.state, "end_reason": "admin_forced"},
         )
+    # After COMMIT — a rollback must not count the transition.
+    stopped.transition.record()
 
     # Best-effort MediaMTX deprovision — same posture as the agent stop route.
     try:

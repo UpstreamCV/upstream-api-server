@@ -178,6 +178,9 @@ async def start(
         raise
 
     session_id_var.set(result.session.id)
+    # Metric facts record only after the transaction above committed —
+    # a rollback must not count a transition (see TransitionRecord).
+    result.transition.record()
 
     # Phase 2 / FU-6 — provision a dynamic MediaMTX path with the session's
     # SRT passphrase. Must happen AFTER the DB transaction commits so a
@@ -201,7 +204,7 @@ async def start(
             status=exc.status,
         )
         async with pool.acquire() as conn2, conn2.transaction():
-            await mark_failed(
+            failed_state = await mark_failed(
                 conn2,
                 session_id=result.session.id,
                 observed=None,
@@ -209,6 +212,7 @@ async def start(
                 failure_code="mediamtx_provision_failed",
                 failure_message=f"reason={exc.reason} status={exc.status}"[:512],
             )
+        failed_state.transition.record()
         raise BadGatewayError(
             "Streaming server is unreachable; session marked failed.",
             code="upstream_unavailable",
@@ -236,6 +240,8 @@ async def stop(
             account_id=auth.account_id,
             session_id=session_id,
         )
+    # After COMMIT — a rollback must not count the transition.
+    row.transition.record()
 
     # Best-effort deprovision of the per-session MediaMTX path (Phase 2).
     # MediaMTX may be down or have already dropped the path on its own

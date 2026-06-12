@@ -1,7 +1,7 @@
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import Field, SecretStr
+from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -32,6 +32,18 @@ class Settings(BaseSettings):
     # M9.3: optional — when unset, GET /metrics 404s (the endpoint does not
     # exist for that deployment). Deployed envs keep it set.
     prometheus_auth_token: SecretStr | None = None
+
+    @field_validator("prometheus_auth_token", mode="before")
+    @classmethod
+    def _empty_prometheus_auth_token_is_unset(cls, v: object) -> object:
+        """``UPSTREAM_PROMETHEUS_AUTH_TOKEN=""`` must behave as unset (404)
+        rather than configuring a token no request can ever match — the
+        bearer check rejects empty credentials, so an empty-string token
+        would make /metrics permanently 401. Same posture as the empty
+        ``fanout_token_secret`` fix in routers/cameras.py."""
+        if isinstance(v, SecretStr):
+            return v if v.get_secret_value() else None
+        return v if v else None
 
     # Comma-separated list in env (UPSTREAM_ALLOWED_ORIGINS=a,b,c).
     # Surfaced as ``allowed_origins: list[str]`` below.
