@@ -17,7 +17,7 @@ import asyncpg
 
 from upstream_api.config import Settings
 from upstream_api.errors import ConflictError, NotFoundError
-from upstream_api.observability.metrics import record_transition
+from upstream_api.observability.metrics import NO_TRANSITION, TransitionRecord
 from upstream_api.security.session_jwt import (
     SessionLimits,
     SessionTokenClaims,
@@ -43,6 +43,10 @@ class StreamSessionRow:
     ended_at: datetime | None
     requested: RequestedStream
     approved: LimitsSnapshot
+    # Deferred metric facts — the router records AFTER its transaction
+    # commits (see observability/metrics.TransitionRecord). Defaults to the
+    # no-op so read-path constructors need not care.
+    transition: TransitionRecord = NO_TRANSITION
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,6 +63,8 @@ class StartSessionResult:
     # baked into `srt_url`. Caller is responsible for NEVER logging
     # this value.
     srt_publish_passphrase: str
+    # Deferred metric facts; the /start router records after COMMIT.
+    transition: TransitionRecord = NO_TRANSITION
 
 
 # SRT latency in milliseconds per mode. Lower = lower glass-to-glass delay,
@@ -235,8 +241,6 @@ async def start_session(
         ) from exc
     assert row is not None  # insert ... returning always returns a row
 
-    record_transition("created", "approved")
-
     await record_event(
         conn,
         account_id=account_id,
@@ -267,6 +271,8 @@ async def start_session(
         claims=claims,
         srt_url=srt_url,
         srt_publish_passphrase=srt_publish_passphrase,
+        # The /start router records this after its transaction commits.
+        transition=TransitionRecord("created", "approved"),
     )
 
 
@@ -278,6 +284,10 @@ async def stop_session(
     reason: str = "agent_requested",
 ) -> StreamSessionRow:
     """Idempotent stop: ``approved|streaming`` -> ``ended``. No-op on terminal."""
+    # FOR UPDATE pins the state read here as the state the UPDATE below
+    # transitions from: without the row lock, a concurrent approved→streaming
+    # commit between this read and the UPDATE would get the transition logged
+    # with a stale from_state label.
     row = await conn.fetchrow(
         """
         select id, account_id, agent_id, camera_id, state, srt_url, streamid,
@@ -286,6 +296,7 @@ async def stop_session(
                lim_width, lim_height, lim_fps, lim_codec, lim_bitrate_kbps, lim_latency_mode
           from stream_sessions
          where id = $1
+           for update
         """,
         session_id,
     )
@@ -308,9 +319,6 @@ async def stop_session(
         assert updated is not None
         state = updated["state"]
         ended_at = updated["ended_at"]
-
-        # row["state"] is the pre-update select, i.e. the real from-state.
-        record_transition(row["state"], "ended")
 
         # Mirror to cameras.status so the cameras list view returns to "idle".
         # The streaming-server's runOnNotReady hook only fires after MediaMTX
@@ -338,9 +346,16 @@ async def stop_session(
             unit="seconds",
             metadata={"reason": reason},
         )
+
+        # row["state"] is the FOR-UPDATE-locked pre-update read, i.e. the
+        # real from-state. Returned as deferred facts; the callers (/stop,
+        # admin force-stop) record after their transactions COMMIT, exactly
+        # like the ingest webhooks.
+        transition = TransitionRecord(row["state"], "ended")
     else:
         state = row["state"]
         ended_at = row["ended_at"]
+        transition = NO_TRANSITION
 
     return StreamSessionRow(
         id=row["id"],
@@ -370,4 +385,5 @@ async def stop_session(
             bitrate_kbps=row["lim_bitrate_kbps"],
             latency_mode=row["lim_latency_mode"],
         ),
+        transition=transition,
     )

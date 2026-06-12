@@ -2,6 +2,11 @@
 
 Each transition is encoded as a single SQL statement so the DB is the only
 source of truth for session state. Callers must hold a transaction.
+
+Metrics: the ``mark_*`` helpers never touch the Prometheus registry
+themselves — they return the new state as a :class:`SessionState` carrying a
+``TransitionRecord``, and the caller runs ``state.transition.record()`` after
+its transaction commits (see ``observability/metrics.py``).
 """
 
 from __future__ import annotations
@@ -15,7 +20,29 @@ from uuid import UUID
 import asyncpg
 
 from upstream_api.errors import ConflictError, NotFoundError
-from upstream_api.observability.metrics import observe_time_to_streaming, record_transition
+from upstream_api.observability.metrics import NO_TRANSITION, TransitionRecord
+
+
+class SessionState(str):
+    """A session-state string that also carries the transition facts.
+
+    The ``mark_*`` helpers write inside the CALLER's transaction, so they
+    must not increment metrics inline — on rollback the counter would keep a
+    phantom transition, and the webhook retry would then count it again.
+    Instead the new state comes back as this ``str`` subclass and the caller
+    runs ``state.transition.record()`` once its ``conn.transaction()`` block
+    has exited (i.e. after COMMIT). Subclassing ``str`` keeps every existing
+    consumer (response bodies, comparisons, logging) unchanged.
+    """
+
+    __slots__ = ("transition",)
+
+    transition: TransitionRecord
+
+    def __new__(cls, state: str, transition: TransitionRecord) -> SessionState:
+        obj = super().__new__(cls, state)
+        obj.transition = transition
+        return obj
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,7 +155,7 @@ async def mark_streaming(
     session_id: UUID,
     observed: dict[str, Any],
     started_at: datetime,
-) -> str:
+) -> SessionState:
     """Transition ``approved`` -> ``streaming`` and write the ffprobe snapshot.
 
     Inserts a passing ``stream_validations`` row alongside the transition so
@@ -170,7 +197,7 @@ async def mark_streaming(
             raise NotFoundError("Session not found.", code="session_not_found")
         if existing.state == "streaming":
             await _sync_camera_status(conn, session_id, "streaming")
-            return existing.state
+            return SessionState(existing.state, NO_TRANSITION)
         raise ConflictError(
             f"Session is in state '{existing.state}', expected 'approved'.",
             code="stream_state_invalid",
@@ -179,14 +206,15 @@ async def mark_streaming(
 
     await _sync_camera_status(conn, session_id, "streaming")
 
-    record_transition("approved", "streaming")
     # Time-to-streaming SLI (doc 01 §5): /start (row creation) → this webhook.
     # `started_at` is caller-supplied and `created_at` driver-supplied; skip if
     # either side is tz-naive so a quirky caller (or a non-timestamptz column)
-    # can't crash the transition with an aware/naive subtraction.
+    # can't crash the transition with an aware/naive subtraction. Computed here,
+    # observed by the caller after commit (via the returned TransitionRecord).
     created_at = row["created_at"]
+    time_to_streaming: float | None = None
     if created_at is not None and created_at.tzinfo is not None and started_at.tzinfo is not None:
-        observe_time_to_streaming(max(0.0, (started_at - created_at).total_seconds()))
+        time_to_streaming = max(0.0, (started_at - created_at).total_seconds())
 
     expected = {
         "codec": row["lim_codec"],
@@ -205,7 +233,10 @@ async def mark_streaming(
         json.dumps(observed),
         json.dumps(expected),
     )
-    return str(row["state"])
+    return SessionState(
+        str(row["state"]),
+        TransitionRecord("approved", "streaming", time_to_streaming),
+    )
 
 
 async def mark_ended(
@@ -214,7 +245,7 @@ async def mark_ended(
     session_id: UUID,
     ended_at: datetime,
     reason: str,
-) -> tuple[str, float | None]:
+) -> tuple[SessionState, float | None]:
     """Transition any non-terminal state -> ``ended``. Idempotent.
 
     Mirrors the transition onto ``cameras.status = 'idle'`` so the dashboard
@@ -239,18 +270,18 @@ async def mark_ended(
         existing = await load_session_state(conn, session_id)
         if existing is None:
             raise NotFoundError("Session not found.", code="session_not_found")
-        return existing.state, None
+        return SessionState(existing.state, NO_TRANSITION), None
 
     await _sync_camera_status(conn, session_id, "idle")
 
     # `started_at` is written exactly once, on the approved→streaming edge,
     # so its presence is the authoritative "was streaming" marker.
-    record_transition("streaming" if row["started_at"] is not None else "approved", "ended")
+    from_state = "streaming" if row["started_at"] is not None else "approved"
 
     duration: float | None = None
     if row["started_at"] is not None and row["ended_at"] is not None:
         duration = (row["ended_at"] - row["started_at"]).total_seconds()
-    return str(row["state"]), duration
+    return SessionState(str(row["state"]), TransitionRecord(from_state, "ended")), duration
 
 
 async def mark_failed(
@@ -261,7 +292,7 @@ async def mark_failed(
     mismatch_fields: list[str],
     failure_code: str,
     failure_message: str,
-) -> str:
+) -> SessionState:
     """Transition any non-terminal state -> ``failed``. Writes a failing validation.
 
     Mirrors the transition onto ``cameras.status = 'error'`` so the dashboard
@@ -289,7 +320,7 @@ async def mark_failed(
     await _sync_camera_status(conn, session_id, "error")
 
     # Same `started_at` reasoning as mark_ended above.
-    record_transition("streaming" if row["started_at"] is not None else "approved", "failed")
+    from_state = "streaming" if row["started_at"] is not None else "approved"
 
     expected = {
         "codec": row["lim_codec"],
@@ -309,7 +340,7 @@ async def mark_failed(
         json.dumps(expected),
         mismatch_fields,
     )
-    return str(row["state"])
+    return SessionState(str(row["state"]), TransitionRecord(from_state, "failed"))
 
 
 async def insert_validation_report(

@@ -152,6 +152,9 @@ async def stream_started(
             observed=observed,
             started_at=body.started_at,
         )
+    # Metrics AFTER the commit: recording inside the transaction would leave
+    # a phantom transition on rollback, double-counted by the webhook retry.
+    state.transition.record()
     session_id_var.set(body.session_id)
     return IngestActionResponse(session_id=body.session_id, state=state)
 
@@ -209,6 +212,9 @@ async def stream_ended(
                 "reason": body.reason,
             },
         )
+
+    # Metrics AFTER the commit — see the note in stream_started.
+    state.transition.record()
 
     # Best-effort MediaMTX path teardown — outside the DB txn so a
     # streaming-server outage can't roll back the lifecycle write.
@@ -284,6 +290,9 @@ async def validation_failed(
         )
         # Read streamid for the deprovision call while we still hold conn.
         session = await load_session_state(conn, body.session_id)
+
+    # Metrics AFTER the commit — see the note in stream_started.
+    state.transition.record()
 
     if session is not None:
         # Same best-effort semantics as `/stream-ended` above; see the

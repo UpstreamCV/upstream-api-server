@@ -4,6 +4,107 @@ Reverse chronological. Newest at top. Every meaningful commit gets an entry foll
 
 ---
 
+## 2026-06-11 - fix(metrics): record transitions after commit; atomic stop from-state; empty token = unset
+
+### Summary
+Review fixes for the M9.3 metrics wiring. (1) `session_transitions_total` /
+`session_start_to_streaming_seconds` were incremented INSIDE the open DB
+transaction (`mark_streaming`/`mark_ended`/`mark_failed` run under the ingest
+routers' `conn.transaction()` blocks), so a rollback left a phantom
+transition counted and the streaming server's webhook retry then counted the
+same transition twice. The `mark_*` helpers now return the new state as a
+`SessionState` (a `str` subclass — response bodies and comparisons are
+unchanged) carrying a `TransitionRecord`; the ingest handlers call
+`state.transition.record()` as a one-liner just after their transaction
+block exits, i.e. after COMMIT. (2) `stop_session`'s from-state label could
+be stale: the state was read by a plain SELECT and the later UPDATE had no
+state guard, so a concurrent approved→streaming commit in the gap got logged
+as `from_state=approved`. The SELECT now takes `FOR UPDATE`, pinning the read
+state as the true pre-transition state. (3)
+`UPSTREAM_PROMETHEUS_AUTH_TOKEN=""` produced `SecretStr("")` — a configured
+token nothing can match, i.e. a permanently-401 `/metrics`. A
+`field_validator` coerces empty to None so empty behaves as unset (404),
+same posture as the fanout_token_secret fix. Also reworded the
+routers/metrics.py 404 comment (the JSON envelope and 405-on-POST mean it
+is not literally indistinguishable from an unmounted route) and noted in
+observability/metrics.py that the registry is per-process (single-instance
+posture; multi-worker would need the multiprocess collector).
+
+### Files touched
+- `src/upstream_api/observability/metrics.py` — `TransitionRecord` (+
+  `NO_TRANSITION` no-op sentinel) with `record()`; per-process-registry
+  docstring note.
+- `src/upstream_api/services/stream_validation.py` — `SessionState(str)`
+  return type; `mark_streaming`/`mark_ended`/`mark_failed` no longer touch
+  the registry, they return the transition facts (incl. time-to-streaming
+  seconds, still skipped for tz-naive timestamps).
+- `src/upstream_api/routers/ingest.py` — `stream-started`/`stream-ended`/
+  `validation-failed` call `state.transition.record()` after the
+  transaction block exits.
+- `src/upstream_api/services/session_lifecycle.py` — `stop_session` SELECT
+  takes `FOR UPDATE` (atomic from-state); `start_session`/`stop_session`
+  no longer record inline — `StartSessionResult` and `StreamSessionRow`
+  carry a `transition: TransitionRecord` (default `NO_TRANSITION`) and the
+  routers record after COMMIT.
+- `src/upstream_api/routers/stream_sessions.py` — `/start` records
+  `result.transition` after its transaction; the provision-failure
+  `mark_failed` records the returned facts after its own transaction;
+  `/stop` records `row.transition` after commit.
+- `src/upstream_api/routers/platform_admin/streams.py` — force-stop records
+  `stopped.transition` after its transaction block.
+- `src/upstream_api/config.py` — `prometheus_auth_token` empty-string →
+  None validator.
+- `src/upstream_api/routers/metrics.py` — 404 comment reword; docstring
+  notes empty counts as unset.
+- `tests/test_metrics_endpoint.py` — transition tests replay the
+  record-after-commit caller pattern; new: service-level rollback (no
+  phantom count), route-level rollback through `/v1/ingest/validation-failed`
+  (500 + `outcome=server_error`, transitions delta 0), `track_ingest`
+  server_error propagation, empty-token 404, empty-Bearer-credential 401.
+
+### Functions/classes changed
+- `TransitionRecord` (new) — deferred metric facts; `record()` no-ops on the
+  default instance so idempotent paths stay one-liners.
+- `SessionState` (new) — `str` subclass carrying `.transition` to the call
+  site.
+- `mark_streaming` → `SessionState`; `mark_ended` →
+  `tuple[SessionState, float | None]`; `mark_failed` → `SessionState` —
+  same string values/tuple arity as before, so existing consumers and tests
+  unpack unchanged.
+- `stop_session` — `FOR UPDATE` on the state read; records the locked
+  pre-update state.
+- `Settings._empty_prometheus_auth_token_is_unset` (new validator).
+
+### System interaction notes
+Ingest webhook → router handler opens `pool.acquire()` +
+`conn.transaction()` → `mark_*` writes rows and RETURNS the facts →
+transaction commits on block exit → `state.transition.record()` increments
+the counters → response. On rollback the record line is never reached, so a
+retried webhook counts the transition exactly once.
+
+### Testing/checks
+- `uv run ruff format --check` + `uv run ruff check` green on all touched
+  files.
+- `uv run pytest -q tests/test_metrics_endpoint.py
+  tests/test_ingest_validation_failed.py tests/test_stream_validation.py
+  tests/test_stream_sessions_router.py tests/test_session_lifecycle.py`
+  — 41 passed.
+- Neighboring modules (ingest_*, camera_management, bootstrap, app_routes,
+  health, platform_admin_streams/system, stream_types, phase45): 140 passed.
+- `uv run mypy` (strict) clean on the six touched src files plus the two
+  untouched caller routers.
+
+### Follow-up TODOs
+- None — the originally-deferred router migrations
+  (`routers/stream_sessions.py` `/start`/`/stop`/provision-failure
+  `mark_failed`, `routers/platform_admin/streams.py` force-stop) were
+  completed in this same commit: all four sites record from the returned
+  `TransitionRecord` after their transaction blocks, ingest-style. Every
+  `session_transitions_total` increment in the codebase is now
+  post-commit.
+
+---
+
 ## 2026-06-11 - chore: lint/format hygiene for the perception/fanout commits
 
 ### Summary

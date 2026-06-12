@@ -17,12 +17,13 @@ from typing import Any
 from unittest.mock import AsyncMock, patch
 from uuid import UUID, uuid4
 
+import pytest
 from fastapi.testclient import TestClient
 
 from upstream_api.app import create_app
 from upstream_api.config import Settings, get_settings
 from upstream_api.db.pool import get_pool
-from upstream_api.observability.metrics import registry
+from upstream_api.observability.metrics import registry, track_ingest
 from upstream_api.security.streamid import build_streamid, mint_stream_key
 from upstream_api.services.limits import RequestedStream
 from upstream_api.services.session_lifecycle import start_session
@@ -162,6 +163,25 @@ class TransitionFakeConn:
         return "OK"
 
 
+class RollbackTx:
+    """Transaction context whose exit raises — the body's statements succeed,
+    then COMMIT fails (or a later in-transaction statement did), so everything
+    rolls back. Mirrors the `async with conn.transaction():` caller pattern."""
+
+    async def __aenter__(self) -> RollbackTx:
+        return self
+
+    async def __aexit__(self, *_exc: Any) -> None:
+        raise RuntimeError("simulated commit failure / rollback")
+
+
+class RollbackConn(TransitionFakeConn):
+    """TransitionFakeConn whose transaction never commits."""
+
+    def transaction(self) -> RollbackTx:
+        return RollbackTx()
+
+
 class StartSessionFakeConn:
     """Serves the queries `start_session` makes (camera, limits, insert);
     trimmed from tests/test_stream_sessions_router.py."""
@@ -256,9 +276,30 @@ def test_metrics_404_when_token_unset() -> None:
     assert r.status_code == 404
 
 
+def test_metrics_404_when_token_empty_string(monkeypatch: pytest.MonkeyPatch) -> None:
+    """UPSTREAM_PROMETHEUS_AUTH_TOKEN='' must behave as unset (404), not as a
+    configured-but-unmatchable token (permanently-401 endpoint) — the config
+    validator coerces empty to None. setenv("") rather than delenv: Settings
+    also reads the repo .env, and an explicit empty value overrides it (same
+    pattern as test_perception_stream_token.py)."""
+    monkeypatch.setenv("UPSTREAM_PROMETHEUS_AUTH_TOKEN", "")
+    get_settings.cache_clear()
+    client = TestClient(create_app())
+    r = client.get("/metrics", headers={"Authorization": "Bearer anything"})
+    assert r.status_code == 404
+
+
 def test_metrics_401_on_missing_header() -> None:
     client = TestClient(create_app())
     r = client.get("/metrics")
+    assert r.status_code == 401
+
+
+def test_metrics_401_on_empty_bearer_credential() -> None:
+    """'Authorization: Bearer ' (scheme only, empty credential) is rejected
+    before the constant-time compare ever runs."""
+    client = TestClient(create_app())
+    r = client.get("/metrics", headers={"Authorization": "Bearer "})
     assert r.status_code == 401
 
 
@@ -405,7 +446,9 @@ def test_ingest_snapshots_client_error_increments_counter() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Session-transition counters + time-to-streaming histogram (service level)
+# Session-transition counters + time-to-streaming histogram (service level).
+# The mark_* helpers RETURN the transition facts; the caller records them
+# after its transaction commits — these tests replay that caller pattern.
 # ---------------------------------------------------------------------------
 
 
@@ -427,14 +470,91 @@ async def test_mark_streaming_records_transition_and_histogram() -> None:
         }
     )
     observed = {"codec": "h264", "width": 1280, "height": 720, "fps": 30, "bitrate_kbps": 2980}
-    await mark_streaming(
+    state = await mark_streaming(
         conn, session_id=uuid4(), observed=observed, started_at=datetime.now(tz=UTC)
     )
+    state.transition.record()  # what the router does after COMMIT
 
     assert _transitions("approved", "streaming") == before_t + 1
     assert _sample("session_start_to_streaming_seconds_count") == before_count + 1
     # ~3 s elapsed between the faked created_at and started_at.
     assert _sample("session_start_to_streaming_seconds_sum") >= before_sum + 2
+
+
+async def test_mark_streaming_rollback_does_not_count_transition() -> None:
+    """A transaction that fails AFTER mark_streaming returns must not move
+    any counter: recording belongs to the caller, after COMMIT. Otherwise the
+    rolled-back transition counts once now (a phantom — no state actually
+    changed) and once more when the streaming server retries the webhook."""
+    before_t = _transitions("approved", "streaming")
+    before_count = _sample("session_start_to_streaming_seconds_count")
+
+    conn = TransitionFakeConn(
+        update_returns={
+            "state": "streaming",
+            "created_at": datetime.now(tz=UTC) - timedelta(seconds=3),
+            "lim_width": 1280,
+            "lim_height": 720,
+            "lim_fps": 30,
+            "lim_codec": "h264",
+            "lim_bitrate_kbps": 3000,
+            "lim_latency_mode": "balanced",
+        }
+    )
+    observed = {"codec": "h264", "width": 1280, "height": 720, "fps": 30, "bitrate_kbps": 2980}
+    with pytest.raises(RuntimeError):
+        async with RollbackTx():
+            await mark_streaming(
+                conn, session_id=uuid4(), observed=observed, started_at=datetime.now(tz=UTC)
+            )
+            # The caller's `state.transition.record()` lives AFTER the
+            # transaction block, so it is never reached on rollback.
+
+    assert _transitions("approved", "streaming") == before_t
+    assert _sample("session_start_to_streaming_seconds_count") == before_count
+
+
+def test_validation_failed_rollback_records_no_transition() -> None:
+    """Route-level record-after-commit: when the webhook's transaction fails
+    on exit, /v1/ingest/validation-failed 500s (outcome=server_error) and
+    session_transitions_total must not move — the retry will count it."""
+    before_t = _transitions("approved", "failed")
+    before_err = _sample(
+        "ingest_webhook_total", {"endpoint": "validation-failed", "outcome": "server_error"}
+    )
+
+    conn = RollbackConn(
+        update_returns={
+            "state": "failed",
+            "started_at": None,
+            "lim_width": 1280,
+            "lim_height": 720,
+            "lim_fps": 30,
+            "lim_codec": "h264",
+            "lim_bitrate_kbps": 3000,
+            "lim_latency_mode": "balanced",
+        }
+    )
+    app = create_app()
+    app.dependency_overrides[get_pool] = lambda: FakePool(conn)
+    client = TestClient(app, raise_server_exceptions=False)
+    r = client.post(
+        "/v1/ingest/validation-failed",
+        json={
+            "session_id": str(uuid4()),
+            "mismatch_fields": ["codec"],
+            "failure_code": "codec_mismatch",
+            "failure_message": "expected h264, observed h265",
+        },
+        headers=_webhook_headers(),
+    )
+
+    assert r.status_code == 500
+    assert _transitions("approved", "failed") == before_t
+    after_err = _sample(
+        "ingest_webhook_total", {"endpoint": "validation-failed", "outcome": "server_error"}
+    )
+    assert after_err == before_err + 1
 
 
 async def test_mark_streaming_naive_created_at_skips_histogram() -> None:
@@ -460,6 +580,7 @@ async def test_mark_streaming_naive_created_at_skips_histogram() -> None:
     state = await mark_streaming(
         conn, session_id=uuid4(), observed=observed, started_at=datetime.now(tz=UTC)
     )
+    state.transition.record()
 
     assert state == "streaming"
     assert _transitions("approved", "streaming") == before_t + 1
@@ -470,9 +591,10 @@ async def test_mark_streaming_reconnect_does_not_record_transition() -> None:
     before_t = _transitions("approved", "streaming")
     conn = TransitionFakeConn(update_returns=None, current_state="streaming")
     observed = {"codec": "h264", "width": 1280, "height": 720, "fps": 30, "bitrate_kbps": 2980}
-    await mark_streaming(
+    state = await mark_streaming(
         conn, session_id=uuid4(), observed=observed, started_at=datetime.now(tz=UTC)
     )
+    state.transition.record()  # NO_TRANSITION on the idempotent path: a no-op
     assert _transitions("approved", "streaming") == before_t
 
 
@@ -485,9 +607,10 @@ async def test_mark_ended_records_streaming_to_ended() -> None:
             "ended_at": datetime.now(tz=UTC),
         }
     )
-    await mark_ended(
+    state, _duration = await mark_ended(
         conn, session_id=uuid4(), ended_at=datetime.now(tz=UTC), reason="client_disconnect"
     )
+    state.transition.record()
     assert _transitions("streaming", "ended") == before_t + 1
 
 
@@ -506,7 +629,7 @@ async def test_mark_failed_records_approved_to_failed() -> None:
             "lim_latency_mode": "balanced",
         }
     )
-    await mark_failed(
+    state = await mark_failed(
         conn,
         session_id=uuid4(),
         observed=None,
@@ -514,21 +637,49 @@ async def test_mark_failed_records_approved_to_failed() -> None:
         failure_code="codec_mismatch",
         failure_message="expected h264, observed h265",
     )
+    state.transition.record()
     assert _transitions("approved", "failed") == before_t + 1
 
 
-async def test_start_session_records_created_to_approved() -> None:
+async def test_track_ingest_records_server_error_and_propagates() -> None:
+    """An unexpected exception inside a tracked handler is counted as
+    outcome=server_error and still propagates to the framework."""
+    before = _sample("ingest_webhook_total", {"endpoint": "boom-test", "outcome": "server_error"})
+
+    @track_ingest("boom-test")
+    async def handler() -> None:
+        raise RuntimeError("boom")
+
+    with pytest.raises(RuntimeError, match="boom"):
+        await handler()
+
+    assert (
+        _sample("ingest_webhook_total", {"endpoint": "boom-test", "outcome": "server_error"})
+        == before + 1
+    )
+
+
+async def test_start_session_returns_transition_recorded_only_by_caller() -> None:
+    """start_session must NOT increment inside the (caller-owned)
+    transaction; it returns the facts and the /start router records them
+    after COMMIT."""
     before_t = _transitions("created", "approved")
     account_id = uuid4()
     conn = StartSessionFakeConn(account_id)
     requested = RequestedStream(
         width=1280, height=720, fps=30, codec="h264", bitrate_kbps=3000, latency_mode="balanced"
     )
-    await start_session(
+    result = await start_session(
         conn,
         settings=get_settings(),
         account_id=account_id,
         camera_id=uuid4(),
         requested=requested,
     )
+    # No increment inside the service (a rollback must not count).
+    assert _transitions("created", "approved") == before_t
+    assert result.transition.from_state == "created"
+    assert result.transition.to_state == "approved"
+    # The router's post-commit one-liner is what counts it.
+    result.transition.record()
     assert _transitions("created", "approved") == before_t + 1
