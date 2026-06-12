@@ -103,9 +103,7 @@ _PATH = "/v1/cameras/{camera_id}/perception/stream-token"
 def test_mint_happy_path_token_verifies(fanout_env: None) -> None:
     account, camera, user = uuid4(), uuid4(), uuid4()
     conn = FakeCameraConn(camera_account_id=account)
-    r = _user_client(conn, account_id=account, user_id=user).post(
-        _PATH.format(camera_id=camera)
-    )
+    r = _user_client(conn, account_id=account, user_id=user).post(_PATH.format(camera_id=camera))
     assert r.status_code == 200, r.text
     body = r.json()
     assert set(body.keys()) == {"token", "ws_url", "expires_at"}
@@ -150,9 +148,7 @@ def test_mint_unknown_camera_404(fanout_env: None) -> None:
 def test_mint_cross_tenant_camera_404(fanout_env: None) -> None:
     caller_account, other_account = uuid4(), uuid4()
     conn = FakeCameraConn(camera_account_id=other_account)
-    r = _user_client(conn, account_id=caller_account).post(
-        _PATH.format(camera_id=uuid4())
-    )
+    r = _user_client(conn, account_id=caller_account).post(_PATH.format(camera_id=uuid4()))
     assert r.status_code == 404
     assert r.json()["error"]["code"] == "camera_not_found"
 

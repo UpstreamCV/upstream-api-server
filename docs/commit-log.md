@@ -4,6 +4,20 @@ Reverse chronological. Newest at top. Every meaningful commit gets an entry foll
 
 ---
 
+## 2026-06-11 - chore: lint/format hygiene for the perception/fanout commits
+
+### Summary
+`ruff format` on 3 files (`security/fanout_token.py`,
+`tests/test_perception_stream_token.py`,
+`tests/test_platform_admin_system.py`), import-order fix in
+`routers/cameras.py` (I001, auto-fix), and two ambiguous en-dashes ->
+hyphens (RUF002/RUF003 in `routers/cameras.py` docstring and
+`config.py` comment). No behavior change. Restores `ruff format
+--check` + `ruff check src tests` to green at HEAD; full suite 1187
+passed.
+
+---
+
 ## 2026-06-11 - Review fix: empty fanout_token_secret counts as unconfigured
 
 ### Summary
