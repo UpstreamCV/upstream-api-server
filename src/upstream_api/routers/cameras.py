@@ -55,6 +55,7 @@ from upstream_api.services.limits import (
     check_stream_type_allowed,
     load_account_limits,
 )
+from upstream_api.services.models import get_model
 from upstream_api.services.processing_config_camera import (
     default_camera_processing_config_record,
     fetch_camera_processing_config,
@@ -901,5 +902,44 @@ async def put_processing_config(
             account_id=scope_account,
             camera_id=camera_id,
             config=body.config,
+        )
+
+        # Package assignment v1: the chosen model maps to a processor
+        # package (see services/models.py). Stamp it into cameras.metadata
+        # — the field the processor's eligible-sessions payload reads — so
+        # the model picker genuinely switches the processing engine. Takes
+        # effect on the camera's NEXT stream session. ``get_model`` cannot
+        # return None here: the request schema already validated model_key.
+        model_entry = get_model(body.config.model_key)
+        if model_entry is not None and model_entry.package_id is not None:
+            await conn.execute(
+                """
+                update cameras
+                   set metadata = jsonb_set(
+                           coalesce(metadata, '{}'::jsonb),
+                           '{package_id}',
+                           to_jsonb($2::text)
+                       ),
+                       updated_at = now()
+                 where id = $1
+                """,
+                camera_id,
+                model_entry.package_id,
+            )
+
+        await try_record_account_audit_log(
+            conn,
+            account_id=scope_account,
+            event_type="camera.processing_config_updated",
+            summary=f"Processing config updated (model {body.config.model_key}).",
+            actor_user_id=caller.user.user_id if caller.user else None,
+            actor_type="user" if caller.user else "system",
+            resource_type="camera",
+            resource_id=str(camera_id),
+            metadata={
+                "model_key": body.config.model_key,
+                "package_id": model_entry.package_id if model_entry else None,
+                "revision": record.revision,
+            },
         )
     return CameraProcessingConfigResponse(processing_config=record)

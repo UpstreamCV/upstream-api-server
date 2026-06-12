@@ -86,6 +86,18 @@ class FakeProcessingConn:
         self.row = row
         self.select_queries: list[tuple[Any, ...]] = []
         self.upserts: list[tuple[Any, ...]] = []
+        # Package-assignment v1: records the cameras.metadata package stamp
+        # (and answers the audit writer's best-effort probes).
+        self.executes: list[tuple[str, tuple[Any, ...]]] = []
+
+    async def execute(self, query: str, *args: Any) -> str:
+        self.executes.append((query, args))
+        return "UPDATE 1"
+
+    async def fetchval(self, query: str, *args: Any) -> Any:
+        # account_audit's to_regclass probe — report the table missing so
+        # the best-effort audit write no-ops in these unit tests.
+        return None
 
     def transaction(self) -> FakeTransaction:
         return FakeTransaction()
@@ -367,3 +379,81 @@ def test_put_rejects_styling_overlay_style_field() -> None:
     r = _put_bad(conn, account, camera, _config(overlay_style={"stroke": 2}))
     assert r.status_code == 422
     assert conn.upserts == []
+
+
+# --- package assignment v1: model choice stamps the camera's package ---------
+
+
+@pytest.fixture(autouse=True)
+def _reset_audit_cache() -> Any:
+    """The audit writer caches its to_regclass probe module-globally; our
+    fake answers None (table missing), so reset around each test to avoid
+    leaking that verdict into other files."""
+    from upstream_api.services.account_audit import reset_audit_table_cache
+
+    reset_audit_table_cache()
+    yield
+    reset_audit_table_cache()
+
+
+def _package_stamps(conn: FakeProcessingConn) -> list[tuple[str, tuple[Any, ...]]]:
+    return [(q, a) for q, a in conn.executes if "jsonb_set" in q]
+
+
+def _put_model(conn: FakeProcessingConn, account: UUID, camera: UUID, model_key: str) -> Any:
+    return _caller_client(conn, account_id=account).put(
+        _PATH.format(camera_id=camera),
+        json={"config": _config(model_key=model_key)},
+    )
+
+
+def test_put_yolox_model_stamps_yolox_package() -> None:
+    account, camera = uuid4(), uuid4()
+    conn = FakeProcessingConn(camera_account_id=account, row=None)
+    r = _put_model(conn, account, camera, "yolox_s_v1")
+    assert r.status_code == 200
+    stamps = _package_stamps(conn)
+    assert len(stamps) == 1
+    query, args = stamps[0]
+    assert "update cameras" in query
+    assert "'{package_id}'" in query
+    assert args == (camera, "deepstream.yolox_analytics_probe.v0")
+
+
+def test_put_trafficcamnet_model_stamps_analytics_package() -> None:
+    account, camera = uuid4(), uuid4()
+    conn = FakeProcessingConn(camera_account_id=account, row=None)
+    r = _put_model(conn, account, camera, "trafficcamnet_v1")
+    assert r.status_code == 200
+    assert _package_stamps(conn)[0][1] == (camera, "deepstream.analytics_probe.v0")
+
+
+def test_put_mock_model_stamps_mock_package() -> None:
+    account, camera = uuid4(), uuid4()
+    conn = FakeProcessingConn(camera_account_id=account, row=None)
+    r = _put_model(conn, account, camera, "mock_detect_v0")
+    assert r.status_code == 200
+    assert _package_stamps(conn)[0][1] == (camera, "mock.detect.v0")
+
+
+def test_metadata_stamp_is_surgical_jsonb_set() -> None:
+    """The stamp must set ONE key — pinned by asserting the SQL uses
+    jsonb_set over coalesce(metadata,'{}'), never a whole-column overwrite."""
+    account, camera = uuid4(), uuid4()
+    conn = FakeProcessingConn(camera_account_id=account, row=None)
+    _put_model(conn, account, camera, "yolox_s_v1")
+    query = _package_stamps(conn)[0][0]
+    assert "coalesce(metadata, '{}'::jsonb)" in query
+    assert "set metadata = jsonb_set(" in query
+
+
+def test_models_catalog_exposes_package_ids() -> None:
+    from upstream_api.services.models import get_model, list_models
+
+    by_key = {m.model_key: m for m in list_models()}
+    assert by_key["yolox_s_v1"].package_id == "deepstream.yolox_analytics_probe.v0"
+    assert by_key["yolox_s_v1"].enabled is True
+    assert "person" in by_key["yolox_s_v1"].supported_classes
+    assert by_key["trafficcamnet_v1"].package_id == "deepstream.analytics_probe.v0"
+    assert by_key["mock_detect_v0"].package_id == "mock.detect.v0"
+    assert get_model("yolox_s_v1") is not None
