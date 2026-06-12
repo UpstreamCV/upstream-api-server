@@ -11,6 +11,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
 
+import pytest
 from fastapi.testclient import TestClient
 
 from upstream_api.app import create_app
@@ -297,3 +298,56 @@ def test_bootstrap_route_not_shadowed_by_agent_id_route() -> None:
     r = _client(conn).get("/v1/agents/bootstrap")
     # A route-order bug would parse "bootstrap" as a UUID -> 422.
     assert r.status_code == 200
+
+
+# --- update M2: agent version policy ----------------------------------------
+
+
+def test_bootstrap_version_policy_null_when_unconfigured() -> None:
+    conn = FakeConn()
+    r = _client(conn).get("/v1/agents/bootstrap")
+    assert r.status_code == 200
+    assert r.json()["agent_version_policy"] is None
+
+
+def test_bootstrap_version_policy_present_when_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from upstream_api.config import get_settings
+
+    settings = get_settings().model_copy(
+        update={
+            "agent_latest_version": "0.2.0",
+            "agent_min_supported_version": "0.1.0",
+            "agent_update_severity_hint": "recommended",
+            "agent_release_notes_url": "https://example.test/releases",
+            "agent_install_hint": "pip install --upgrade upstream-agent",
+        }
+    )
+    monkeypatch.setattr("upstream_api.routers.agents.get_settings", lambda: settings)
+    conn = FakeConn()
+    r = _client(conn).get("/v1/agents/bootstrap")
+    assert r.status_code == 200
+    policy = r.json()["agent_version_policy"]
+    assert policy == {
+        "latest_version": "0.2.0",
+        "minimum_supported_version": "0.1.0",
+        "severity_hint": "recommended",
+        "release_notes_url": "https://example.test/releases",
+        "install_hint": "pip install --upgrade upstream-agent",
+    }
+
+
+def test_bootstrap_version_policy_partial_config_still_ships(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Either of latest/minimum alone is enough to ship the policy; the
+    other fields ride along as null."""
+    from upstream_api.config import get_settings
+
+    settings = get_settings().model_copy(update={"agent_latest_version": "0.2.0"})
+    monkeypatch.setattr("upstream_api.routers.agents.get_settings", lambda: settings)
+    r = _client(FakeConn()).get("/v1/agents/bootstrap")
+    policy = r.json()["agent_version_policy"]
+    assert policy["latest_version"] == "0.2.0"
+    assert policy["minimum_supported_version"] is None

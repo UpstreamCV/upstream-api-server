@@ -75,6 +75,21 @@ class BootstrapSession(BaseModel):
     approved: dict[str, Any]
 
 
+class AgentVersionPolicy(BaseModel):
+    """Update M2 (notify-only): server-owned version facts the agent
+    compares itself against. Omitted entirely when unconfigured. The
+    agent computes the consequences locally; ``required`` is always
+    derived from minimum_supported_version, never sent.
+    ``severity_hint`` ∈ {"optional", "recommended"} dials notice loudness
+    only. install_hint is display text — never executed by the agent."""
+
+    latest_version: str | None = None
+    minimum_supported_version: str | None = None
+    severity_hint: str | None = None
+    release_notes_url: str | None = None
+    install_hint: str | None = None
+
+
 class BootstrapResponse(BaseModel):
     account: BootstrapAccount
     token: BootstrapToken
@@ -86,3 +101,5 @@ class BootstrapResponse(BaseModel):
     cameras: list[CameraResponse]
     active_sessions: list[BootstrapSession]
     server_time: datetime
+    # Update M2: omitted (None) unless the deployment configures a policy.
+    agent_version_policy: AgentVersionPolicy | None = None
