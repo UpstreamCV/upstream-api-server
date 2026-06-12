@@ -648,7 +648,14 @@ async def mint_perception_stream_token(
     token is returned once and never logged.
     """
     settings = get_settings()
-    if settings.fanout_token_secret is None or not settings.fanout_public_ws_url:
+    # An empty-string env var yields SecretStr("") (not None), and the sidecar
+    # fail-louds on the same empty value — treat empty as unconfigured here too
+    # so the operator gets the clean 503 instead of unverifiable tokens.
+    if (
+        settings.fanout_token_secret is None
+        or not settings.fanout_token_secret.get_secret_value()
+        or not settings.fanout_public_ws_url
+    ):
         raise PerceptionStreamNotConfiguredError(
             "Perception streaming is not configured for this deployment."
         )
