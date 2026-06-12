@@ -94,6 +94,18 @@ class Settings(BaseSettings):
     # SRT ingest endpoint advertised back to the agent in `srt_url`. Defaults
     # point at the public ingest hostname; override per env (dev/staging can
     # set these to a raw IP for a local streaming server).
+    # --- Agent version policy (update M2, notify-only) -------------------
+    # Server-owned facts the agent compares itself against; shipped on
+    # GET /v1/agents/bootstrap as ``agent_version_policy``. ALL optional:
+    # with latest+minimum both unset the field is omitted entirely and
+    # agents behave exactly as before. Strings are display facts — the
+    # agent never executes install_hint.
+    agent_latest_version: str | None = None
+    agent_min_supported_version: str | None = None
+    agent_update_severity_hint: str | None = None
+    agent_release_notes_url: str | None = None
+    agent_install_hint: str | None = None
+
     srt_ingest_host: str = "ingest.upstreamcv.com"
     srt_ingest_port: int = 18890
 

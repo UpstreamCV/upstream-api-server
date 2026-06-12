@@ -1665,6 +1665,29 @@ usage events for the current calendar month, so in-flight session time
 is invisible until the session ends. `agents` is empty when no agent
 has registered yet.
 
+**Agent version policy (update M2, notify-only).** The response carries an
+`agent_version_policy` object (or `null` when the deployment configures no
+policy — the default). Env-configured (`UPSTREAM_AGENT_LATEST_VERSION`,
+`UPSTREAM_AGENT_MIN_SUPPORTED_VERSION`, `UPSTREAM_AGENT_UPDATE_SEVERITY_HINT`,
+`UPSTREAM_AGENT_RELEASE_NOTES_URL`, `UPSTREAM_AGENT_INSTALL_HINT`); shipped
+when at least one of latest/minimum is set:
+
+```json
+"agent_version_policy": {
+  "latest_version": "0.2.0",
+  "minimum_supported_version": "0.1.0",
+  "severity_hint": "recommended",
+  "release_notes_url": "https://github.com/UpstreamCV/upstream-agent/releases",
+  "install_hint": "pip install --upgrade upstream-agent"
+}
+```
+
+The server owns these facts only; the agent compares its own version and
+decides what to show. `required` is always derived client-side from
+`minimum_supported_version` (the server never sends it), and `install_hint`
+is display text the agent never executes. No enforcement happens server-side
+in M2 (a below-minimum agent still streams; enforcement is the M3 milestone).
+
 ### Stream types (`allowed_stream_types` / `source_type`)
 
 - `POST /v1/cameras/register` accepts an optional `source_type` (max 32

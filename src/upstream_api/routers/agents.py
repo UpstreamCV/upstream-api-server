@@ -7,6 +7,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Query
 
+from upstream_api.config import get_settings
 from upstream_api.errors import NotFoundError
 from upstream_api.observability.context import agent_id_var
 from upstream_api.schemas.agents import (
@@ -25,6 +26,7 @@ from upstream_api.schemas.bootstrap import (
     BootstrapUsage,
 )
 from upstream_api.security.deps import CurrentAgent, CurrentCaller, PoolDep
+from upstream_api.services.agent_version_policy import build_agent_version_policy
 from upstream_api.services.limits import load_account_limits
 
 router = APIRouter(prefix="/v1/agents", tags=["agents"])
@@ -234,6 +236,8 @@ async def bootstrap(auth: CurrentAgent, pool: PoolDep) -> BootstrapResponse:
             for r in session_rows
         ],
         server_time=datetime.now(tz=UTC),
+        # Update M2: omitted unless this deployment configures a policy.
+        agent_version_policy=build_agent_version_policy(get_settings()),
     )
 
 

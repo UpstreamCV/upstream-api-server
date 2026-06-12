@@ -4,6 +4,24 @@ Reverse chronological. Newest at top. Every meaningful commit gets an entry foll
 
 ---
 
+## 2026-06-12 - feat(agents): agent version policy on bootstrap (update M2, notify-only)
+
+**Why:** stale agents miss reliability/security fixes and new contract
+expectations; the approved auto-update plan starts notify-only with the
+server owning the version facts.
+
+**What:** optional `agent_version_policy` on `GET /v1/agents/bootstrap`
+(null unless configured): latest_version / minimum_supported_version /
+severity_hint / release_notes_url / install_hint. Env-configured
+(5 UPSTREAM_AGENT_* settings) via the static
+`services/agent_version_policy.py` (plans/models catalog pattern — no
+DB). The agent compares locally; nothing is enforced server-side in M2.
+Companion agent work (upstream-agent repo): update_check module +
+startup/shell notices + 24h snooze. Tests: 3 bootstrap cases (null /
+full / partial). 1200 passed; mypy src+tests clean.
+
+---
+
 ## 2026-06-11 - Package assignment v1: model picker drives the processor package
 
 **Why:** after P5-F the full hot path works, but the engine was selected
