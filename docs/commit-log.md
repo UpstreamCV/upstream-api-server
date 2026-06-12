@@ -4,6 +4,40 @@ Reverse chronological. Newest at top. Every meaningful commit gets an entry foll
 
 ---
 
+## 2026-06-11 - Package assignment v1: model picker drives the processor package
+
+**Why:** after P5-F the full hot path works, but the engine was selected
+by a global UPSTREAM_FORCE_PACKAGE_ID env var on the processor host. The
+dashboard already had a per-camera model picker (GET /v1/models +
+camera_processing_configs.model_key) that was lineage-only; this makes it
+real without new UI.
+
+**What:** ModelRegistryEntry gains `package_id`; the catalog adds
+`yolox_s_v1` ("YOLOX-S (People Analytics)", enabled, curated class subset,
+package deepstream.yolox_analytics_probe.v0) and maps trafficcamnet_v1 /
+mock_detect_v0 to their packages. PUT
+/v1/cameras/{id}/processing-config now ALSO stamps
+cameras.metadata.package_id (surgical jsonb_set; same transaction) — the
+exact field the processor's eligible-sessions payload reads — and records
+a camera.processing_config_updated tenant audit event. Takes effect on
+the camera's next stream session. No migration (metadata jsonb exists);
+no new endpoints; dashboard needs no code change (the picker is
+catalog-driven).
+
+**Cutover note:** once cameras carry real package ids, remove
+UPSTREAM_FORCE_PACKAGE_ID from the processor host .env (it outranks
+per-camera selection); cameras without a saved processing config default
+to mock.detect.v0 by design.
+
+**Files:** schemas/models.py, services/models.py, routers/cameras.py,
+tests/test_camera_processing_config.py (+5: per-model package stamps,
+surgical-jsonb_set pin, catalog exposure), docs/api-contracts.md.
+
+**Checks:** full suite 1197 passed; `uv run mypy src tests` clean; ruff
+clean on src/tests.
+
+---
+
 ## 2026-06-11 - fix(metrics): record transitions after commit; atomic stop from-state; empty token = unset
 
 ### Summary

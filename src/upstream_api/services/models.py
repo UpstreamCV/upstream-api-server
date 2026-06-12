@@ -43,6 +43,7 @@ MODEL_REGISTRY: tuple[ModelRegistryEntry, ...] = (
             "Fixed to the 4 TrafficCamNet classes.",
             "Can misclassify people as cars in some scenes.",
         ],
+        package_id="deepstream.analytics_probe.v0",
     ),
     ModelRegistryEntry(
         model_key="mock_detect_v0",
@@ -59,6 +60,50 @@ MODEL_REGISTRY: tuple[ModelRegistryEntry, ...] = (
         enabled=True,
         notes="Development/testing detector; outputs are synthetic.",
         limitations=["Not a real detector."],
+        package_id="mock.detect.v0",
+    ),
+    ModelRegistryEntry(
+        model_key="yolox_s_v1",
+        display_name="YOLOX-S (People Analytics)",
+        description=(
+            "Apache-2.0 YOLOX-S detector (COCO classes) running through the "
+            "people-analytics pipeline — the recommended model for person "
+            "detection, zones, and line crossing."
+        ),
+        task_type="object_detection",
+        runtime="deepstream",
+        default_confidence_threshold=0.4,
+        # Curated, useful subset of COCO-80 for per-camera class filtering
+        # (the processing config caps selected_classes well below 80; the
+        # processor's package scopes analytics to person by default).
+        supported_classes=[
+            "person",
+            "car",
+            "truck",
+            "bus",
+            "bicycle",
+            "motorcycle",
+            "dog",
+            "cat",
+            "backpack",
+            "handbag",
+            "suitcase",
+        ],
+        supported_trackers=["iou"],
+        model_version="yolox_s_coco_0.1.1rc0_onnx",
+        detector_version=None,
+        resource_profile="gpu_medium",
+        enabled=True,
+        notes=(
+            "Live-verified on the processor (P5-B/P5-D/P5-F): reliable person "
+            "detection where TrafficCamNet was not; feeds the realtime "
+            "detection overlay."
+        ),
+        limitations=[
+            "Analytics events are scoped to person by default.",
+            "Tracker continuity through fast motion is a known follow-up.",
+        ],
+        package_id="deepstream.yolox_analytics_probe.v0",
     ),
 )
 

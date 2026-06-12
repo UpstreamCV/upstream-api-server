@@ -1148,9 +1148,14 @@ config references. `enabled: false` entries are still listed but cannot be
 selected by a processing-config PUT (→ 422). Unknown fields on an entry are
 rejected (`extra="forbid"`); no styling/overlay fields are modelled.
 
-The live processor does not consume this config yet — it runs its
-hard-coded detector; the catalog exists so the dashboard can author model
-selection ahead of processor integration.
+Each entry now carries `package_id` — the processor package the model
+selection maps to (package assignment v1). The processor's
+eligible-sessions payload reads the camera's package from
+`cameras.metadata.package_id`, and a processing-config PUT stamps it (see
+below), so the dashboard's model picker genuinely switches the processing
+engine. The processor applies the model/tracker bundled in the package;
+confidence/classes/FPS from this config are applied per the M7 lineage
+rules.
 
 ### `GET /v1/cameras/{camera_id}/processing-config`
 
@@ -1228,6 +1233,15 @@ account).
 The live processor does not consume this config yet.
 
 ### `PUT /v1/cameras/{camera_id}/processing-config`
+
+**Package assignment v1 side effect:** on a successful save, the camera's
+`metadata.package_id` is set to the chosen model's `package_id` from the
+models catalog (`yolox_s_v1` → `deepstream.yolox_analytics_probe.v0`,
+`trafficcamnet_v1` → `deepstream.analytics_probe.v0`, `mock_detect_v0` →
+`mock.detect.v0`). The processor picks this up on the camera's NEXT stream
+session (an in-flight session keeps its package). Also records a
+`camera.processing_config_updated` tenant audit event with
+`{model_key, package_id, revision}`.
 
 M3/M4. Full-replace upsert of a camera's processing config. Query:
 `account_id`.

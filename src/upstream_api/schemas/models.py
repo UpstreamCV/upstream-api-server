@@ -40,6 +40,13 @@ class ModelRegistryEntry(BaseModel):
     enabled: bool
     notes: str | None
     limitations: list[str] | None
+    # Package assignment v1: the processor package this model selection maps
+    # to. Saving a camera processing config with this model_key ALSO sets
+    # ``cameras.metadata.package_id`` (the field the processor's
+    # eligible-sessions payload reads), so the dashboard's existing model
+    # picker genuinely switches the processing engine. ``None`` = selecting
+    # this model leaves the camera's package untouched.
+    package_id: str | None = None
 
 
 class ModelsListResponse(BaseModel):
