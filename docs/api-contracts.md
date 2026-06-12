@@ -1561,7 +1561,7 @@ All mutations write an `admin_audit_log` row (`{before, after}` diff,
 | Method | Path | Notes |
 |---|---|---|
 | GET | `/v1/admin/me` | Gate check: `{user_id, email}`. |
-| GET | `/v1/admin/system/health` | Rollup: `{api, database, streaming_server, processors}`. Probes degrade (DB 0.5 s timeout, MediaMTX `GET /v3/paths/list` 1 s timeout → `unreachable`); always 200. |
+| GET | `/v1/admin/system/health` | Rollup: `{api, database, streaming_server, processors}`. Probes degrade (DB 0.5 s timeout, MediaMTX `GET /v3/paths/list` 1 s timeout → `unreachable`); always 200. `api.runtime` carries process vitals `{uptime_seconds, memory_rss_mb, load_1m}` (each null when the platform can't report it). |
 | GET | `/v1/admin/streams?state=&account_id=&limit=&offset=` | Cross-account sessions, newest first; each item carries `account_name/slug`, `camera_name`, `latest_heartbeat`, `latest_validation_passed`, `processor_status` (lateral joins). `{items, total}`. |
 | GET | `/v1/admin/streams/summary` | `{by_state, started_24h, validation_failures_24h, accounts_streaming, open_reliability_findings}`. |
 | GET | `/v1/admin/streams/{session_id}` | Session + `requested/approved/validated` dicts + last 50 heartbeats + last 20 validations + camera findings + processor statuses. |

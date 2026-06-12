@@ -9,12 +9,17 @@ down. Timeouts are short so the endpoint stays snappy: 0.5 s for the DB
 from __future__ import annotations
 
 import asyncio
+import os
+import resource
+import sys
 import time
 
 import asyncpg
 import httpx
 
+from upstream_api.observability.metrics import process_started_at
 from upstream_api.schemas.platform_admin import (
+    ApiRuntime,
     DatabaseHealth,
     ProcessorsHealth,
     StreamingServerHealth,
@@ -27,6 +32,45 @@ _MEDIAMTX_TIMEOUT_SECONDS = 1.0
 # its status but never reported failed/stopped. Matches the dashboard's
 # online-agent heuristic window.
 _PROCESSOR_STALE_INTERVAL = "5 minutes"
+
+
+def _rss_mb() -> float | None:
+    """Current resident memory of this process, in MB.
+
+    Prefers /proc/self/status (current RSS — what production's Linux
+    container has); falls back to getrusage's PEAK RSS elsewhere (macOS
+    dev, where ru_maxrss is bytes; Linux reports KB).
+    """
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return round(int(line.split()[1]) / 1024, 1)
+    except OSError:
+        pass
+    try:
+        peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    except (ValueError, OSError):
+        return None
+    divisor = 1024 * 1024 if sys.platform == "darwin" else 1024
+    return round(peak / divisor, 1)
+
+
+def api_runtime() -> ApiRuntime:
+    """Process-level vitals for the API component of the health rollup.
+
+    Everything degrades to None rather than failing the rollup — these are
+    nice-to-have params on a tile, not probes.
+    """
+    try:
+        load_1m: float | None = round(os.getloadavg()[0], 2)
+    except OSError:
+        load_1m = None
+    return ApiRuntime(
+        uptime_seconds=round(max(0.0, time.time() - process_started_at), 1),
+        memory_rss_mb=_rss_mb(),
+        load_1m=load_1m,
+    )
 
 
 async def check_database(pool: asyncpg.Pool) -> DatabaseHealth:

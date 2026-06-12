@@ -18,6 +18,7 @@ from upstream_api.schemas.platform_admin import (
 )
 from upstream_api.security.deps import CurrentPlatformAdmin, PoolDep, SettingsDep
 from upstream_api.services.admin_health import (
+    api_runtime,
     check_database,
     check_streaming_server,
     processor_rollup,
@@ -51,7 +52,12 @@ async def get_system_health(
     else:
         processors = ProcessorsHealth(active=0, stale=0, failed=0)
     return SystemHealthResponse(
-        api=ApiHealth(status="ok", version=__version__, environment=settings.environment),
+        api=ApiHealth(
+            status="ok",
+            version=__version__,
+            environment=settings.environment,
+            runtime=api_runtime(),
+        ),
         database=database,
         streaming_server=streaming_server,
         processors=processors,

@@ -101,6 +101,9 @@ def test_health_rollup_renders_degraded_components(monkeypatch: pytest.MonkeyPat
     assert r.status_code == 200
     body = r.json()
     assert body["api"]["status"] == "ok"
+    runtime = body["api"]["runtime"]
+    assert runtime["uptime_seconds"] > 0
+    assert runtime["memory_rss_mb"] is None or runtime["memory_rss_mb"] > 0
     assert body["database"]["status"] == "ok"
     assert body["streaming_server"]["status"] == "unreachable"
     assert body["processors"] == {
@@ -432,6 +435,17 @@ def test_histogram_quantile_estimation() -> None:
     assert _histogram_quantile([(1.0, 0.0), (inf, 0.0)], 0.5) is None
     # Quantile landing in +Inf returns the last finite bound (a floor).
     assert _histogram_quantile([(1.0, 0.0), (inf, 10.0)], 0.5) == 1.0
+
+
+def test_api_runtime_degrades_to_none_not_raises() -> None:
+    from upstream_api.services.admin_health import api_runtime
+
+    runtime = api_runtime()
+    assert runtime.uptime_seconds is not None and runtime.uptime_seconds > 0
+    # rss/load are platform-dependent; the contract is "value or None",
+    # never an exception that would take the health rollup down with it.
+    assert runtime.memory_rss_mb is None or runtime.memory_rss_mb > 0
+    assert runtime.load_1m is None or runtime.load_1m >= 0
 
 
 def test_system_metrics_requires_platform_admin() -> None:

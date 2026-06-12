@@ -28,10 +28,19 @@ class AdminMeResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+class ApiRuntime(BaseModel):
+    """Process vitals for the API tile. All optional — params, not probes."""
+
+    uptime_seconds: float | None = None
+    memory_rss_mb: float | None = None
+    load_1m: float | None = None
+
+
 class ApiHealth(BaseModel):
     status: str
     version: str
     environment: str
+    runtime: ApiRuntime | None = None
 
 
 class DatabaseHealth(BaseModel):

@@ -4,6 +4,47 @@ Reverse chronological. Newest at top. Every meaningful commit gets an entry foll
 
 ---
 
+## 2026-06-11 - feat(admin): API process vitals on the health rollup
+
+### Summary
+The API component of `GET /v1/admin/system/health` previously reported
+only status/version/environment — nothing measurable about the process
+itself. New `api.runtime` block: `uptime_seconds` (from
+observability.metrics.process_started_at — also a restart detector),
+`memory_rss_mb` (current RSS via /proc/self/status on Linux, peak RSS
+via getrusage on macOS dev), `load_1m` (os.getloadavg). All stdlib, no
+psutil; every field degrades to None rather than failing the rollup.
+
+### Files touched
+- `src/upstream_api/services/admin_health.py` — `api_runtime()`,
+  `_rss_mb()`.
+- `src/upstream_api/schemas/platform_admin.py` — `ApiRuntime`;
+  `ApiHealth.runtime` (optional, so older panel builds are unaffected).
+- `src/upstream_api/routers/platform_admin/system.py` — health rollup
+  fills `runtime=api_runtime()`.
+- `docs/api-contracts.md` — health row documents `api.runtime`.
+- `tests/test_platform_admin_system.py` — rollup asserts runtime
+  fields; `api_runtime()` never-raises contract test.
+
+### Functions/classes changed
+- `api_runtime()` — process vitals; params, not probes (no timeout
+  needed, nothing blocks).
+- `_rss_mb()` — /proc first (current RSS, production), getrusage
+  fallback (peak; ru_maxrss is bytes on darwin, KB on Linux).
+
+### System interaction notes
+Panel System page → `/v1/admin/system/health` → `api_runtime()` reads
+process/OS state only — no DB, no network. No new instrumentation.
+
+### Testing/checks
+`uv run pytest tests/test_platform_admin_system.py` — 18 passed.
+`ruff` clean on touched files, `mypy src` clean.
+
+### Follow-up TODOs
+- None beyond the pre-existing items noted in the previous entry.
+
+---
+
 ## 2026-06-11 - feat(admin): control-plane metrics endpoint + richer system timeseries
 
 ### Summary
