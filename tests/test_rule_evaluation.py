@@ -690,6 +690,13 @@ class FakeEvalConn:
         # (workflow_run_id, status, action_result) per finalize call.
         self.run_finalizes: list[tuple[Any, ...]] = []
         self.run_ids: list[UUID] = []
+        # M6.1: raw args of each canonical-event insert; ON CONFLICT modeled.
+        self.event_inserts: list[tuple[Any, ...]] = []
+        self._event_keys: set[tuple[Any, str]] = set()
+
+    def transaction(self) -> FakeTransaction:
+        # M6.1 event emission wraps its insert in a savepoint.
+        return FakeTransaction()
 
     async def fetch(self, query: str, *args: Any) -> list[dict[str, Any]]:
         assert "from rules" in query
@@ -702,6 +709,15 @@ class FakeEvalConn:
             and r["rule_type"] == rule_type
             and r["enabled"]
         ]
+
+    async def fetchrow(self, query: str, *args: Any) -> dict[str, Any] | None:
+        assert "insert into events" in query
+        account_id, dedupe_key = args[0], args[12]
+        if (account_id, dedupe_key) in self._event_keys:
+            return None  # ON CONFLICT (account_id, dedupe_key) DO NOTHING
+        self._event_keys.add((account_id, dedupe_key))
+        self.event_inserts.append(args)
+        return {"id": uuid4(), "seq": len(self.event_inserts)}
 
     async def fetchval(self, query: str, *args: Any) -> Any:
         if "insert into workflow_runs" in query:
@@ -804,6 +820,82 @@ async def test_matching_rule_creates_workflow_run() -> None:
     assert rule_snapshot["cooldown_seconds"] == 300
     # Finalized completed with the alert as the action outcome.
     assert conn.run_finalizes == [(conn.run_ids[0], "completed", "alert_created")]
+
+
+async def test_matching_rule_emits_one_alert_created_event() -> None:
+    """M6.1: finalizing the run emits exactly one canonical event referencing
+    the run, rule, camera, source observation, and the created alert."""
+    account, camera = uuid4(), uuid4()
+    rule = _eval_rule(account_id=account, camera_id=camera, severity="critical")
+    conn = FakeEvalConn(rules=[rule])
+    observation_id = uuid4()
+    await evaluate_observation(
+        conn,
+        account_id=account,
+        camera_id=camera,
+        observation_id=observation_id,
+        observation_type="processor.line_crossing",
+        payload={"line_id": "line-1", "line_label": "Front door"},
+        observed_at=_EVAL_NOW,
+    )
+    assert len(conn.event_inserts) == 1
+    args = conn.event_inserts[0]
+    assert args[0] == account  # account_id
+    assert args[1] == camera  # camera_id
+    assert args[3] == "alert.created"  # event_type
+    assert args[5] == "rule"  # source
+    assert args[6] == observation_id  # source_observation_id
+    assert args[7] == conn.run_ids[0]  # workflow_run_id
+    assert args[8] is not None  # source_alert_id present
+    assert args[10] == rule["id"]  # rule_id
+    assert args[12] == f"workflow_run:{conn.run_ids[0]}:completed:alert_created"
+    # Evidence = the triggering observation payload; payload = finalize context
+    # + the rule snapshot.
+    assert json.loads(args[15]) == {"line_id": "line-1", "line_label": "Front door"}
+    payload = json.loads(args[14])
+    assert payload["status"] == "completed"
+    assert payload["action_result"] == "alert_created"
+    assert payload["trigger_type"] == "processor.line_crossing"
+    assert payload["rule"]["rule_type"] == "line_crossing"
+
+
+async def test_cooldown_suppressed_match_emits_cooldown_event() -> None:
+    """M6.1: a cooldown-suppressed match still finalizes a run, so it still
+    emits one event — typed workflow.cooldown_suppressed, with no alert ref."""
+    account, camera = uuid4(), uuid4()
+    rule = _eval_rule(account_id=account, camera_id=camera)
+    conn = FakeEvalConn(rules=[rule], recent_alert_rule_ids={rule["id"]})
+    await evaluate_observation(
+        conn,
+        account_id=account,
+        camera_id=camera,
+        observation_id=uuid4(),
+        observation_type="processor.line_crossing",
+        payload={"line_id": "line-1"},
+        observed_at=_EVAL_NOW,
+    )
+    assert len(conn.event_inserts) == 1
+    args = conn.event_inserts[0]
+    assert args[3] == "workflow.cooldown_suppressed"
+    assert args[8] is None  # no alert -> no alert ref
+    assert args[12].endswith(":suppressed:alert_suppressed_cooldown")
+
+
+async def test_non_matching_rule_emits_no_event() -> None:
+    """No match -> no run -> no event."""
+    account, camera = uuid4(), uuid4()
+    rule = _eval_rule(account_id=account, camera_id=camera, config={"line_id": "line-1"})
+    conn = FakeEvalConn(rules=[rule])
+    await evaluate_observation(
+        conn,
+        account_id=account,
+        camera_id=camera,
+        observation_id=uuid4(),
+        observation_type="processor.line_crossing",
+        payload={"line_id": "line-2"},
+        observed_at=_EVAL_NOW,
+    )
+    assert conn.event_inserts == []
 
 
 async def test_unmapped_observation_type_is_a_noop() -> None:
@@ -1051,6 +1143,9 @@ class FakeIngestConn:
         self.alert_inserts: list[tuple[Any, ...]] = []
         self.run_inserts: list[tuple[Any, ...]] = []
         self.run_finalizes: list[tuple[Any, ...]] = []
+        # M6.1: raw args of each canonical-event insert; ON CONFLICT modeled.
+        self.event_inserts: list[tuple[Any, ...]] = []
+        self._event_keys: set[tuple[Any, str]] = set()
 
     def transaction(self) -> FakeTransaction:
         return FakeTransaction()
@@ -1058,6 +1153,13 @@ class FakeIngestConn:
     async def fetchrow(self, query: str, *args: Any) -> dict[str, Any] | None:
         if "from stream_sessions where id" in query:
             return self._session_row
+        if "insert into events" in query:
+            account_id, dedupe_key = args[0], args[12]
+            if (account_id, dedupe_key) in self._event_keys:
+                return None
+            self._event_keys.add((account_id, dedupe_key))
+            self.event_inserts.append(args)
+            return {"id": uuid4(), "seq": len(self.event_inserts)}
         return None
 
     async def fetch(self, query: str, *args: Any) -> list[dict[str, Any]]:
@@ -1181,6 +1283,11 @@ def test_ingest_with_matching_rule_creates_alert() -> None:
     assert conn.alert_inserts[0][1] == camera
     assert conn.run_inserts[0][0] == account
     assert conn.run_inserts[0][1] == camera
+    # M6.1: the run finalization emits exactly one canonical event, in the same
+    # ingest transaction, with tenant columns derived from the session.
+    assert len(conn.event_inserts) == 1
+    assert conn.event_inserts[0][0] == account  # account_id
+    assert conn.event_inserts[0][3] == "alert.created"  # event_type
 
 
 def test_ingest_with_no_rules_creates_no_alert() -> None:

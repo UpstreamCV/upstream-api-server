@@ -424,6 +424,18 @@ async def evaluate_observation(
         if not rule_matches(row["rule_type"], config, payload):
             continue
         summary = build_alert_message(row["rule_type"], payload)
+        # Snapshot the rule definition so the run (and the canonical event
+        # emitted on finalize) stay interpretable after the rule is edited or
+        # deleted.
+        run_payload = {
+            "rule": {
+                "id": str(row["id"]),
+                "rule_type": row["rule_type"],
+                "config": config,
+                "severity": row["severity"],
+                "cooldown_seconds": row["cooldown_seconds"],
+            }
+        }
         run_id = await insert_workflow_run(
             conn,
             account_id=account_id,
@@ -435,17 +447,7 @@ async def evaluate_observation(
             summary=summary,
             trigger_type=observation_type,
             evidence=payload,
-            # Snapshot the rule definition so the run stays interpretable
-            # after the rule is edited or deleted.
-            payload={
-                "rule": {
-                    "id": str(row["id"]),
-                    "rule_type": row["rule_type"],
-                    "config": config,
-                    "severity": row["severity"],
-                    "cooldown_seconds": row["cooldown_seconds"],
-                }
-            },
+            payload=run_payload,
         )
         alert_id = await conn.fetchval(
             _INSERT_ALERT_SQL,
@@ -467,6 +469,16 @@ async def evaluate_observation(
                 workflow_run_id=run_id,
                 status="completed",
                 action_result="alert_created",
+                account_id=account_id,
+                occurred_at=observed_at,
+                camera_id=camera_id,
+                source="rule",
+                rule_id=row["id"],
+                source_observation_id=observation_id,
+                source_alert_id=alert_id,
+                trigger_type=observation_type,
+                evidence=payload,
+                payload=run_payload,
             )
         else:
             await finalize_workflow_run(
@@ -474,5 +486,14 @@ async def evaluate_observation(
                 workflow_run_id=run_id,
                 status="suppressed",
                 action_result="alert_suppressed_cooldown",
+                account_id=account_id,
+                occurred_at=observed_at,
+                camera_id=camera_id,
+                source="rule",
+                rule_id=row["id"],
+                source_observation_id=observation_id,
+                trigger_type=observation_type,
+                evidence=payload,
+                payload=run_payload,
             )
     return created

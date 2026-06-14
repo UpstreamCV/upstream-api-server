@@ -10,10 +10,13 @@ account-scoped).
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from typing import Any
 from uuid import UUID
 
 import asyncpg
+
+from upstream_api.services.events import emit_workflow_run_event
 
 # A run opens 'active' and is finalized in the same request once its action
 # step resolves. The two-step shape (insert → finalize) exists so the alert
@@ -107,8 +110,44 @@ async def finalize_workflow_run(
     workflow_run_id: UUID,
     status: str,
     action_result: str,
+    # --- M6.1 canonical event emission context (optional, additive) ---------
+    # When ``account_id`` and ``occurred_at`` are provided, a canonical event
+    # is emitted in the same transaction (transactional outbox). Emission is
+    # best-effort (its own savepoint) and never changes the run/alert outcome.
+    # Callers that omit this context still finalize exactly as before.
+    account_id: UUID | None = None,
+    occurred_at: datetime | None = None,
+    camera_id: UUID | None = None,
+    source: str = "workflow",
+    rule_id: UUID | None = None,
+    workflow_id: UUID | None = None,
+    session_id: UUID | None = None,
+    source_observation_id: UUID | None = None,
+    source_alert_id: UUID | None = None,
+    trigger_type: str | None = None,
+    evidence: dict[str, Any] | None = None,
+    payload: dict[str, Any] | None = None,
 ) -> None:
     await conn.execute(_FINALIZE_RUN_SQL, workflow_run_id, status, action_result)
+    if account_id is not None and occurred_at is not None:
+        await emit_workflow_run_event(
+            conn,
+            workflow_run_id=workflow_run_id,
+            status=status,
+            action_result=action_result,
+            account_id=account_id,
+            occurred_at=occurred_at,
+            camera_id=camera_id,
+            source=source,
+            rule_id=rule_id,
+            workflow_id=workflow_id,
+            session_id=session_id,
+            source_observation_id=source_observation_id,
+            source_alert_id=source_alert_id,
+            trigger_type=trigger_type,
+            evidence=evidence,
+            payload=payload,
+        )
 
 
 async def list_workflow_runs(

@@ -4,6 +4,80 @@ Reverse chronological. Newest at top. Every meaningful commit gets an entry foll
 
 ---
 
+## 2026-06-14 - feat(events): M6.1 canonical event ledger (Module 6)
+
+**Why:** Module 6 (Event Delivery / Developer API) needs a durable, canonical
+record that the future Event REST API, webhook destinations, delivery
+attempts, replay, and WebSocket stream will all read from. M6.1 lays only that
+foundation — start accumulating real canonical events in production now, while
+leaving alerts/workflow_runs/rules/reliability untouched. No webhooks, no
+delivery, no API, no dashboard yet.
+
+**What:** a new append-only `events` table written inside the SAME transaction
+as workflow-run finalization (transactional outbox), so an event commits
+atomically with its run and a rollback drops both.
+
+- **Migration** `supabase/migrations/20260619120000_events_ledger.sql`: table
+  `events` with `id`, monotonic `seq bigserial`, `account_id`, nullable
+  `camera_id`, `session_id`, open-vocab `event_type` + `schema_version`,
+  `source`, soft refs (`source_observation_id`/`workflow_run_id`/
+  `source_alert_id`/`source_finding_id`/`rule_id`/`workflow_id`), `dedupe_key`,
+  `occurred_at`/`created_at`, `payload`/`evidence` jsonb + nullable
+  `reliability_context`. Indexes: unique `(account_id, seq)`, unique
+  `(account_id, dedupe_key)`, `(account_id, event_type, seq desc)`, partial
+  `(camera_id, seq desc)`, partial `(workflow_run_id)`. RLS member-select +
+  `grant select … to authenticated` (no insert/update/delete policy —
+  service-role writes only), mirroring `account_audit_logs`.
+- **Schema** `src/upstream_api/schemas/events.py`: `CanonicalEvent` model,
+  `EVENT_SCHEMA_VERSION`, `EventType`/`EventSource` literals (open-vocab in DB,
+  whitelisted at the schema layer).
+- **Service** `src/upstream_api/services/events.py`: `insert_event` (pure;
+  `ON CONFLICT (account_id, dedupe_key) DO NOTHING`; opens no transaction of
+  its own; sanitizes payload/evidence), `workflow_run_event_type` /
+  `workflow_run_dedupe_key` (pure mapping), and `emit_workflow_run_event`
+  (best-effort savepoint wrapper — a ledger failure can never roll back or
+  change the run/alert outcome).
+- **Wiring**: `services/workflow_runs.py::finalize_workflow_run` gained optional
+  event-emission kwargs and emits when `account_id`/`occurred_at` are passed;
+  all four callers updated — `services/rules.py` (observation-driven rule
+  matches, `source="rule"`) and `services/workflow_evaluator.py` (timer rules,
+  `source="timer"`). `services/account_audit.py` exposes a public
+  `sanitize_metadata` alias so the ledger reuses the same secret-stripping
+  policy.
+- **Event types emitted today**: `alert.created` (a run completed by creating an
+  alert) and `workflow.cooldown_suppressed` (a match suppressed in cooldown).
+  The mapping also defines `workflow.succeeded` / `failed` / `timed_out` /
+  `started` for future producers (sequence completion/timeout, run start) that
+  will route through the same seam.
+
+**Tests:** new `tests/test_events_service.py` (mapping, dedupe key, `insert_event`
+insert/dedupe/defaults/sanitization/required-field validation, transaction
+rollback atomicity, `finalize_workflow_run` emit/dedupe/backward-compat/
+best-effort-on-failure, migration shape pin). Extended
+`tests/test_rule_evaluation.py` and `tests/test_workflow_evaluator.py` to assert
+finalize emits exactly one correctly-typed event (and emits nothing on
+non-match / cooldown re-fire window). Full suite: **1230 passed**; ruff + mypy
+clean.
+
+**Known limitations / follow-ups:** (1) emission is additive and best-effort —
+an unexpected ledger error is isolated in its own savepoint and logged, so the
+event is skipped rather than rolling back the run; (2) `session_id` is left null
+for now (not threaded through `evaluate_observation`); (3) only the
+`finalize_workflow_run` seam emits — the sequencer's direct `UPDATE`
+finalizations (sequence `workflow.succeeded`/`failed`/`timed_out`), reliability
+findings (`reliability.finding.*`), and raw processor observations are
+intentionally NOT emitted yet; (4) payload sanitization uses the audit
+sanitizer's depth-4 limit, so deeply-nested rule `schedule` config in the event
+payload snapshot is truncated (the full run remains via `workflow_run_id`); (5)
+the migration was not applied to a live DB (none reachable from this
+environment) — it mirrors the `account_audit_logs` pattern and passes the
+shape-pin test.
+
+**Next milestone:** M6.2 — Event REST API (`GET /v1/events`, `GET /v1/events/{id}`,
+keyset cursor on `seq`) with `events:read` scope groundwork.
+
+---
+
 ## 2026-06-12 - feat(agents): agent version policy on bootstrap (update M2, notify-only)
 
 **Why:** stale agents miss reliability/security fixes and new contract
