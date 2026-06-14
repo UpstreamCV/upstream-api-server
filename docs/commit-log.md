@@ -4,6 +4,77 @@ Reverse chronological. Newest at top. Every meaningful commit gets an entry foll
 
 ---
 
+## 2026-06-14 - feat(events): M6.3 Webhook Destinations (Module 6)
+
+**Why:** Module 6 needs a place to configure WHERE canonical events will be
+delivered before any delivery exists. M6.3 adds the destination config layer —
+account-scoped webhook endpoints with filters and a recoverable signing secret —
+so M6.4 can wire up the delivery worker against it. No outbound delivery,
+delivery attempts, retries, replay, WebSocket, or dashboard UI in this milestone.
+
+**What:** an `event_destinations` table + full CRUD REST API.
+
+- **Endpoints** (`routers/event_destinations.py`, prefix `/v1/event-destinations`,
+  registered in `app.py`): `GET` (list, filters `enabled`/`destination_type`),
+  `POST` (create), `GET /{id}`, `PATCH /{id}`, `DELETE /{id}`.
+- **Migration** `20260620120000_event_destinations.sql`: table with
+  account_id, destination_type (open-vocab, default 'webhook'), name, url,
+  enabled, `event_type_filters text[]` / `camera_id_filters uuid[]` /
+  `workflow_id_filters uuid[]` (empty = all), `signing_secret_encrypted bytea`
+  (pgcrypto ciphertext — never returned), `signing_secret_preview text` (masked),
+  health bookkeeping (last_success_at/last_failure_at/consecutive_failures/
+  disabled_at), created_by/created_at/updated_at. Three btree indexes,
+  set_updated_at trigger, RLS member-select + `grant select to authenticated`
+  (no insert/update/delete policy — service-role writes only).
+- **Secret handling:** server generates `whsec_<env>_<random>`, stores it via
+  `pgp_sym_encrypt($secret, $key)` (key from new optional
+  `UPSTREAM_WEBHOOK_SECRET_ENC_KEY`, decrypted only by the future delivery
+  worker), returns plaintext **once** from `POST`, and only a masked
+  `whsec_<env>_...XXXX` preview on every other response. The API never decrypts.
+- **URL validation (SSRF-aware):** https-only; rejects empty/non-https URLs,
+  `localhost`/`*.localhost`, and loopback/private/link-local (incl. cloud
+  metadata 169.254.169.254)/reserved/multicast IP literals. DNS-rebinding
+  protection deferred to the M6.4 delivery path (documented).
+- **Filters:** `event_type_filters` validated against the canonical event-type
+  vocabulary; `camera_id_filters`/`workflow_id_filters` validated to belong to
+  the account (cross-account ids rejected 400). Empty array = "all".
+- **Auth:** dual via `CurrentCaller`. Reads need `destinations:read` for API
+  tokens (users gated by membership); writes need `destinations:write` for API
+  tokens or owner/admin for dashboard users. `ALLOWED_SCOPES` widened with
+  `destinations:read` + `destinations:write`. Unknown/cross-account ids → 404.
+- **Audit:** `event_destination.created/updated/deleted` recorded via the
+  existing best-effort tenant audit log; the signing secret never reaches it.
+
+**Tests:** new `tests/test_event_destinations_api.py` (41 cases): create
+(owner/admin yes, viewer 403, secret-once, no-secret-in-audit, https/SSRF
+rejects, event-type + camera/workflow filter accept + cross-account reject, 503
+when key unconfigured); list (isolation, masked, enabled filter); get (masked,
+unknown/cross-account 404); update (fields, disable/enable→disabled_at, viewer
+403, cross-account 404, bad-url 400); delete (owner yes, viewer 403,
+cross-account 404, gone after); token scopes (read/write 200-vs-403, vocabulary,
+user-bypass, 401); SQL-pin (pgp_sym_encrypt used, ciphertext never selected) +
+migration-shape pin. Full suite: **1296 passed**; ruff + mypy clean. OpenAPI
+exposes the routes.
+
+**Known limitations / follow-ups:** (1) `UPSTREAM_WEBHOOK_SECRET_ENC_KEY` is
+optional so the server boots without it, but `POST` returns 503 until it's set —
+**this env var must be configured before destinations can be created**; key
+rotation is unplanned (a later concern). (2) No DNS-rebinding/runtime egress
+check yet — only scheme + IP-literal validation at write time; add at M6.4
+delivery. (3) Hard delete (fine pre-delivery; M6.4 may switch to soft-delete once
+delivery attempts reference destinations). (4) GIN indexes on the filter arrays
+deferred until M6.4 needs event→destination matching. (5) Migration not applied
+to a live DB here (none reachable) — it reuses the pgcrypto + RLS conventions and
+passes the shape pin; apply before relying on it. (6) Dashboard destination UI is
+a later milestone; the create dialog will need the masked-preview/reveal-once UX.
+
+**Next milestone:** M6.4 — Delivery Attempts + Basic Webhook Worker
+(`event_delivery_attempts` table, event→destination matching, enqueue on event
+insert, in-process worker with `FOR UPDATE SKIP LOCKED`, signed payloads,
+retries/backoff, destination health updates).
+
+---
+
 ## 2026-06-14 - feat(events): M6.2 Event REST API (Module 6)
 
 **Why:** M6.1 added the canonical `events` ledger and started populating it from

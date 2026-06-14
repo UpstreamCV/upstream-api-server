@@ -31,6 +31,7 @@ from upstream_api.routers import (
     billing,
     cameras,
     dashboard,
+    event_destinations,
     events,
     heartbeats,
     ingest,
@@ -174,6 +175,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(alerts.router)  # /v1/alerts (Workflow Engine M1)
     app.include_router(workflow_runs.router)  # /v1/workflow-runs (Workflow Engine M2)
     app.include_router(events.router)  # /v1/events (Module 6 M6.2)
+    app.include_router(event_destinations.router)  # /v1/event-destinations (Module 6 M6.3)
     app.include_router(workflow_evaluator.router)  # /v1/internal/workflow-evaluator (M4)
     app.include_router(workflows.router)  # /v1/workflows (Workflow Engine M5)
     app.include_router(usage.router)  # /v1/usage (Module 7 M1)
