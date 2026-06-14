@@ -17,6 +17,7 @@ def _set_dummy_env() -> None:
         "UPSTREAM_MEDIAMTX_WEBHOOK_SECRET": "test-mediamtx",
         "UPSTREAM_PROCESSOR_WEBHOOK_SECRET": "test-processor",
         "UPSTREAM_PROMETHEUS_AUTH_TOKEN": "test-prom",
+        "UPSTREAM_WEBHOOK_SECRET_ENC_KEY": "test-webhook-enc-key-32-bytes-minimum!!",
         "UPSTREAM_ENVIRONMENT": "development",
     }
     for k, v in defaults.items():

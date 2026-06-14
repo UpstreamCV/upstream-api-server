@@ -14,7 +14,7 @@ ledger is replayed at the version each row was written at.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Literal
+from typing import Any, Literal, get_args
 from uuid import UUID
 
 from pydantic import BaseModel, Field
@@ -41,6 +41,10 @@ EventType = Literal[
 
 # Producer family that emitted the event.
 EventSource = Literal["rule", "timer", "workflow", "processor", "reliability"]
+
+# The canonical event_type vocabulary as a runtime set — used to validate
+# webhook destination event_type filters (M6.3).
+KNOWN_EVENT_TYPES: frozenset[str] = frozenset(get_args(EventType))
 
 
 class CanonicalEvent(BaseModel):

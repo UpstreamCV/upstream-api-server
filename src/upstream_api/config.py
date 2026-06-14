@@ -32,6 +32,11 @@ class Settings(BaseSettings):
     # M9.3: optional — when unset, GET /metrics 404s (the endpoint does not
     # exist for that deployment). Deployed envs keep it set.
     prometheus_auth_token: SecretStr | None = None
+    # Module 6 M6.3: symmetric key used to pgcrypto-encrypt webhook destination
+    # signing secrets at rest. Optional so the server still boots without it
+    # (additive); creating a webhook destination requires it (503 otherwise).
+    # The future delivery worker (M6.4) decrypts with the same key to sign.
+    webhook_secret_enc_key: SecretStr | None = None
 
     @field_validator("prometheus_auth_token", mode="before")
     @classmethod

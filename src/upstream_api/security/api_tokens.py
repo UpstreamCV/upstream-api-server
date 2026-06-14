@@ -31,7 +31,9 @@ def _random_chars(length: int) -> str:
 # Open vocabulary enforced here (not in the DB). ``events:read`` (Module 6 M6.2)
 # grants an API token read access to the canonical event ledger; ``agent`` is
 # the edge-agent credential and does NOT imply event read access.
-ALLOWED_SCOPES: frozenset[str] = frozenset({"agent", "events:read"})
+ALLOWED_SCOPES: frozenset[str] = frozenset(
+    {"agent", "events:read", "destinations:read", "destinations:write"}
+)
 
 
 @dataclass(frozen=True, slots=True)
