@@ -4,6 +4,67 @@ Reverse chronological. Newest at top. Every meaningful commit gets an entry foll
 
 ---
 
+## 2026-06-14 - feat(events): M6.2 Event REST API (Module 6)
+
+**Why:** M6.1 added the canonical `events` ledger and started populating it from
+`finalize_workflow_run`, but there was no way to read it. M6.2 exposes the
+ledger through a clean, account-scoped REST API so developers and the dashboard
+can list and inspect canonical events — a safe inspection layer before we start
+pushing events externally (webhooks land in M6.3+). No webhooks, delivery,
+replay, WebSocket, or dashboard UI in this milestone.
+
+**What:** two read-only endpoints over `events`, plus `events:read` scope
+groundwork.
+
+- **Endpoints** (`routers/events.py`, registered in `app.py`):
+  - `GET /v1/events` — keyset-paginated (newest-first by `seq`), filtered.
+  - `GET /v1/events/{event_id}` — one full `CanonicalEvent`.
+- **Auth:** dual via `CurrentCaller` — dashboard JWT users (gated by account
+  membership) and developer API tokens (gated by the new `events:read` scope).
+  Account scoping is enforced in app code (`where account_id = $1`); unknown and
+  cross-account ids both return 404 (no existence leak). Read-only — never
+  writes/mutates events.
+- **Filters:** `camera_id`, `event_type`, `source`, `rule_id`, `workflow_id`,
+  `workflow_run_id`, `session_id`, `start_time` (occurred_at ≥), `end_time`
+  (occurred_at <, exclusive), `has_evidence`, plus `limit` (default 50, max
+  100), `before_seq` (next/older page, `seq < before_seq`), `after_seq` (newer,
+  `seq > after_seq`, for polling). Response: `{items, next_before_seq}` where
+  `next_before_seq` is the last item's `seq` when the page is full, else null.
+- **Service** (`services/events.py`): `list_events(...) -> (items, next_before_seq)`
+  and `get_event(...) -> CanonicalEvent | None` — parameterized "null means
+  unfiltered" SQL, keyset on `seq`, local jsonb coercion (avoids a
+  `services.processor` import cycle). `DEFAULT_EVENT_LIMIT`/`MAX_EVENT_LIMIT`.
+- **Schema** (`schemas/events.py`): `EventListResponse(items, next_before_seq)`.
+- **Scope groundwork:** `ALLOWED_SCOPES` widened to include `events:read`
+  (`security/api_tokens.py`), so tokens can be minted with it; a new
+  `require_token_scope(caller, *scopes)` helper (`security/deps.py`) enforces it
+  for API-token callers only — dashboard users bypass (membership-gated), and an
+  `agent` token does NOT implicitly gain event read access.
+
+**Tests:** new `tests/test_events_api.py` (25 cases): list newest-first, account
+isolation, empty account, `limit`/`before_seq`/`after_seq` pagination (stable,
+no dupes), all filters, time range, `has_evidence`, full payload/evidence/
+reliability_context returned, invalid limit 422, unauthenticated 401; get by id,
+unknown 404, cross-account 404, invalid uuid 422; agent token with/without
+`events:read` (200/403), `require_token_scope` user-bypass/agent-ok/agent-missing,
+`events:read` mintable + unknown rejected + agent retained; SQL-pin tests for the
+list and get statements. Full suite: **1255 passed**; ruff + mypy clean. OpenAPI
+spec exposes both routes.
+
+**Known limitations / follow-ups:** (1) no payload/JSON-field filtering or
+full-text search (out of scope); (2) `before_seq`+`after_seq` together form a
+window — fine, but cursor encoding is intentionally plain (raw `seq`), not opaque;
+(3) the dashboard token-create dialog still hardcodes `scopes:["agent"]` — a
+scope selector is a dashboard follow-up so operators can mint `events:read`
+tokens from the UI; (4) reads were exercised against fakes (no live DB reachable
+here) — the SQL-pin tests guard the predicates.
+
+**Next milestone:** M6.3 — Webhook Destinations (`event_destinations` table +
+CRUD, encrypted signing secret, owner/admin-gated; still no delivery — that is
+M6.4).
+
+---
+
 ## 2026-06-14 - feat(events): M6.1 canonical event ledger (Module 6)
 
 **Why:** Module 6 (Event Delivery / Developer API) needs a durable, canonical

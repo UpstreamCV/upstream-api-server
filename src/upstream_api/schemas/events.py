@@ -71,3 +71,14 @@ class CanonicalEvent(BaseModel):
     payload: dict[str, Any] = Field(default_factory=dict)
     evidence: dict[str, Any] = Field(default_factory=dict)
     reliability_context: dict[str, Any] | None = None
+
+
+class EventListResponse(BaseModel):
+    """Keyset-paginated page of canonical events, newest-first by ``seq``."""
+
+    items: list[CanonicalEvent]
+    # ``seq`` of the last (smallest-seq) item when the page is full — pass back
+    # as ?before_seq= for the next, older page. Null when there are no more
+    # rows. A seq keyset cursor, not an opaque token.
+    next_before_seq: int | None
+

@@ -36,8 +36,12 @@ from uuid import UUID
 import asyncpg
 
 from upstream_api.observability.logging import get_logger
-from upstream_api.schemas.events import EVENT_SCHEMA_VERSION
+from upstream_api.schemas.events import EVENT_SCHEMA_VERSION, CanonicalEvent
 from upstream_api.services.account_audit import sanitize_metadata
+
+# Read-path bounds (M6.2). Mirrors the audit-logs keyset reader.
+DEFAULT_EVENT_LIMIT = 50
+MAX_EVENT_LIMIT = 100
 
 _logger = get_logger("events")
 
@@ -261,3 +265,160 @@ async def emit_workflow_run_event(
             error=type(exc).__name__,
         )
         return None
+
+
+# ---------------------------------------------------------------------------
+# Read path (M6.2): account-scoped list + single-event fetch.
+# ---------------------------------------------------------------------------
+
+_EVENT_COLUMNS = """
+    id, seq, account_id, camera_id, session_id, event_type, schema_version,
+    source, source_observation_id, workflow_run_id, source_alert_id,
+    source_finding_id, rule_id, workflow_id, dedupe_key, occurred_at,
+    created_at, payload, evidence, reliability_context
+"""
+
+# Keyset pagination on the monotonic per-account ``seq``, newest-first. Every
+# filter is a parameterized "null means unfiltered" predicate so one prepared
+# statement serves all filter combinations (same shape as the audit-logs and
+# workflow-runs readers).
+_LIST_EVENTS_SQL = f"""
+select
+{_EVENT_COLUMNS}
+  from events
+ where account_id = $1
+   and ($2::uuid is null or camera_id = $2)
+   and ($3::text is null or event_type = $3)
+   and ($4::text is null or source = $4)
+   and ($5::uuid is null or rule_id = $5)
+   and ($6::uuid is null or workflow_id = $6)
+   and ($7::uuid is null or workflow_run_id = $7)
+   and ($8::uuid is null or session_id = $8)
+   and ($9::timestamptz is null or occurred_at >= $9)
+   and ($10::timestamptz is null or occurred_at < $10)
+   and ($11::bigint is null or seq < $11)
+   and ($12::bigint is null or seq > $12)
+   and ($13::boolean is null or (evidence <> '{{}}'::jsonb) = $13)
+ order by seq desc
+ limit $14
+"""
+
+_GET_EVENT_SQL = f"""
+select
+{_EVENT_COLUMNS}
+  from events
+ where account_id = $1
+   and id = $2
+"""
+
+
+def _jsonb_dict(value: object) -> dict[str, Any]:
+    """asyncpg returns jsonb as ``str`` unless a codec is registered; the fake
+    pool in tests hands back ``dict``. Accept both (local copy to avoid a
+    services.processor import cycle)."""
+    if isinstance(value, dict):
+        return value
+    if value in (None, ""):
+        return {}
+    parsed = json.loads(value)  # type: ignore[arg-type]
+    assert isinstance(parsed, dict)
+    return parsed
+
+
+def _jsonb_optional(value: object) -> dict[str, Any] | None:
+    """Like ``_jsonb_dict`` but preserves SQL NULL as ``None`` (for the
+    nullable ``reliability_context`` column)."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, dict):
+        return value
+    parsed = json.loads(value)  # type: ignore[arg-type]
+    assert isinstance(parsed, dict)
+    return parsed
+
+
+def _row_to_event(row: Any) -> CanonicalEvent:
+    return CanonicalEvent(
+        id=row["id"],
+        seq=row["seq"],
+        event_type=row["event_type"],
+        schema_version=row["schema_version"],
+        account_id=row["account_id"],
+        camera_id=row["camera_id"],
+        session_id=row["session_id"],
+        source=row["source"],
+        source_observation_id=row["source_observation_id"],
+        workflow_run_id=row["workflow_run_id"],
+        source_alert_id=row["source_alert_id"],
+        source_finding_id=row["source_finding_id"],
+        rule_id=row["rule_id"],
+        workflow_id=row["workflow_id"],
+        dedupe_key=row["dedupe_key"],
+        occurred_at=row["occurred_at"],
+        created_at=row["created_at"],
+        payload=_jsonb_dict(row["payload"]),
+        evidence=_jsonb_dict(row["evidence"]),
+        reliability_context=_jsonb_optional(row["reliability_context"]),
+    )
+
+
+async def list_events(
+    conn: asyncpg.Connection,
+    *,
+    account_id: UUID,
+    camera_id: UUID | None = None,
+    event_type: str | None = None,
+    source: str | None = None,
+    rule_id: UUID | None = None,
+    workflow_id: UUID | None = None,
+    workflow_run_id: UUID | None = None,
+    session_id: UUID | None = None,
+    start_time: datetime | None = None,
+    end_time: datetime | None = None,
+    has_evidence: bool | None = None,
+    limit: int = DEFAULT_EVENT_LIMIT,
+    before_seq: int | None = None,
+    after_seq: int | None = None,
+) -> tuple[list[CanonicalEvent], int | None]:
+    """List account-scoped canonical events, newest-first by ``seq``.
+
+    Keyset pagination: ``before_seq`` returns the next (older) page
+    (``seq < before_seq``); ``after_seq`` returns newer events
+    (``seq > after_seq``) for polling. Returns ``(items, next_before_seq)``,
+    where ``next_before_seq`` is the cursor for the next page, or ``None`` when
+    the page was not full (no more rows). ``account_id`` is always enforced.
+    """
+    limit = max(1, min(limit, MAX_EVENT_LIMIT))
+    rows = await conn.fetch(
+        _LIST_EVENTS_SQL,
+        account_id,
+        camera_id,
+        event_type,
+        source,
+        rule_id,
+        workflow_id,
+        workflow_run_id,
+        session_id,
+        start_time,
+        end_time,
+        before_seq,
+        after_seq,
+        has_evidence,
+        limit,
+    )
+    items = [_row_to_event(r) for r in rows]
+    next_before_seq = items[-1].seq if len(items) == limit else None
+    return items, next_before_seq
+
+
+async def get_event(
+    conn: asyncpg.Connection,
+    *,
+    account_id: UUID,
+    event_id: UUID,
+) -> CanonicalEvent | None:
+    """Fetch one account-scoped event by id. Returns ``None`` when the event
+    does not exist OR belongs to another account — the router turns ``None``
+    into a 404 so cross-account existence never leaks."""
+    row = await conn.fetchrow(_GET_EVENT_SQL, account_id, event_id)
+    return _row_to_event(row) if row is not None else None
