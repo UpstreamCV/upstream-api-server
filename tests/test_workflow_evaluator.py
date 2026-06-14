@@ -74,6 +74,14 @@ class FakeConn:
         self.run_finalizes: list[tuple[Any, ...]] = []
         self.observation_query_args: list[tuple[Any, ...]] = []
         self.run_ids: list[UUID] = []
+        # M6.1: raw args of each canonical-event insert; ON CONFLICT modeled.
+        self.event_inserts: list[tuple[Any, ...]] = []
+        self._event_keys: set[tuple[Any, str]] = set()
+
+    def transaction(self) -> AcquireCtx:
+        # M6.1 event emission wraps its insert in a savepoint. Reuse the no-op
+        # async context manager already defined for pool.acquire().
+        return AcquireCtx(self)
 
     async def fetch(self, query: str, *args: Any) -> list[dict[str, Any]]:
         if "from workflow_runs r" in query:
@@ -82,6 +90,13 @@ class FakeConn:
         return list(self.rules)
 
     async def fetchrow(self, query: str, *args: Any) -> dict[str, Any] | None:
+        if "insert into events" in query:
+            account_id, dedupe_key = args[0], args[12]
+            if (account_id, dedupe_key) in self._event_keys:
+                return None  # ON CONFLICT (account_id, dedupe_key) DO NOTHING
+            self._event_keys.add((account_id, dedupe_key))
+            self.event_inserts.append(args)
+            return {"id": uuid4(), "seq": len(self.event_inserts)}
         camera_id = args[0]
         if "as active_session" in query:
             if self.liveness_raises:
@@ -398,6 +413,30 @@ async def test_offline_rule_fires_run_and_linked_alert() -> None:
     assert conn.run_finalizes == [(conn.run_ids[0], "completed", "alert_created")]
 
 
+async def test_timer_match_emits_one_canonical_event() -> None:
+    """M6.1: a timer match finalizes a run, which emits exactly one canonical
+    event (source 'timer') referencing the run, rule, camera, and alert."""
+    rule = _timer_rule(severity="critical")
+    conn = FakeConn(
+        rules=[rule],
+        last_heartbeat_by_camera={rule["camera_id"]: _NOW - timedelta(seconds=900)},
+    )
+    await run_workflow_evaluator(FakePool(conn), now=_NOW)
+    assert len(conn.event_inserts) == 1
+    args = conn.event_inserts[0]
+    assert args[0] == rule["account_id"]  # account_id
+    assert args[1] == rule["camera_id"]  # camera_id
+    assert args[3] == "alert.created"  # event_type
+    assert args[5] == "timer"  # source
+    assert args[6] is None  # no triggering observation for a timer match
+    assert args[7] == conn.run_ids[0]  # workflow_run_id
+    assert args[8] is not None  # source_alert_id present
+    assert args[10] == rule["id"]  # rule_id
+    payload = json.loads(args[14])
+    assert payload["trigger_type"] == "timer.camera_offline"
+    assert json.loads(args[15])["offline_for_seconds"] == 900
+
+
 async def test_cooldown_window_creates_nothing_per_tick() -> None:
     """Inside the re-fire window the guarded run insert returns no id —
     no run, no alert, no suppressed-run spam per tick."""
@@ -414,6 +453,8 @@ async def test_cooldown_window_creates_nothing_per_tick() -> None:
     assert conn.run_inserts == []
     assert conn.alert_inserts == []
     assert conn.run_finalizes == []
+    # No run finalized inside the re-fire window -> no canonical event either.
+    assert conn.event_inserts == []
 
 
 async def test_repeated_ticks_do_not_spam() -> None:

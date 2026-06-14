@@ -102,6 +102,11 @@ def _sanitize_metadata(value: Any, depth: int = 0) -> Any:
     return str(value)
 
 
+# Public alias so other writers (e.g. services/events.py) reuse the SAME
+# secret-stripping policy rather than re-deriving the forbidden-key list.
+sanitize_metadata = _sanitize_metadata
+
+
 _INSERT_SQL = """
 insert into account_audit_logs (
     account_id, actor_user_id, actor_type, event_type,

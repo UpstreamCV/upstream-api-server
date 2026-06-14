@@ -273,6 +273,18 @@ async def _evaluate_rule(
     stats.matched_rules += 1
 
     cooldown = float(rule["cooldown_seconds"])
+    trigger_type = f"timer.{rule['rule_type']}"
+    # Snapshot the rule definition so the run (and the canonical event emitted
+    # on finalize) stay interpretable after the rule is edited or deleted.
+    run_payload = {
+        "rule": {
+            "id": str(rule["id"]),
+            "rule_type": rule["rule_type"],
+            "config": config,
+            "severity": rule["severity"],
+            "cooldown_seconds": rule["cooldown_seconds"],
+        }
+    }
     run_id = await conn.fetchval(
         _INSERT_TIMER_RUN_SQL,
         rule["account_id"],
@@ -280,19 +292,9 @@ async def _evaluate_rule(
         rule["id"],
         rule["name"],
         condition.summary,
-        f"timer.{rule['rule_type']}",
+        trigger_type,
         json.dumps(condition.evidence),
-        json.dumps(
-            {
-                "rule": {
-                    "id": str(rule["id"]),
-                    "rule_type": rule["rule_type"],
-                    "config": config,
-                    "severity": rule["severity"],
-                    "cooldown_seconds": rule["cooldown_seconds"],
-                }
-            }
-        ),
+        json.dumps(run_payload),
         cooldown,
     )
     if run_id is None:
@@ -321,6 +323,15 @@ async def _evaluate_rule(
             workflow_run_id=run_id,
             status="completed",
             action_result="alert_created",
+            account_id=rule["account_id"],
+            occurred_at=now,
+            camera_id=rule["camera_id"],
+            source="timer",
+            rule_id=rule["id"],
+            source_alert_id=alert_id,
+            trigger_type=trigger_type,
+            evidence=condition.evidence,
+            payload=run_payload,
         )
     else:
         await finalize_workflow_run(
@@ -328,6 +339,14 @@ async def _evaluate_rule(
             workflow_run_id=run_id,
             status="suppressed",
             action_result="alert_suppressed_cooldown",
+            account_id=rule["account_id"],
+            occurred_at=now,
+            camera_id=rule["camera_id"],
+            source="timer",
+            rule_id=rule["id"],
+            trigger_type=trigger_type,
+            evidence=condition.evidence,
+            payload=run_payload,
         )
 
 
