@@ -312,6 +312,26 @@ async def current_caller(
 CurrentCaller = Annotated[CallerAuth, Depends(current_caller)]
 
 
+def require_token_scope(caller: CallerAuth, *required: str) -> None:
+    """Enforce API-token scopes for a dual-auth (``CurrentCaller``) endpoint.
+
+    Only API tokens carry scopes. Dashboard JWT callers (``caller.user``) are
+    gated by account membership/role instead and bypass scope checks entirely,
+    so a logged-in member never needs an ``events:read`` token. An ``agent``
+    token does NOT implicitly gain new scopes — it must be minted with the
+    required scope explicitly (Module 6 M6.2 groundwork).
+    """
+    if caller.agent is None:
+        return
+    missing = [s for s in required if s not in caller.agent.scopes]
+    if missing:
+        raise ForbiddenError(
+            "API token is missing a required scope.",
+            code="forbidden.scope",
+            details={"required": sorted(required), "missing": sorted(missing)},
+        )
+
+
 def require_account_role(
     user: UserAuth,
     account_id: UUID,
