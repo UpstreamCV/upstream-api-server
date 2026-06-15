@@ -79,6 +79,18 @@ class Settings(BaseSettings):
     # the workflow evaluator above.
     health_sample_interval_seconds: int = 60
 
+    # Module 6 M6.4 — in-process webhook delivery worker. Defaults OFF so the
+    # outbound capability is a deliberate per-deploy opt-in (set
+    # UPSTREAM_WEBHOOK_DELIVERY_ENABLED=true in prod). The durable
+    # event_delivery_attempts rows are the queue; the loop claims due rows with
+    # FOR UPDATE SKIP LOCKED, so it is safe under multiple API workers. The
+    # internal drain endpoint works regardless of the loop for cron/tests.
+    webhook_delivery_enabled: bool = False
+    webhook_delivery_interval_seconds: int = 2
+    webhook_delivery_batch_size: int = 25
+    webhook_delivery_timeout_seconds: float = 5.0
+    webhook_delivery_max_attempts: int = 5
+
     # Module 7 M2 — Stripe Checkout + Customer Portal. ALL optional: with
     # stripe_secret_key unset, /v1/billing/* and /v1/webhooks/stripe return
     # 503 billing_not_configured and the dashboard shows its "coming soon"

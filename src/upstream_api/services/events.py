@@ -38,6 +38,9 @@ import asyncpg
 from upstream_api.observability.logging import get_logger
 from upstream_api.schemas.events import EVENT_SCHEMA_VERSION, CanonicalEvent
 from upstream_api.services.account_audit import sanitize_metadata
+from upstream_api.services.event_delivery_attempts import (
+    enqueue_delivery_attempts_for_event,
+)
 
 # Read-path bounds (M6.2). Mirrors the audit-logs keyset reader.
 DEFAULT_EVENT_LIMIT = 50
@@ -188,6 +191,39 @@ async def insert_event(
         account_id=str(account_id),
         seq=row["seq"],
     )
+    # M6.4: enqueue webhook delivery attempts for the just-inserted event, in
+    # the same transaction (best-effort — the helper isolates itself in a
+    # savepoint, so an enqueue failure never breaks event creation). Built from
+    # the insert params + the returned id/seq so it does not depend on the full
+    # RETURNING row shape. Only runs when the row was actually inserted (a
+    # deduped ON CONFLICT returns None above and never reaches here).
+    try:
+        created_at = row["created_at"]
+    except KeyError:
+        created_at = occurred_at
+    new_event = CanonicalEvent(
+        id=row["id"],
+        seq=row["seq"],
+        event_type=event_type,
+        schema_version=schema_version,
+        account_id=account_id,
+        camera_id=camera_id,
+        session_id=session_id,
+        source=source,
+        source_observation_id=source_observation_id,
+        workflow_run_id=workflow_run_id,
+        source_alert_id=source_alert_id,
+        source_finding_id=source_finding_id,
+        rule_id=rule_id,
+        workflow_id=workflow_id,
+        dedupe_key=dedupe_key,
+        occurred_at=occurred_at,
+        created_at=created_at,
+        payload=clean_payload,
+        evidence=clean_evidence,
+        reliability_context=clean_context,
+    )
+    await enqueue_delivery_attempts_for_event(conn, event=new_event)
     return dict(row)
 
 

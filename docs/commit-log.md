@@ -4,6 +4,79 @@ Reverse chronological. Newest at top. Every meaningful commit gets an entry foll
 
 ---
 
+## 2026-06-14 - feat(events): M6.4 MVP webhook delivery base (Module 6)
+
+**Why:** M6.1–M6.3 built the ledger, the read API, and destination config. M6.4
+closes the loop: canonical event → matching destination → durable delivery
+attempt → signed POST → status/logging → retry. Database-backed and safe under
+multiple API workers. MVP — no replay, manual redeliver, test-send, WebSocket,
+or dashboard UI.
+
+**What:**
+
+- **Migration** `20260621120000_event_delivery_attempts.sql`: durable queue, one
+  row per (event, destination) (`unique (event_id, destination_id)`), status
+  `pending|delivering|delivered|failed|dead`, attempt_count/max_attempts,
+  next_attempt_at, response/error fields, 4 indexes (incl. partial due-index),
+  RLS member-select + grant (no client write policy).
+- **Enqueue** (`services/event_delivery_attempts.py` + wired into
+  `services/events.py::insert_event`): on a real (non-deduped) event insert,
+  create one pending attempt per enabled `webhook` destination whose filters
+  match (`destination_matches_event`, pure/tested; empty filter = all), in the
+  same transaction, best-effort (own savepoint — never breaks event creation),
+  `ON CONFLICT (event_id, destination_id) DO NOTHING`.
+- **Worker** (`services/webhook_delivery.py`): in-process loop spawned from
+  lifespan **only when `UPSTREAM_WEBHOOK_DELIVERY_ENABLED=true`** (off by
+  default), using a dedicated httpx client (tight timeout) so a slow tenant
+  endpoint can't starve the shared pool. Claims a batch with
+  `FOR UPDATE SKIP LOCKED` (multi-worker safe), loads event+destination and
+  pgcrypto-**decrypts** the signing secret (only here; never logged), signs +
+  POSTs, classifies, records outcome, updates destination health. One bad
+  delivery never stops the batch.
+- **Signing:** `Upstream-Signature: v1=<hex>` = HMAC-SHA256 over
+  `<timestamp>.<raw_body>` (exact bytes sent). Headers: Upstream-Event-Id /
+  -Event-Type / -Delivery-Id / -Timestamp / -Signature, Idempotency-Key
+  (= event id), Content-Type, User-Agent. Payload `{delivery_id, attempt,
+  sent_at, event:{…}}`.
+- **Retry/backoff:** 2xx→delivered; network/timeout/408/429/5xx→retry (failed,
+  next_attempt_at = now + 1m/5m/15m/60m by attempt) or dead at max_attempts;
+  other 4xx→dead immediately. Response body preview + error capped at 500 chars.
+- **Health:** success → last_success_at, consecutive_failures=0; failure →
+  last_failure_at, consecutive_failures++. No auto-disable yet (tracking only).
+- **Read API** (`routers/event_delivery_attempts.py`): `GET
+  /v1/event-delivery-attempts` (+ `/v1/events/{id}/delivery-attempts`,
+  `/v1/event-destinations/{id}/delivery-attempts`), account-scoped, keyset on
+  created_at, filters status/event_id/destination_id; readable by a member or a
+  token with `events:read` OR `destinations:read`. Internal
+  `POST /v1/internal/event-deliveries/drain` (processor shared-secret) for
+  cron/smoke.
+- **Config:** `webhook_delivery_enabled` (default false) + interval/batch/
+  timeout/max_attempts. Added to env examples.
+
+**Tests:** `tests/test_webhook_delivery.py` (26 — backoff, retry classification,
+signing over exact bytes + headers, success/5xx/408/429/4xx/network/timeout/
+exhausted, preview cap, drain success+health/failure+health/empty/one-bad-in-
+batch) and `tests/test_event_delivery_attempts.py` (20 — pure matching,
+enqueue match/filters/multi/dedupe/best-effort, claim SQL pin for FOR UPDATE
+SKIP LOCKED + due predicates, read API isolation/filters/scopes/401, migration
+shape). Full suite: **1342 passed**; ruff + mypy clean.
+
+**Known limitations / follow-ups:** (1) worker is **off by default** — set
+`UPSTREAM_WEBHOOK_DELIVERY_ENABLED=true` (and the M6.3 enc key) in prod to
+deliver. (2) A worker crash after claim leaves a row stuck `delivering` (claim
+only takes pending/failed) — rare; a stale-`delivering` reclaim sweep is a
+follow-up. (3) SSRF is validated at destination create/update (M6.3) but the
+worker does not re-resolve DNS at send time (rebinding) — harden in a follow-up.
+(4) No auto-disable of chronically failing destinations yet (health tracked
+only). (5) Migration + the pgp_sym_decrypt/HTTP path weren't run against a live
+DB here (none reachable) — SQL/migration pins guard shape; smoke after deploy.
+
+**Next milestone:** M6.5 — Delivery Debug + Manual Actions (failed-attempt
+surface, manual redeliver one event/attempt, send-test-webhook, small
+destination-health display).
+
+---
+
 ## 2026-06-14 - feat(events): M6.3 Webhook Destinations (Module 6)
 
 **Why:** Module 6 needs a place to configure WHERE canonical events will be
