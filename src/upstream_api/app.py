@@ -5,6 +5,7 @@ import contextlib
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
+import httpx
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -31,6 +32,7 @@ from upstream_api.routers import (
     billing,
     cameras,
     dashboard,
+    event_delivery_attempts,
     event_destinations,
     events,
     heartbeats,
@@ -52,6 +54,7 @@ from upstream_api.routers import (
 )
 from upstream_api.services.health_sampler import health_sampler_loop
 from upstream_api.services.http_client import build_http_client
+from upstream_api.services.webhook_delivery import webhook_delivery_loop
 from upstream_api.services.workflow_evaluator import workflow_evaluator_loop
 
 _logger = get_logger("app")
@@ -93,17 +96,38 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             "health_sampler_loop_started",
             interval_seconds=settings.health_sample_interval_seconds,
         )
+    # Module 6 M6.4: in-process webhook delivery worker. Defaults OFF — enable
+    # in prod with UPSTREAM_WEBHOOK_DELIVERY_ENABLED=true. Uses a dedicated
+    # httpx client (tight timeout) so a slow tenant endpoint can't starve the
+    # shared WHEP/MediaMTX pool. Multi-worker safe via FOR UPDATE SKIP LOCKED.
+    webhook_delivery_task: asyncio.Task[None] | None = None
+    webhook_http_client: httpx.AsyncClient | None = None
+    if settings.webhook_delivery_enabled and settings.webhook_delivery_interval_seconds > 0:
+        webhook_http_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(settings.webhook_delivery_timeout_seconds)
+        )
+        app.state.webhook_http_client = webhook_http_client
+        webhook_delivery_task = asyncio.create_task(
+            webhook_delivery_loop(pool, webhook_http_client, settings)
+        )
+        _logger.info(
+            "webhook_delivery_loop_started",
+            interval_seconds=settings.webhook_delivery_interval_seconds,
+            batch_size=settings.webhook_delivery_batch_size,
+        )
     _logger.info("startup", environment=settings.environment, port=settings.port)
     try:
         yield
     finally:
         _logger.info("shutdown")
-        for task in (evaluator_task, sampler_task):
+        for task in (evaluator_task, sampler_task, webhook_delivery_task):
             if task is not None:
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
         await app.state.http_client.aclose()
+        if webhook_http_client is not None:
+            await webhook_http_client.aclose()
         await pool.close()
 
 
@@ -176,6 +200,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(workflow_runs.router)  # /v1/workflow-runs (Workflow Engine M2)
     app.include_router(events.router)  # /v1/events (Module 6 M6.2)
     app.include_router(event_destinations.router)  # /v1/event-destinations (Module 6 M6.3)
+    app.include_router(event_delivery_attempts.router)  # /v1/event-delivery-attempts (M6.4)
     app.include_router(workflow_evaluator.router)  # /v1/internal/workflow-evaluator (M4)
     app.include_router(workflows.router)  # /v1/workflows (Workflow Engine M5)
     app.include_router(usage.router)  # /v1/usage (Module 7 M1)

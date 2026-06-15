@@ -231,20 +231,27 @@ async def test_missing_required_kwarg_raises_type_error() -> None:
 
 
 class _Txn:
+    """Models a savepoint: on rollback, only rows staged SINCE this savepoint
+    began are discarded (so a nested savepoint — e.g. the M6.4 enqueue — never
+    nukes the parent's staged rows); only the top-level commit flushes."""
+
     def __init__(self, conn: TxnConn) -> None:
         self.conn = conn
+        self._mark = 0
 
     async def __aenter__(self) -> _Txn:
+        self._mark = len(self.conn.staged)
         self.conn.depth += 1
         return self
 
-    async def __aexit__(self, exc_type: Any, *_rest: Any) -> None:
+    async def __aexit__(self, exc_type: Any, *_rest: Any) -> bool:
         self.conn.depth -= 1
         if exc_type is not None:
-            self.conn.staged.clear()  # rollback drops everything staged
+            del self.conn.staged[self._mark :]  # rollback to savepoint
         elif self.conn.depth == 0:
             self.conn.committed.extend(self.conn.staged)
             self.conn.staged.clear()
+        return False
 
 
 class TxnConn:
@@ -260,6 +267,11 @@ class TxnConn:
 
     def transaction(self) -> _Txn:
         return _Txn(self)
+
+    async def fetch(self, query: str, *args: Any) -> list[dict[str, Any]]:
+        # M6.4 enqueue looks up webhook destinations — none in this fake.
+        assert "from event_destinations" in query
+        return []
 
     async def fetchrow(self, query: str, *args: Any) -> dict[str, Any]:
         assert "insert into events" in query
