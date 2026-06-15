@@ -4,6 +4,42 @@ Reverse chronological. Newest at top. Every meaningful commit gets an entry foll
 
 ---
 
+## 2026-06-15 - feat(processing): P5-F processing package catalog (read-only)
+
+**Why:** make processing packages a first-class backend/API concept so the
+dashboard can build "package cards" and so P5-G can later add camera
+package request/apply. This milestone is **catalog only** — no camera
+assignment, no requested/applied state, no dashboard selector.
+
+**What:**
+
+- **Endpoints** (`routers/processing.py`): `GET /v1/processing/packages`
+  (list + `categories` grouping + catalog `warnings`, optional filters
+  `category`/`status`/`runtime`/`test_mode_safe`) and
+  `GET /v1/processing/packages/{package_id}` (full detail; unknown →
+  `404 package_not_found`). `CurrentCaller`-authed, platform-global,
+  conservative visibility gate (hides only `deprecated`). Registered in
+  `app.py`.
+- **Schema** (`schemas/processing_packages.py`): dashboard-friendly
+  `ProcessingPackage` (status ladder `probe`/`experimental`/`supported`/
+  `deprecated`, `production_ready`/`test_mode_safe`, composed
+  model/tracker/analytics ids, `supported_outputs`/`shapes`/`triggers`,
+  curated `default_settings`/`allowed_overrides`, `warnings`/`limitations`,
+  derived `requires_geometry`/`requires_restart`, `readiness_notes`/
+  `related_packages`). Raw DeepStream knobs deliberately not exposed.
+- **Data** (`services/package_catalog.py`): a **curated API-side static
+  snapshot** of the processor's `package_registry.json` (the repos deploy
+  independently — no runtime cross-repo dependency; same posture as
+  `services/models.py`). 9 packages; the NvDCF package is honestly
+  `experimental` with a "not promoted until a representative person A/B
+  passes" warning; the IOU YOLOX analytics package is `probe`.
+- **Tests** (`tests/test_processing_packages.py`, 11): auth (401), list
+  shape + grouping, schema-stability snapshot, detail, unknown 404, status
+  honesty (experimental visible+marked, no dishonest production_ready),
+  filters. Full suite green (1353), mypy + ruff clean.
+- **Docs:** `api-contracts.md` (endpoint shapes), `module-map.md`. Catalog
+  ≠ assignment; assignment is P5-G.
+
 ## 2026-06-14 - feat(events): M6.4 MVP webhook delivery base (Module 6)
 
 **Why:** M6.1–M6.3 built the ledger, the read API, and destination config. M6.4

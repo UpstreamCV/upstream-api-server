@@ -1157,6 +1157,64 @@ engine. The processor applies the model/tracker bundled in the package;
 confidence/classes/FPS from this config are applied per the M7 lineage
 rules.
 
+### `GET /v1/processing/packages`
+
+P5-F. The platform's read-only **processing-package catalog** — what each
+processing package does, what it composes (model / tracker / analytics), what
+it can emit, its readiness status, and whether it is safe/recommended. Powers
+future dashboard "package cards". **Catalog only**: it does NOT assign packages
+to cameras and exposes no requested/applied state (that is P5-G). The data is a
+curated, in-process API-side snapshot of the processor's package registry —
+there is **no DB table** and no runtime dependency on the processor.
+
+Authenticated (any caller), **not** account-scoped (a conservative visibility
+gate hides only retired packages). Optional filters (query params):
+`category`, `status`, `runtime`, `test_mode_safe`.
+
+Response 200: `{ "packages": [ProcessingPackage, ...], "categories": [{id,
+display_name}], "warnings": [str] }`. Status is one of `probe` /
+`experimental` / `supported` / `deprecated`; the dashboard must never present a
+non-`supported` (`production_ready: false`) package as recommended. Example
+`ProcessingPackage`:
+```json
+{
+  "package_id": "deepstream.yolox_analytics_nvdcf_probe.v0",
+  "display_name": "People Analytics — YOLOX + NvDCF (experimental)",
+  "description": "Same YOLOX-S people-analytics chain ... with the NvDCF tracker ...",
+  "category": "people_analytics",
+  "status": "experimental",
+  "production_ready": false,
+  "test_mode_safe": true,
+  "runtime": "deepstream",
+  "model_id": "yolox_s_v1",
+  "tracker_profile_id": "deepstream_nvdcf_balanced_v1",
+  "analytics_profile_id": "deepstream_nvdsanalytics_probe_v1",
+  "supported_classes": ["person"],
+  "supported_outputs": ["processor.zone_entered", "processor.zone_exited", "..."],
+  "supported_shapes": ["polygon_roi", "line_segment"],
+  "supported_triggers": ["line_crossing", "roi_occupancy", "zone_entered", "zone_exited", "dwell_exceeded"],
+  "default_settings": {"confidence_threshold": 0.4, "target_fps": 30},
+  "allowed_overrides": ["confidence_threshold", "selected_classes", "processing_fps"],
+  "compute_tier": "high",
+  "pricing_tier": "free_probe",
+  "observation_volume_risk": "medium",
+  "warnings": ["Experimental. Runtime viability proven, but not promoted until a representative person-analytics A/B passes."],
+  "limitations": [],
+  "best_for": ["occlusion_robustness", "track_continuity"],
+  "not_recommended_for": ["production_sla", "unverified_until_live_ab"],
+  "requires_geometry": true,
+  "requires_restart": true,
+  "readiness_notes": "NvDCF config reconciled to the DS 8.0 perf sample ...; promotion gated on a representative person A/B.",
+  "related_packages": ["deepstream.yolox_analytics_probe.v0"]
+}
+```
+
+### `GET /v1/processing/packages/{package_id}`
+
+P5-F. One processing package by id — the same `ProcessingPackage` shape (full
+detail incl. `readiness_notes` / `related_packages`). Unknown/hidden id → `404`
+with `error.code = "package_not_found"`.
+
 ### `GET /v1/cameras/{camera_id}/processing-config`
 
 M3. The dashboard-authored model/**processing config** for one camera —
