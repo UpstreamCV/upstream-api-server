@@ -98,3 +98,119 @@ class CameraProcessingConfigRecord(BaseModel):
 
 class CameraProcessingConfigResponse(BaseModel):
     processing_config: CameraProcessingConfigRecord
+
+
+# --- P5-G: package-centric request/apply ------------------------------------
+
+# Maps a user-facing settings key to the processor's genuine apply seam name
+# (the package catalog's ``allowed_overrides``).
+_SETTING_TO_OVERRIDE = {
+    "confidence_threshold": "confidence_threshold",
+    "target_fps": "processing_fps",
+    "selected_classes": "selected_classes",
+}
+
+CameraPackageState = Literal[
+    "unset",
+    "active",
+    "pending_apply",
+    "pending_restart",
+    "failed_config",
+    "experimental_selected",
+]
+
+
+class CameraPackageSettings(BaseModel):
+    """The operator-overridable settings for a package selection. Empty
+    ``selected_classes`` means "all of the package's supported classes"."""
+
+    model_config = ConfigDict(extra="forbid")
+    confidence_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
+    target_fps: int | None = Field(default=None, ge=1, le=30)
+    selected_classes: list[str] = Field(default_factory=list, max_length=64)
+
+    def provided_override_keys(self) -> list[str]:
+        keys: list[str] = []
+        if self.confidence_threshold is not None:
+            keys.append("confidence_threshold")
+        if self.target_fps is not None:
+            keys.append("target_fps")
+        if self.selected_classes:
+            keys.append("selected_classes")
+        return keys
+
+
+class CameraPackageRequest(BaseModel):
+    """``PUT/POST`` body for the package-centric processing config. Validated
+    against the P5-F package catalog: the package must exist + be visible;
+    ``experimental`` requires an explicit ``allow_experimental`` opt-in;
+    ``deprecated`` is rejected; selected classes must be supported; and only
+    the package's ``allowed_overrides`` settings may be set."""
+
+    model_config = ConfigDict(extra="forbid")
+    package_id: str = Field(min_length=1, max_length=128)
+    settings: CameraPackageSettings = Field(default_factory=CameraPackageSettings)
+    # Explicit opt-in so an experimental package is never selected by accident.
+    allow_experimental: bool = False
+
+    @model_validator(mode="after")
+    def _validate_against_catalog(self) -> CameraPackageRequest:
+        # Imported lazily to keep this schema importable without the catalog at
+        # module import time (mirrors the model_key validator's get_model use).
+        from upstream_api.services.package_catalog import get_package
+
+        pkg = get_package(self.package_id)
+        if pkg is None:
+            raise ValueError(f"unknown package_id: {self.package_id}")
+        if pkg.status == "deprecated":
+            raise ValueError(f"package is deprecated: {self.package_id}")
+        if pkg.status == "experimental" and not self.allow_experimental:
+            raise ValueError(
+                f"package {self.package_id!r} is experimental; "
+                "set allow_experimental=true to select it"
+            )
+        supported = set(pkg.supported_classes)
+        if self.settings.selected_classes:
+            if not supported:
+                # The package declares no class set, so a narrowing can't be
+                # validated — reject rather than pass garbage classes through.
+                raise ValueError(
+                    f"package {self.package_id!r} does not declare a class set; "
+                    "selected_classes cannot be narrowed"
+                )
+            for cls in self.settings.selected_classes:
+                if cls not in supported:
+                    raise ValueError(f"class not supported by package: {cls}")
+        allowed = set(pkg.allowed_overrides)
+        for key in self.settings.provided_override_keys():
+            override = _SETTING_TO_OVERRIDE[key]
+            if override not in allowed:
+                raise ValueError(f"setting not overridable for this package: {key}")
+        return self
+
+
+class RequestedPackageConfig(BaseModel):
+    package_id: str
+    settings: CameraPackageSettings
+    revision: int
+    updated_at: datetime | None = None
+    updated_by: str | None = None
+
+
+class AppliedPackageConfig(BaseModel):
+    """Derived from the latest ``processor_statuses`` row — what actually ran."""
+
+    package_id: str | None = None
+    model_id: str | None = None
+    tracker_profile_id: str | None = None
+    analytics_profile_id: str | None = None
+    status: str | None = None
+    applied_at: datetime | None = None
+
+
+class CameraPackageConfigResponse(BaseModel):
+    camera_id: UUID
+    requested: RequestedPackageConfig | None
+    applied: AppliedPackageConfig | None
+    state: CameraPackageState
+    warnings: list[str]

@@ -23,6 +23,8 @@ from upstream_api.schemas.geometry import (
     GeometryConfigUpdateRequest,
 )
 from upstream_api.schemas.processing_config_camera import (
+    CameraPackageConfigResponse,
+    CameraPackageRequest,
     CameraProcessingConfigResponse,
     CameraProcessingConfigUpdateRequest,
 )
@@ -43,6 +45,10 @@ from upstream_api.security.deps import (
 )
 from upstream_api.security.fanout_token import mint_fanout_token
 from upstream_api.services.account_audit import try_record_account_audit_log
+from upstream_api.services.camera_package_config import (
+    build_package_config_response,
+    store_requested_package,
+)
 from upstream_api.services.geometry import (
     default_geometry_config_record,
     fetch_geometry_config,
@@ -943,3 +949,148 @@ async def put_processing_config(
             },
         )
     return CameraProcessingConfigResponse(processing_config=record)
+
+
+# --- P5-G: package-centric request/apply -------------------------------------
+
+
+@router.get(
+    "/{camera_id}/processing-config/package",
+    response_model=CameraPackageConfigResponse,
+)
+async def get_package_config(
+    camera_id: UUID,
+    caller: CurrentCaller,
+    pool: PoolDep,
+    account_id: Annotated[UUID | None, Query()] = None,
+) -> CameraPackageConfigResponse:
+    """P5-G: the camera's requested-vs-applied processing PACKAGE state.
+
+    ``requested`` is the operator's package selection (stored in
+    ``cameras.metadata``); ``applied`` is derived from the latest processor
+    status (what actually ran); ``state`` compares them
+    (unset/active/pending_apply/pending_restart/failed_config/
+    experimental_selected). Catalog only — this does not assign or restart a
+    running session; a selection takes effect on the camera's next session.
+    """
+    scope_account = caller.resolve_account(account_id)
+    async with pool.acquire() as conn:
+        owner_row = await conn.fetchrow(
+            "select account_id from cameras where id = $1",
+            camera_id,
+        )
+        if owner_row is None or owner_row["account_id"] != scope_account:
+            raise NotFoundError("Camera not found.", code="camera_not_found")
+        return await build_package_config_response(
+            conn, account_id=scope_account, camera_id=camera_id
+        )
+
+
+@router.put(
+    "/{camera_id}/processing-config/package",
+    response_model=CameraPackageConfigResponse,
+)
+async def put_package_config(
+    camera_id: UUID,
+    body: CameraPackageRequest,
+    caller: CurrentCaller,
+    pool: PoolDep,
+    account_id: Annotated[UUID | None, Query()] = None,
+) -> CameraPackageConfigResponse:
+    """P5-G: request a processing package for one camera. Validated against the
+    package catalog (exists/visible; ``experimental`` requires
+    ``allow_experimental``; ``deprecated`` rejected; selected classes + settings
+    within the package's bounds). Stores the requested config (bumping its
+    revision) and stamps ``cameras.metadata.package_id``; takes effect on the
+    camera's next session start."""
+    scope_account = caller.resolve_account(account_id)
+    async with pool.acquire() as conn, conn.transaction():
+        owner_row = await conn.fetchrow(
+            "select account_id from cameras where id = $1",
+            camera_id,
+        )
+        if owner_row is None or owner_row["account_id"] != scope_account:
+            raise NotFoundError("Camera not found.", code="camera_not_found")
+        await store_requested_package(
+            conn,
+            camera_id=camera_id,
+            package_id=body.package_id,
+            settings=body.settings,
+            updated_by=(f"user:{caller.user.user_id}" if caller.user else None),
+            now=datetime.now(UTC),
+        )
+        await try_record_account_audit_log(
+            conn,
+            account_id=scope_account,
+            event_type="camera.processing_package_requested",
+            summary=f"Processing package requested ({body.package_id}).",
+            actor_user_id=caller.user.user_id if caller.user else None,
+            actor_type="user" if caller.user else "system",
+            resource_type="camera",
+            resource_id=str(camera_id),
+            metadata={"package_id": body.package_id},
+        )
+        return await build_package_config_response(
+            conn, account_id=scope_account, camera_id=camera_id
+        )
+
+
+@router.post(
+    "/{camera_id}/processing-config/apply",
+    response_model=CameraPackageConfigResponse,
+)
+async def apply_package_config(
+    camera_id: UUID,
+    caller: CurrentCaller,
+    pool: PoolDep,
+    account_id: Annotated[UUID | None, Query()] = None,
+) -> CameraPackageConfigResponse:
+    """P5-G: confirm the requested package as the active intent and return the
+    derived state. Re-stamps ``metadata.package_id`` from the requested config
+    (idempotent); the processor applies it on the next session start — no live
+    restart (Option A), so the state is ``pending_apply`` / ``pending_restart``
+    until then. 409 if nothing has been requested."""
+    scope_account = caller.resolve_account(account_id)
+    async with pool.acquire() as conn, conn.transaction():
+        owner_row = await conn.fetchrow(
+            "select account_id from cameras where id = $1",
+            camera_id,
+        )
+        if owner_row is None or owner_row["account_id"] != scope_account:
+            raise NotFoundError("Camera not found.", code="camera_not_found")
+        current = await build_package_config_response(
+            conn, account_id=scope_account, camera_id=camera_id
+        )
+        if current.requested is None:
+            raise ConflictError(
+                "No requested package config to apply.", code="no_requested_config"
+            )
+        # Idempotent re-stamp of metadata.package_id from the requested config
+        # (does not bump the requested revision). The next session picks it up.
+        await conn.execute(
+            """
+            update cameras
+               set metadata = jsonb_set(
+                       coalesce(metadata, '{}'::jsonb),
+                       '{package_id}', to_jsonb($2::text)
+                   ),
+                   updated_at = now()
+             where id = $1
+            """,
+            camera_id,
+            current.requested.package_id,
+        )
+        await try_record_account_audit_log(
+            conn,
+            account_id=scope_account,
+            event_type="camera.processing_package_applied",
+            summary=f"Processing package apply confirmed ({current.requested.package_id}).",
+            actor_user_id=caller.user.user_id if caller.user else None,
+            actor_type="user" if caller.user else "system",
+            resource_type="camera",
+            resource_id=str(camera_id),
+            metadata={"package_id": current.requested.package_id},
+        )
+        return await build_package_config_response(
+            conn, account_id=scope_account, camera_id=camera_id
+        )

@@ -1331,6 +1331,52 @@ The live processor does not consume this config yet: it is saved as the
 *intended* per-camera configuration ahead of processor integration. No
 dashboard editor yet.
 
+### `GET/PUT /v1/cameras/{camera_id}/processing-config/package` · `POST .../apply`
+
+P5-G — package-centric camera request/apply (separate from the model_key
+endpoints above, which keep working). Authenticated + camera-ownership scoped
+(404 `camera_not_found` for unknown/cross-account). The **requested** package
+is stored in `cameras.metadata`; the **applied** is derived from the latest
+`processor_statuses` row; **state** compares them. Catalog only — selecting a
+package takes effect on the camera's **next session** (no live restart).
+
+`GET .../package` → 200:
+```json
+{
+  "camera_id": "...",
+  "requested": {
+    "package_id": "deepstream.yolox_analytics_probe.v0",
+    "settings": {"confidence_threshold": 0.4, "target_fps": null, "selected_classes": []},
+    "revision": 2, "updated_at": "...", "updated_by": "user:<uuid>"
+  },
+  "applied": {
+    "package_id": "deepstream.yolox_analytics_probe.v0",
+    "model_id": "yolox_s_v1", "tracker_profile_id": "deepstream_iou_fast_v1",
+    "analytics_profile_id": "deepstream_nvdsanalytics_probe_v1",
+    "status": "processing", "applied_at": "..."
+  },
+  "state": "active",
+  "warnings": []
+}
+```
+`state` ∈ `unset` / `active` / `pending_apply` (requested, no processor status
+yet) / `pending_restart` (a session is running an older package) /
+`failed_config` (latest status `failed` + `package_resolution`) /
+`experimental_selected`.
+
+`PUT .../package` body `{package_id, settings?: {confidence_threshold?, target_fps?,
+selected_classes?}, allow_experimental?: bool}` → validated against the P5-F
+catalog: unknown/`deprecated` package, a class not in `supported_classes`, a
+setting not in the package's `allowed_overrides`, or an out-of-range value →
+`422`; an `experimental` package requires `allow_experimental: true` (else
+`422`). On success: stores the requested config (revision bump), stamps
+`cameras.metadata.package_id`, audits, returns the GET shape.
+
+`POST .../apply` → confirms the requested package as the active intent
+(idempotent re-stamp of `metadata.package_id`); `409 no_requested_config` if
+nothing has been requested. Returns the GET shape (state `pending_apply` /
+`pending_restart` until the next session picks it up).
+
 ### `GET /v1/dashboard/summary`
 
 Query: `account_id`.

@@ -4,6 +4,33 @@ Reverse chronological. Newest at top. Every meaningful commit gets an entry foll
 
 ---
 
+## 2026-06-15 - feat(processing): P5-G camera package request/apply state
+
+**Why:** make a camera's processing **package** a real request/apply concept so
+the dashboard (later) and the processor can agree on what was requested vs what
+ran. Catalog only became selection. Backend/API + processor only — no UI.
+
+**What:**
+- `routers/cameras.py`: `GET/PUT /v1/cameras/{id}/processing-config/package`
+  and `POST .../processing-config/apply` (separate from the existing model_key
+  endpoints, which keep working). Auth + camera-ownership scoped.
+- `services/camera_package_config.py`: requested stored in `cameras.metadata`
+  (migration-free, revision-bumped, stamps `metadata.package_id`); applied
+  DERIVED from the latest `processor_statuses` row; the
+  unset/active/pending_apply/pending_restart/failed_config/experimental_selected
+  state machine. Apply takes effect on the next session (Option A — no live
+  restart).
+- `schemas/processing_config_camera.py`: `CameraPackageRequest` (validated
+  against the P5-F catalog — exists/visible, experimental needs
+  `allow_experimental`, classes ⊆ supported, settings ⊆ allowed_overrides,
+  value ranges) + the `{requested, applied, state, warnings}` response.
+- `tests/test_camera_package_config.py` (17): auth/ownership, the full state
+  machine, PUT validation (unknown/class/setting/range/experimental), apply +
+  409. Full suite green (1370), mypy + ruff clean.
+- Docs: `api-contracts.md`, `module-map.md`. The matching processor change
+  (requested vs applied package lineage in status/observations) ships in the
+  processor repo.
+
 ## 2026-06-15 - feat(processing): P5-F processing package catalog (read-only)
 
 **Why:** make processing packages a first-class backend/API concept so the
