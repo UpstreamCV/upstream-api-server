@@ -4,6 +4,39 @@ Reverse chronological. Newest at top. Every meaningful commit gets an entry foll
 
 ---
 
+## 2026-06-17 - feat(processing): P5-J processing runtime evidence (read-only)
+
+**Why:** give operators/builders VISIBILITY into what a camera's processing
+package is actually doing — lineage, status, recent observation counts,
+lifecycle signals (inferred zone exits), and package-change history — so later
+milestones can build recommendations on real signals. NOT a recommendation
+engine: no verdicts, no auto-apply, no auto-tuning.
+
+**What:** new `GET /v1/cameras/{camera_id}/processing/evidence?range=1h|24h`
+(`routers/processing_evidence.py`, mounted in `app.py`) →
+`schemas/processing_evidence.py::ProcessingEvidenceResponse`. New
+`services/processing_evidence.py::build_processing_evidence` composes the reused
+`build_package_config_response` (package/state) + `fetch_latest_processor_status`
+(lineage read straight from the payload — `_derive_applied` omits
+`tracker_algorithm`) + three windowed/history queries:
+- windowed observation count-by-type (`observations`, half-open trailing window
+  on `observed_at`, deliberately NOT hour-aligned);
+- inferred / track-missing-timeout zone-exit counts (`payload->>'inferred'`,
+  `payload->>'exit_reason'` — P5-Gap; no status counter exists);
+- recent `camera.processing_package_*` audit events (guarded by a `to_regclass`
+  probe → `[]` + `package_history_unavailable` warning on a pre-migration deploy).
+Tracking metrics are session-level (flagged `is_session_level` + a
+`tracking_metrics_are_session_level` warning); dwell-closed-by-inferred-exit is
+not persisted → `dwell_closure_reason_not_persisted` warning. Pure read; no
+processor changes (everything needed was already emitted).
+
+**Tests:** `tests/test_processing_evidence.py` (18) — SQL pins, half-open
+windowing, inferred-vs-observed counting, no-status / no-observations, package
+history + table-missing, standing warnings, auth/ownership 404, range 422,
+lineage-from-payload. Full suite 1396 passed; mypy + ruff clean.
+
+---
+
 ## 2026-06-15 - feat(processing): P5-G camera package request/apply state
 
 **Why:** make a camera's processing **package** a real request/apply concept so
