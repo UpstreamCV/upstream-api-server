@@ -41,6 +41,7 @@ from upstream_api.routers import (
     models,
     platform_admin,
     processing,
+    processing_evidence,
     processor,
     reliability,
     rules,
@@ -194,6 +195,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(processor.router)  # /v1/internal/processor/* (M8.0)
     app.include_router(models.router)  # /v1/models
     app.include_router(processing.router)  # /v1/processing/packages (P5-F catalog)
+    app.include_router(
+        processing_evidence.router
+    )  # /v1/cameras/{id}/processing/evidence (P5-J)
     app.include_router(users.router)
     app.include_router(accounts.router)
     app.include_router(dashboard.router)

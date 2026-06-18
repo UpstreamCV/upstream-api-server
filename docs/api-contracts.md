@@ -884,6 +884,39 @@ Response 200: `{ "observations": [ObservationRecord, ...] }` newest first (by `o
 
 Errors: `camera_not_found` (404 — unknown camera **or** a camera in another account; identical response, no existence oracle).
 
+### `GET /v1/cameras/{camera_id}/processing/evidence`
+
+P5-J. Read-only **processing runtime evidence** for one camera over a recent window — VISIBILITY, not recommendations (powers the dashboard "Runtime Evidence" panel). No verdicts, no auto-apply, no auto-tuning.
+
+Query: `account_id`, `range` (`1h` | `24h`, default `24h`; any other value → 422).
+
+Response 200 `ProcessingEvidenceResponse`:
+```json
+{
+  "camera_id": "uuid",
+  "window": { "range": "24h", "started_at": "...", "ended_at": "..." },
+  "package": { "requested_package_id": "deepstream.yolox_analytics_probe.v0", "applied_package_id": "deepstream.yolox_analytics_probe.v0", "state": "active", "requested_revision": 3 },
+  "lineage": { "model_id": "yolox_s_v1", "tracker_profile_id": "deepstream_iou_fast_v1", "tracker_algorithm": "iou", "analytics_profile_id": "deepstream_nvdsanalytics_probe_v1" },
+  "status": { "status": "processing", "last_seen_at": "...", "last_error_code": null, "updated_at": "..." },
+  "observation_counts": [ { "type": "processor.zone_exited", "count": 3 } ],
+  "lifecycle": { "inferred_zone_exits": 2, "track_missing_timeout_exits": 2 },
+  "tracking": { "unique_tracker_ids_count": 8, "tracker_ids_sample": ["1", "2"], "is_session_level": true },
+  "package_history": [ { "id": "uuid", "event_type": "camera.processing_package_applied", "package_id": "...", "actor_type": "user", "actor_user_id": "uuid", "summary": "...", "created_at": "..." } ],
+  "warnings": ["dwell_closure_reason_not_persisted"]
+}
+```
+
+What's tracked vs not (read the warnings):
+- `observation_counts` are **windowed** — counted from the `observations` table over the trailing `range`, half-open `[now - n hours, now)` on `observed_at` (deliberately NOT hour-aligned).
+- `lifecycle.inferred_zone_exits` counts `processor.zone_exited` observations carrying `payload.inferred = true` (P5-Gap) over the window; `track_missing_timeout_exits` is the `exit_reason = "track_missing_timeout"` subset. There is no status counter for these.
+- `lineage` is read from the latest `processor_statuses` payload (what actually ran).
+- `tracking` metrics are **session-level** (cumulative for the current session, NOT windowed) — `is_session_level` is always `true`.
+- `package_history` is the recent `camera.processing_package_requested` / `camera.processing_package_applied` audit events for this camera.
+
+Warning codes (stable; switch on the code): `dwell_closure_reason_not_persisted` (always — dwell closures caused by inferred exits are not persisted anywhere), `tracking_metrics_are_session_level` (when tracking has data), `package_history_unavailable` (audit table not migrated). Nested objects are always present (with null fields) even when there is no status row or no observations.
+
+Errors: `camera_not_found` (404). Pure read — no evaluator, no writes. NOT a recommendation engine; later milestones may build recommendations on these signals.
+
 ### `GET /v1/cameras/{camera_id}/perception/latest`
 
 P5-C. The latest **perception snapshot** for one camera — current visual
