@@ -24,6 +24,10 @@ _GET = "/v1/cameras/{camera_id}/processing-config/package"
 _APPLY = "/v1/cameras/{camera_id}/processing-config/apply"
 _IOU = "deepstream.yolox_analytics_probe.v0"
 _NVDCF = "deepstream.yolox_analytics_nvdcf_probe.v0"
+# P5-K
+_VEHICLE = "deepstream.trafficcamnet_vehicle_probe.v0"
+_LINE = "deepstream.yolox_people_line_crossing_probe.v0"
+_YOLO11S = "deepstream.yolo11s_people_probe.v0"
 
 
 class FakeTransaction:
@@ -296,6 +300,48 @@ def test_put_experimental_needs_opt_in() -> None:
     )
     assert r2.status_code == 200, r2.text
     assert r2.json()["state"] in ("pending_apply", "experimental_selected")
+
+
+def test_put_p5k_experimental_packages_need_opt_in() -> None:
+    # P5-K: the line-crossing, vehicle, and per-new-model packages are all
+    # experimental and require the same explicit opt-in as NvDCF.
+    for pid in (_LINE, _VEHICLE, _YOLO11S):
+        acct = uuid4()
+        conn = FakePkgConn(camera_account_id=acct, metadata={})
+        client = _client(conn, account_id=acct)
+        assert (
+            client.put(_GET.format(camera_id=uuid4()), json={"package_id": pid}).status_code == 422
+        )
+        r = client.put(
+            _GET.format(camera_id=uuid4()),
+            json={"package_id": pid, "allow_experimental": True},
+        )
+        assert r.status_code == 200, r.text
+
+
+def test_put_vehicle_package_class_validation() -> None:
+    # The vehicle package supports car/bicycle (not person).
+    acct = uuid4()
+    conn = FakePkgConn(camera_account_id=acct, metadata={})
+    client = _client(conn, account_id=acct)
+    ok = client.put(
+        _GET.format(camera_id=uuid4()),
+        json={
+            "package_id": _VEHICLE,
+            "allow_experimental": True,
+            "settings": {"selected_classes": ["car"]},
+        },
+    )
+    assert ok.status_code == 200, ok.text
+    bad = client.put(
+        _GET.format(camera_id=uuid4()),
+        json={
+            "package_id": _VEHICLE,
+            "allow_experimental": True,
+            "settings": {"selected_classes": ["person"]},
+        },  # not a vehicle class
+    )
+    assert bad.status_code == 422
 
 
 # --- POST apply ---------------------------------------------------------------

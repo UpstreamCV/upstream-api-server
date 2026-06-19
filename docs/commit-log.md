@@ -4,6 +4,64 @@ Reverse chronological. Newest at top. Every meaningful commit gets an entry foll
 
 ---
 
+## 2026-06-18 - feat(processing): P5-K curated model + package catalog expansion
+
+**Why:** make the processing-package catalog reflect the full set of models the
+processor can now run (multiple YOLOX sizes, YOLO11/YOLOv8, PeopleNet,
+TrafficCamNet vehicle) so the dashboard can offer real per-model / per-use-case
+package cards — while honoring a **BYOM-first** licensing policy: first-party
+hosted packages must be permissively licensed or covered by a completed
+commercial agreement; AGPL/GPL (Ultralytics) models are supported via BYOM /
+the customer's own license but are NOT auto-provided as first-party until legal
+approval. Upstream holds an Ultralytics Enterprise license (dev use cleared).
+Catalog/provenance only — no new model picker, no auto-promotion, nothing
+dishonestly `production_ready`.
+
+**What:**
+
+- **Catalog** (`services/package_catalog.py`): grew **9 → 23 packages**. New:
+  5 YOLOX-S + IOU people variants (`deepstream.yolox_people_{fast,high_recall,
+  line_crossing,occupancy,dwell}_probe.v0` — reuse the verified IOU pipeline,
+  only defaults/scope differ); 1 TrafficCamNet vehicle package
+  (`deepstream.trafficcamnet_vehicle_probe.v0`, classes car/bicycle, **new
+  `vehicle_analytics` category** added to `_CATEGORY_NAMES`); and 8 per-new-model
+  people packages (`deepstream.{yolox_nano,yolox_tiny,yolox_m,yolo11n,yolo11s,
+  yolo11m,yolov8n,peoplenet}_people_probe.v0`). Status spread: fast / high_recall
+  / occupancy / dwell are `probe`; everything else new (vehicle, line_crossing,
+  all 8 per-model) is `experimental`. No new package is `production_ready`.
+- **Schema** (`schemas/processing_packages.py`): `ProcessingPackage` gains
+  `license_class` (`"permissive"` | `"commercial_agreement"` | `"restrictive"`)
+  and `first_party: bool`, mirroring the backing model's licensing/provenance
+  (orthogonal to `status`).
+- **Config gate** (`config.py`): new `catalog_first_party_only: bool = False`
+  (env `UPSTREAM_CATALOG_FIRST_PARTY_ONLY`). Default OFF — dev/demo see
+  everything (the dashboard badges non-first-party as BYOM); flip ON at go-live
+  so AGPL/restrictive packages stop being auto-provided. When on, the catalog's
+  `_visible()` gate hides non-`first_party` packages: the 4 AGPL Ultralytics
+  packages (`deepstream.{yolo11n,yolo11s,yolo11m,yolov8n}_people_probe.v0`).
+- **Endpoints** (`routers/processing.py`): `GET /v1/processing/packages` (list)
+  and `GET /v1/processing/packages/{id}` (detail) honor the gate via a new
+  `SettingsDep` — list hides gated packages, detail 404s (`package_not_found`)
+  them when the flag is on. Internal validation (`get_package` in camera package
+  requests) is NOT gated — an explicitly-chosen BYOM package still resolves.
+  Experimental packages still require `allow_experimental` on a camera package
+  PUT (unchanged), which now also covers the new experimental packages.
+- **Deliberate scope decision:** the new models were **not** mirrored into
+  `services/models.py` (the M3/M4 model picker). That picker has NO
+  first-party/provenance gate, so adding AGPL models there would leak them into
+  the ungated picker, violating BYOM-first. New models are surfaced ONLY through
+  the gated package catalog. Existing model→default-package mappings
+  (`yolox_s_v1`→`yolox_analytics_probe`, `trafficcamnet_v1`→`analytics_probe`,
+  `mock`→`mock.detect`) are unchanged.
+
+**Tests:** full suite **1403 passed**; mypy + ruff clean.
+
+**Docs:** `api-contracts.md` (new package ids/categories, the two response
+fields, the gate behavior), `module-map.md` (`services/package_catalog.py`,
+the new config + the deliberate `models.py` non-change), this entry.
+
+---
+
 ## 2026-06-17 - feat(processing): P5-J processing runtime evidence (read-only)
 
 **Why:** give operators/builders VISIBILITY into what a camera's processing

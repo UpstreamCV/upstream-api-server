@@ -16,11 +16,18 @@ from uuid import UUID, uuid4
 from fastapi.testclient import TestClient
 
 from upstream_api.app import create_app
+from upstream_api.config import get_settings
 from upstream_api.db.pool import get_pool
 from upstream_api.security.deps import AgentAuth, CallerAuth, current_caller
 
 _NVDCF = "deepstream.yolox_analytics_nvdcf_probe.v0"
 _IOU = "deepstream.yolox_analytics_probe.v0"
+# P5-K additions used across tests.
+_VEHICLE = "deepstream.trafficcamnet_vehicle_probe.v0"
+_LINE = "deepstream.yolox_people_line_crossing_probe.v0"
+_OCC = "deepstream.yolox_people_occupancy_probe.v0"
+_YOLO11S = "deepstream.yolo11s_people_probe.v0"  # AGPL / first_party=false
+_NANO = "deepstream.yolox_nano_people_probe.v0"  # permissive / first_party=true
 
 _EXPECTED_FIELDS = {
     "package_id",
@@ -43,6 +50,8 @@ _EXPECTED_FIELDS = {
     "compute_tier",
     "pricing_tier",
     "observation_volume_risk",
+    "license_class",
+    "first_party",
     "warnings",
     "limitations",
     "best_for",
@@ -88,6 +97,19 @@ def _unauth_client() -> TestClient:
     resolves); no Authorization header => 401."""
     app = create_app()
     app.dependency_overrides[get_pool] = lambda: _FakePool(None)
+    return TestClient(app)
+
+
+def _first_party_only_client() -> TestClient:
+    """A caller client with the P5-K catalog gate ON (production posture)."""
+    app = create_app()
+    app.dependency_overrides[get_pool] = lambda: _FakePool(None)
+    app.dependency_overrides[current_caller] = lambda: CallerAuth(
+        agent=AgentAuth(account_id=uuid4(), token_id=uuid4(), scopes=("agent",)),
+        user=None,
+    )
+    gated = get_settings().model_copy(update={"catalog_first_party_only": True})
+    app.dependency_overrides[get_settings] = lambda: gated
     return TestClient(app)
 
 
@@ -199,3 +221,78 @@ def test_filter_by_test_mode_safe() -> None:
     r = _caller_client().get("/v1/processing/packages", params={"test_mode_safe": "true"})
     pkgs = r.json()["packages"]
     assert pkgs and all(p["test_mode_safe"] is True for p in pkgs)
+
+
+# --- P5-K: catalog expansion --------------------------------------------------
+
+
+def test_vehicle_analytics_category_present() -> None:
+    body = _caller_client().get("/v1/processing/packages").json()
+    cat_ids = {c["id"] for c in body["categories"]}
+    assert "vehicle_analytics" in cat_ids
+    veh = (
+        _caller_client()
+        .get("/v1/processing/packages", params={"category": "vehicle_analytics"})
+        .json()
+    )
+    ids = {p["package_id"] for p in veh["packages"]}
+    assert _VEHICLE in ids
+    assert all(p["category"] == "vehicle_analytics" for p in veh["packages"])
+
+
+def test_p5k_new_experimental_packages_are_honest() -> None:
+    by_id = {
+        p["package_id"]: p
+        for p in _caller_client().get("/v1/processing/packages").json()["packages"]
+    }
+    for pid in (_VEHICLE, _LINE, _YOLO11S):
+        pkg = by_id[pid]
+        assert pkg["status"] == "experimental"
+        assert pkg["production_ready"] is False
+        assert pkg["warnings"]  # clearly marked
+    # The 5 YOLOX-S variants that reuse the verified pipeline stay probe.
+    assert by_id[_OCC]["status"] == "probe"
+
+
+def test_p5k_provenance_and_byom_marking() -> None:
+    by_id = {
+        p["package_id"]: p
+        for p in _caller_client().get("/v1/processing/packages").json()["packages"]
+    }
+    # Permissive YOLOX size: first-party.
+    assert by_id[_NANO]["license_class"] == "permissive"
+    assert by_id[_NANO]["first_party"] is True
+    # Ultralytics (AGPL): restrictive + BYOM (not first-party).
+    assert by_id[_YOLO11S]["license_class"] == "restrictive"
+    assert by_id[_YOLO11S]["first_party"] is False
+    assert any("BYOM" in w for w in by_id[_YOLO11S]["warnings"])
+    # TAO PeopleNet: covered by a commercial agreement, first-party.
+    pn = by_id["deepstream.peoplenet_people_probe.v0"]
+    assert pn["license_class"] == "commercial_agreement" and pn["first_party"] is True
+
+
+def test_first_party_only_gate_hides_agpl_from_list() -> None:
+    # Default (dev): AGPL packages are visible (with a BYOM badge).
+    default_ids = {
+        p["package_id"] for p in _caller_client().get("/v1/processing/packages").json()["packages"]
+    }
+    assert _YOLO11S in default_ids
+    # Gate ON (go-live): AGPL/non-first-party packages are hidden; permissive +
+    # the recommended IOU package stay.
+    gated_ids = {
+        p["package_id"]
+        for p in _first_party_only_client().get("/v1/processing/packages").json()["packages"]
+    }
+    assert _YOLO11S not in gated_ids
+    assert "deepstream.yolov8n_people_probe.v0" not in gated_ids
+    assert _NANO in gated_ids and _IOU in gated_ids and _VEHICLE in gated_ids
+
+
+def test_first_party_only_gate_404s_agpl_detail() -> None:
+    # Visible by default; 404 when the gate is on.
+    assert _caller_client().get(f"/v1/processing/packages/{_YOLO11S}").status_code == 200
+    r = _first_party_only_client().get(f"/v1/processing/packages/{_YOLO11S}")
+    assert r.status_code == 404
+    assert r.json()["error"]["code"] == "package_not_found"
+    # A permissive package is unaffected by the gate.
+    assert _first_party_only_client().get(f"/v1/processing/packages/{_NANO}").status_code == 200

@@ -61,6 +61,14 @@ class ProcessingPackage(BaseModel):
     compute_tier: str | None
     pricing_tier: str | None
     observation_volume_risk: str | None
+    # P5-K licensing/provenance (orthogonal to ``status``). ``license_class``:
+    # "permissive" | "commercial_agreement" | "restrictive". ``first_party``:
+    # may Upstream auto-provide this as a first-party hosted package? False for
+    # restrictive (AGPL) models — BYOM / your own license, not auto-provided in
+    # production until legal approval (the catalog gate hides them when
+    # ``catalog_first_party_only`` is on; the dashboard badges them).
+    license_class: str
+    first_party: bool
     warnings: list[str]
     limitations: list[str]
     best_for: list[str]
