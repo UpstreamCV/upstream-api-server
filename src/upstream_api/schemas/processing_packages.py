@@ -27,6 +27,29 @@ from pydantic import BaseModel, ConfigDict
 PackageStatus = Literal["probe", "experimental", "supported", "deprecated"]
 
 
+class ModelMetrics(BaseModel):
+    """P5-L — PUBLISHED reference benchmarks for the backing model, for the
+    operator model-comparison UI. These are NOT measured by Upstream on
+    customer hardware: ``upstream_measured`` is always false and
+    ``metric_source`` records provenance. COCO fields apply to COCO-trained
+    detectors (YOLOX/Ultralytics); NVIDIA TAO models (TrafficCamNet/PeopleNet)
+    have no COCO mAP, so those are null and their vendor-reported KPI rides in
+    ``vendor_kpi_*`` (clearly labelled, NOT comparable to COCO mAP)."""
+
+    model_config = ConfigDict(extra="forbid")
+    metric_source: str
+    upstream_measured: bool
+    metric_dataset: str | None = None
+    coco_map50_95: float | None = None
+    coco_map50: float | None = None
+    params_m: float | None = None
+    input_size: int | None = None
+    backbone: str | None = None
+    vendor_kpi_label: str | None = None
+    vendor_kpi_value: float | None = None
+    vendor_kpi_note: str | None = None
+
+
 class ProcessingPackage(BaseModel):
     """One processing package the platform knows about."""
 
@@ -80,6 +103,10 @@ class ProcessingPackage(BaseModel):
     # Detail-friendly extras (populated where meaningful; safe in list too).
     readiness_notes: str | None = None
     related_packages: list[str] = []
+    # P5-L: published reference benchmarks for the backing model (model-
+    # comparison UI). Null for packages with no backing model (diagnostic/mock)
+    # or no curated stats.
+    model_metrics: ModelMetrics | None = None
 
 
 class ProcessingPackageCategory(BaseModel):

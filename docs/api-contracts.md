@@ -1269,6 +1269,42 @@ P5-K added two licensing/provenance fields on every `ProcessingPackage`
   are BYOM (the customer's own license), not auto-provided in production until
   legal approval; the dashboard badges them.
 
+P5-L added an optional `model_metrics` object on every `ProcessingPackage`,
+carrying the backing model's **published reference benchmarks** for the
+dashboard's model-comparison UI. It is `null` for packages with no backing model
+(diagnostic / mock) and inherited from the package's `model_id` otherwise (so all
+packages sharing a model carry identical metrics). Example:
+```json
+"model_metrics": {
+  "metric_source": "Published reference — YOLOX repo (Megvii, Apache-2.0)",
+  "upstream_measured": false,
+  "metric_dataset": "COCO val2017",
+  "coco_map50_95": 40.5,
+  "coco_map50": null,
+  "params_m": 9.0,
+  "input_size": 640,
+  "backbone": null,
+  "vendor_kpi_label": null,
+  "vendor_kpi_value": null,
+  "vendor_kpi_note": null
+}
+```
+Honesty framing — these are **PUBLISHED** numbers from each model's source, **not
+measured by Upstream** on customer hardware: `upstream_measured` is always
+`false` and `metric_source` records the provenance. The COCO fields
+(`coco_map50_95` / `coco_map50` / `params_m` / `input_size`) apply to the
+COCO-trained YOLO detectors (YOLOX / Ultralytics). The NVIDIA TAO models
+(TrafficCamNet, PeopleNet) have **no COCO mAP**, so those fields are `null` and
+the vendor-reported number rides in `vendor_kpi_*` instead, with a
+`vendor_kpi_note` stating it is **not comparable to COCO mAP** (e.g. PeopleNet's
+person mAP on a proprietary eval at IoU>0.5). The dashboard must not chart a TAO
+`vendor_kpi_value` on the same axis as a COCO mAP.
+
+`model_metrics` is **not** a separate endpoint and is **not** separately gated —
+it rides on the `ProcessingPackage`, so it inherits the same first-party gate: a
+package hidden by `catalog_first_party_only` (below) takes its metrics with it,
+and no metric for a hidden BYOM package is exposed in production.
+
 **`catalog_first_party_only` gate** (env `UPSTREAM_CATALOG_FIRST_PARTY_ONLY`,
 default **off**): when **off**, the list returns every visible package and the
 dashboard shows a BYOM badge on `first_party: false` ones (dev/demo posture).

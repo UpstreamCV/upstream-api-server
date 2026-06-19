@@ -4,6 +4,50 @@ Reverse chronological. Newest at top. Every meaningful commit gets an entry foll
 
 ---
 
+## 2026-06-19 - feat(processing): P5-L published model metrics on processing packages
+
+**Why:** the dashboard's model-comparison UI needs per-model benchmark numbers
+(COCO mAP, params, input size) to let an operator compare the packages' backing
+models side by side. The honest framing matters: these are **PUBLISHED reference
+benchmarks** (from each model's published source), **never Upstream-measured on
+customer hardware** — and NVIDIA TAO models (PeopleNet/TrafficCamNet) have no
+COCO mAP, so their vendor-reported KPI is carried separately and clearly marked
+**not comparable to COCO mAP**. No new endpoint, no gate change — the metrics
+ride on the already-gated `ProcessingPackage`.
+
+**What:**
+
+- **Schema** (`schemas/processing_packages.py`): new `ModelMetrics` BaseModel
+  (`extra="forbid"`) and `model_metrics: ModelMetrics | None = None` on
+  `ProcessingPackage`. Fields: `metric_source` (provenance), `upstream_measured`
+  (always `false`), `metric_dataset`, `coco_map50_95`, `coco_map50`, `params_m`,
+  `input_size`, `backbone`, `vendor_kpi_label`, `vendor_kpi_value`,
+  `vendor_kpi_note`. COCO fields apply to COCO-trained detectors
+  (YOLOX/Ultralytics); TAO models leave them null and use `vendor_kpi_*`.
+- **Catalog** (`services/package_catalog.py`): a static
+  `_MODEL_METRICS: dict[model_id, ModelMetrics]` lookup of PUBLISHED reference
+  numbers mirrored from the processor model registry — COCO mAP for the YOLO
+  families (e.g. `yolox_s_v1` 40.5 mAP50-95 / 9.0M params / 640px), NVIDIA TAO
+  vendor KPI for PeopleNet / TrafficCamNet with a "not comparable to COCO" note.
+  Each package inherits its backing model's metrics in `_pkg()`
+  (`model_metrics=_MODEL_METRICS.get(model_id)`); packages with no backing model
+  (diagnostic/mock) get null. **No new endpoint and no gate change** — the
+  metrics ride on the already-gated `ProcessingPackage`, so a hidden BYOM
+  package's metrics are hidden with it when `catalog_first_party_only` is on.
+- **Tests** (`tests/test_processing_packages.py`): `_EXPECTED_FIELDS` gained
+  `model_metrics`; new tests assert metrics present (YOLOX-S 40.5 mAP / 9.0M,
+  never `upstream_measured`), the TAO package has null COCO mAP + a vendor KPI
+  label with a "not comparable" note, the diagnostic package has null metrics,
+  and metrics are hidden with gated packages.
+
+**Tests:** full suite **1405 passed**; mypy + ruff clean.
+
+**Docs:** `api-contracts.md` (the `model_metrics` object on each package in the
+`GET /v1/processing/packages` section), `module-map.md`
+(`services/package_catalog.py`), this entry.
+
+---
+
 ## 2026-06-18 - feat(processing): P5-K curated model + package catalog expansion
 
 **Why:** make the processing-package catalog reflect the full set of models the

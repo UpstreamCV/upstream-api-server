@@ -60,6 +60,7 @@ _EXPECTED_FIELDS = {
     "requires_restart",
     "readiness_notes",
     "related_packages",
+    "model_metrics",
 }
 
 
@@ -269,6 +270,35 @@ def test_p5k_provenance_and_byom_marking() -> None:
     # TAO PeopleNet: covered by a commercial agreement, first-party.
     pn = by_id["deepstream.peoplenet_people_probe.v0"]
     assert pn["license_class"] == "commercial_agreement" and pn["first_party"] is True
+
+
+def test_p5l_model_metrics_on_packages() -> None:
+    by_id = {
+        p["package_id"]: p
+        for p in _caller_client().get("/v1/processing/packages").json()["packages"]
+    }
+    # YOLOX-S package carries published COCO mAP + params, never Upstream-measured.
+    iou = by_id[_IOU]["model_metrics"]
+    assert iou is not None
+    assert iou["coco_map50_95"] == 40.5
+    assert iou["params_m"] == 9.0
+    assert iou["upstream_measured"] is False
+    assert iou["metric_source"]
+    # The TrafficCamNet (people) package: NVIDIA TAO model → no COCO mAP, vendor KPI label.
+    tcn = by_id["deepstream.analytics_probe.v0"]["model_metrics"]
+    assert tcn is not None and tcn["coco_map50_95"] is None
+    assert tcn["vendor_kpi_label"] and "not comparable" in (tcn["vendor_kpi_note"] or "")
+    # Diagnostic decode probe has no backing model → no metrics.
+    assert by_id["deepstream.decode_probe.v0"]["model_metrics"] is None
+
+
+def test_p5l_metrics_hidden_with_gated_packages() -> None:
+    # The gate hides BYOM packages (and thus their model_metrics) in production.
+    gated = {
+        p["package_id"]
+        for p in _first_party_only_client().get("/v1/processing/packages").json()["packages"]
+    }
+    assert _YOLO11S not in gated  # AGPL model's package (and its metrics) not exposed
 
 
 def test_first_party_only_gate_hides_agpl_from_list() -> None:
