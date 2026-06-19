@@ -47,6 +47,7 @@ _ANALYTICS_OVERRIDES = ("confidence_threshold", "selected_classes", "processing_
 
 _CATEGORY_NAMES: dict[str, str] = {
     "people_analytics": "People Analytics",
+    "vehicle_analytics": "Vehicle Analytics",
     "diagnostic": "Diagnostic Probes",
     "mock": "Mock",
 }
@@ -77,6 +78,8 @@ def _pkg(
     compute_tier: str | None = None,
     pricing_tier: str | None = "free_probe",
     observation_volume_risk: str | None = None,
+    license_class: str = "permissive",
+    first_party: bool = True,
     warnings: Sequence[str] = (),
     limitations: Sequence[str] = (),
     best_for: Sequence[str] = (),
@@ -88,7 +91,9 @@ def _pkg(
 ) -> ProcessingPackage:
     """Build a ProcessingPackage, deriving ``requires_geometry`` (analytics
     packages need ROI/line geometry) and ``requires_restart`` (DeepStream
-    packages take effect on the next worker start)."""
+    packages take effect on the next worker start). ``license_class`` /
+    ``first_party`` mirror the backing model's P5-K provenance (default:
+    permissive + first-party)."""
     return ProcessingPackage(
         package_id=package_id,
         display_name=display_name,
@@ -110,6 +115,8 @@ def _pkg(
         compute_tier=compute_tier,
         pricing_tier=pricing_tier,
         observation_volume_risk=observation_volume_risk,
+        license_class=license_class,
+        first_party=first_party,
         warnings=list(warnings),
         limitations=list(limitations),
         best_for=list(best_for),
@@ -203,6 +210,7 @@ PACKAGE_CATALOG: tuple[ProcessingPackage, ...] = (
         default_settings={"confidence_threshold": 0.4, "target_fps": 30},
         compute_tier="low",
         observation_volume_risk="medium",
+        license_class="commercial_agreement",
         warnings=(
             "TrafficCamNet can misclassify people as cars in non-traffic scenes — "
             "prefer the YOLOX people-analytics package for person analytics.",
@@ -285,14 +293,329 @@ PACKAGE_CATALOG: tuple[ProcessingPackage, ...] = (
         ),
         related_packages=("deepstream.yolox_analytics_probe.v0",),
     ),
+    # --- P5-K: YOLOX-S + IOU people variants (reuse the verified pipeline) ---
+    _pkg(
+        package_id="deepstream.yolox_people_fast_probe.v0",
+        display_name="People Analytics — YOLOX (Fast)",
+        description=(
+            "YOLOX-S people analytics tuned for low compute / many cameras: higher "
+            "confidence (0.5), 15 fps. Same verified IOU pipeline; only the defaults differ."
+        ),
+        category="people_analytics",
+        status="probe",
+        model_id="yolox_s_v1",
+        tracker_profile_id="deepstream_iou_fast_v1",
+        analytics_profile_id="deepstream_nvdsanalytics_probe_v1",
+        supported_classes=("person",),
+        supported_outputs=_ANALYTICS_OUTPUTS,
+        supported_shapes=_ANALYTICS_SHAPES,
+        supported_triggers=_ANALYTICS_TRIGGERS,
+        allowed_overrides=_ANALYTICS_OVERRIDES,
+        default_settings={"confidence_threshold": 0.5, "target_fps": 15},
+        compute_tier="low",
+        observation_volume_risk="low",
+        warnings=(
+            "A lower frame rate can increase IOU track fragmentation for fast-moving people.",
+        ),
+        best_for=("low_compute", "many_cameras"),
+        not_recommended_for=("fast_movers", "dense_crowds", "production_sla"),
+        related_packages=("deepstream.yolox_analytics_probe.v0",),
+    ),
+    _pkg(
+        package_id="deepstream.yolox_people_high_recall_probe.v0",
+        display_name="People Analytics — YOLOX (High Recall)",
+        description=(
+            "YOLOX-S people analytics tuned to catch more detections (confidence 0.25) "
+            "for crowded / don't-miss scenes. Same verified IOU pipeline; higher volume."
+        ),
+        category="people_analytics",
+        status="probe",
+        model_id="yolox_s_v1",
+        tracker_profile_id="deepstream_iou_fast_v1",
+        analytics_profile_id="deepstream_nvdsanalytics_probe_v1",
+        supported_classes=("person",),
+        supported_outputs=_ANALYTICS_OUTPUTS,
+        supported_shapes=_ANALYTICS_SHAPES,
+        supported_triggers=_ANALYTICS_TRIGGERS,
+        allowed_overrides=_ANALYTICS_OVERRIDES,
+        default_settings={"confidence_threshold": 0.25, "target_fps": 30},
+        compute_tier="high",
+        observation_volume_risk="high",
+        warnings=(
+            "Lower confidence threshold increases false positives and observation "
+            "volume; not separately live-tuned.",
+        ),
+        best_for=("crowded_scenes", "high_recall"),
+        not_recommended_for=("low_compute", "observation_volume_sensitive", "production_sla"),
+        related_packages=("deepstream.yolox_analytics_probe.v0",),
+    ),
+    _pkg(
+        package_id="deepstream.yolox_people_line_crossing_probe.v0",
+        display_name="People Line Crossing (experimental)",
+        description=(
+            "Directional people counting across a line: YOLOX-S + IOU + nvdsanalytics "
+            "narrowed to line-crossing. Draw a line (no ROI needed)."
+        ),
+        category="people_analytics",
+        status="experimental",
+        model_id="yolox_s_v1",
+        tracker_profile_id="deepstream_iou_fast_v1",
+        analytics_profile_id="deepstream_nvdsanalytics_probe_v1",
+        supported_classes=("person",),
+        supported_outputs=("processor.line_crossing", "processor.line_crossing_object"),
+        supported_shapes=("line_segment",),
+        supported_triggers=("line_crossing",),
+        allowed_overrides=_ANALYTICS_OVERRIDES,
+        default_settings={"confidence_threshold": 0.4, "target_fps": 30},
+        compute_tier="medium",
+        observation_volume_risk="medium",
+        warnings=(
+            "Experimental — line-crossing emission via the IOU tracker is not yet "
+            "live-confirmed (suspected track fragmentation during walking motion).",
+        ),
+        best_for=("line_crossing", "directional_counting"),
+        not_recommended_for=("production_sla",),
+        related_packages=("deepstream.yolox_analytics_probe.v0",),
+    ),
+    _pkg(
+        package_id="deepstream.yolox_people_occupancy_probe.v0",
+        display_name="People Occupancy",
+        description=(
+            "People occupancy / capacity / presence in a polygon ROI: YOLOX-S + IOU + "
+            "nvdsanalytics ROI occupancy. Draw an ROI."
+        ),
+        category="people_analytics",
+        status="probe",
+        model_id="yolox_s_v1",
+        tracker_profile_id="deepstream_iou_fast_v1",
+        analytics_profile_id="deepstream_nvdsanalytics_probe_v1",
+        supported_classes=("person",),
+        supported_outputs=(
+            "processor.roi_occupancy",
+            "processor.zone_entered",
+            "processor.zone_exited",
+        ),
+        supported_shapes=("polygon_roi",),
+        supported_triggers=("roi_occupancy",),
+        allowed_overrides=_ANALYTICS_OVERRIDES,
+        default_settings={"confidence_threshold": 0.4, "target_fps": 30},
+        compute_tier="medium",
+        observation_volume_risk="medium",
+        warnings=(
+            "zone_exited is inferred when a track disappears (grace window), not a true "
+            "geometric exit.",
+        ),
+        best_for=("occupancy", "capacity", "presence"),
+        not_recommended_for=("dense_crowds", "production_sla"),
+        related_packages=("deepstream.yolox_analytics_probe.v0",),
+    ),
+    _pkg(
+        package_id="deepstream.yolox_people_dwell_probe.v0",
+        display_name="People Dwell / Loitering",
+        description=(
+            "People dwell / loitering monitoring in a polygon ROI: YOLOX-S + IOU + "
+            "nvdsanalytics dwell events. Draw an ROI."
+        ),
+        category="people_analytics",
+        status="probe",
+        model_id="yolox_s_v1",
+        tracker_profile_id="deepstream_iou_fast_v1",
+        analytics_profile_id="deepstream_nvdsanalytics_probe_v1",
+        supported_classes=("person",),
+        supported_outputs=(
+            "processor.dwell_started",
+            "processor.dwell_updated",
+            "processor.dwell_exceeded",
+            "processor.zone_entered",
+            "processor.zone_exited",
+        ),
+        supported_shapes=("polygon_roi",),
+        supported_triggers=("dwell_exceeded",),
+        allowed_overrides=_ANALYTICS_OVERRIDES,
+        default_settings={"confidence_threshold": 0.4, "target_fps": 30},
+        compute_tier="medium",
+        observation_volume_risk="medium",
+        best_for=("dwell", "dwell_monitoring", "loitering"),
+        not_recommended_for=("dense_crowds", "production_sla"),
+        related_packages=("deepstream.yolox_analytics_probe.v0",),
+    ),
+    # --- P5-K: TrafficCamNet vehicle (new vehicle_analytics category) --------
+    _pkg(
+        package_id="deepstream.trafficcamnet_vehicle_probe.v0",
+        display_name="Vehicle / Traffic Analytics (experimental)",
+        description=(
+            "Vehicle counting / occupancy via TrafficCamNet (car/bicycle) + IOU + "
+            "nvdsanalytics. Experimental — vehicle detection is not yet live-verified."
+        ),
+        category="vehicle_analytics",
+        status="experimental",
+        model_id="trafficcamnet_v1",
+        tracker_profile_id="deepstream_iou_fast_v1",
+        analytics_profile_id="deepstream_nvdsanalytics_probe_v1",
+        supported_classes=("car", "bicycle"),
+        supported_outputs=(
+            "processor.line_crossing",
+            "processor.line_crossing_object",
+            "processor.roi_occupancy",
+            "processor.zone_entered",
+            "processor.zone_exited",
+        ),
+        supported_shapes=_ANALYTICS_SHAPES,
+        supported_triggers=("roi_occupancy", "line_crossing"),
+        allowed_overrides=_ANALYTICS_OVERRIDES,
+        default_settings={"confidence_threshold": 0.4, "target_fps": 30},
+        compute_tier="low",
+        observation_volume_risk="medium",
+        license_class="commercial_agreement",
+        warnings=("Experimental — vehicle detection is not yet live-verified in Upstream.",),
+        best_for=("vehicle_counting", "traffic_scenes", "parking_occupancy"),
+        not_recommended_for=("person_analytics", "production_sla"),
+        readiness_notes=(
+            "TrafficCamNet is the only currently-bundled traffic detector (NVIDIA "
+            "TAO/NGC EULA — bundled, never redistributed; review before 'supported')."
+        ),
+    ),
 )
 
 
-def _visible(pkg: ProcessingPackage) -> bool:
-    """Conservative account-visibility gate. Today: hide only retired packages
-    (none are deprecated). Stub seam for future production/account entitlement —
-    it never hides a probe/experimental/free package."""
-    return pkg.status != "deprecated"
+# P5-K: the shared shape of a per-new-model "People Analytics — <model>" package.
+# Each new model is experimental (no GPU verification this milestone); Ultralytics
+# models are restrictive / BYOM (first_party=False) — see the licensing policy.
+def _model_people_packages() -> tuple[ProcessingPackage, ...]:
+    byom_warning = (
+        "BYOM / requires your own Ultralytics license — not auto-provided as a "
+        "first-party package in production until legal approval. Detection parser "
+        "authored but not yet GPU-validated."
+    )
+    prep_warning = (
+        "Experimental — this model is prepared in-repo but not yet live-verified on "
+        "the GPU host (promote to probe after a verification run)."
+    )
+
+    def _mp(
+        *,
+        package_id: str,
+        display_name: str,
+        model_id: str,
+        compute_tier: str,
+        license_class: str = "permissive",
+        first_party: bool = True,
+        warnings: tuple[str, ...] = (),
+    ) -> ProcessingPackage:
+        return _pkg(
+            package_id=package_id,
+            display_name=display_name,
+            description=(
+                f"People analytics on {display_name.split('—')[-1].strip()} + IOU + "
+                "nvdsanalytics. P5-K: this model is experimental (prepared in-repo; "
+                "not yet live-verified)."
+            ),
+            category="people_analytics",
+            status="experimental",
+            model_id=model_id,
+            tracker_profile_id="deepstream_iou_fast_v1",
+            analytics_profile_id="deepstream_nvdsanalytics_probe_v1",
+            supported_classes=("person",),
+            supported_outputs=_ANALYTICS_OUTPUTS,
+            supported_shapes=_ANALYTICS_SHAPES,
+            supported_triggers=_ANALYTICS_TRIGGERS,
+            allowed_overrides=_ANALYTICS_OVERRIDES,
+            default_settings={"confidence_threshold": 0.4, "target_fps": 30},
+            compute_tier=compute_tier,
+            observation_volume_risk="medium",
+            license_class=license_class,
+            first_party=first_party,
+            warnings=warnings or (prep_warning,),
+            best_for=("person_entry_exit", "zone_presence", "dwell_monitoring"),
+            not_recommended_for=("production_sla",),
+            related_packages=("deepstream.yolox_analytics_probe.v0",),
+        )
+
+    return (
+        _mp(
+            package_id="deepstream.yolox_nano_people_probe.v0",
+            display_name="People Analytics — YOLOX-Nano",
+            model_id="yolox_nano_v1",
+            compute_tier="low",
+        ),
+        _mp(
+            package_id="deepstream.yolox_tiny_people_probe.v0",
+            display_name="People Analytics — YOLOX-Tiny",
+            model_id="yolox_tiny_v1",
+            compute_tier="low",
+        ),
+        _mp(
+            package_id="deepstream.yolox_m_people_probe.v0",
+            display_name="People Analytics — YOLOX-M",
+            model_id="yolox_m_v1",
+            compute_tier="high",
+        ),
+        _mp(
+            package_id="deepstream.yolo11n_people_probe.v0",
+            display_name="People Analytics — YOLO11-N",
+            model_id="yolo11n_v1",
+            compute_tier="low",
+            license_class="restrictive",
+            first_party=False,
+            warnings=(byom_warning,),
+        ),
+        _mp(
+            package_id="deepstream.yolo11s_people_probe.v0",
+            display_name="People Analytics — YOLO11-S",
+            model_id="yolo11s_v1",
+            compute_tier="medium",
+            license_class="restrictive",
+            first_party=False,
+            warnings=(byom_warning,),
+        ),
+        _mp(
+            package_id="deepstream.yolo11m_people_probe.v0",
+            display_name="People Analytics — YOLO11-M",
+            model_id="yolo11m_v1",
+            compute_tier="high",
+            license_class="restrictive",
+            first_party=False,
+            warnings=(byom_warning,),
+        ),
+        _mp(
+            package_id="deepstream.yolov8n_people_probe.v0",
+            display_name="People Analytics — YOLOv8-N",
+            model_id="yolov8n_v1",
+            compute_tier="low",
+            license_class="restrictive",
+            first_party=False,
+            warnings=(byom_warning,),
+        ),
+        _mp(
+            package_id="deepstream.peoplenet_people_probe.v0",
+            display_name="People Analytics — PeopleNet",
+            model_id="peoplenet_v1",
+            compute_tier="low",
+            license_class="commercial_agreement",
+            warnings=(
+                "Experimental — NVIDIA PeopleNet (NGC model EULA); prepared in-repo, "
+                "not yet live-verified.",
+            ),
+        ),
+    )
+
+
+# Appended after the helper is defined; the per-model packages reuse the
+# module-level _pkg/_ANALYTICS_* and round out the catalog.
+PACKAGE_CATALOG = PACKAGE_CATALOG + _model_people_packages()
+
+
+def _visible(pkg: ProcessingPackage, *, first_party_only: bool = False) -> bool:
+    """Account/catalog-visibility gate. Always hides retired (deprecated)
+    packages. When ``first_party_only`` is set (the production go-live switch,
+    ``catalog_first_party_only``), it also hides non-first-party packages —
+    AGPL/restrictive models Upstream may not auto-provide until legal approval
+    (P5-K). Default false: dev/demo see everything (with a BYOM badge)."""
+    if pkg.status == "deprecated":
+        return False
+    if first_party_only:
+        return pkg.first_party
+    return True
 
 
 def list_packages(
@@ -301,11 +624,12 @@ def list_packages(
     status: str | None = None,
     runtime: str | None = None,
     test_mode_safe: bool | None = None,
+    first_party_only: bool = False,
 ) -> list[ProcessingPackage]:
     """Visible packages, optionally filtered, in declaration order."""
     out: list[ProcessingPackage] = []
     for pkg in PACKAGE_CATALOG:
-        if not _visible(pkg):
+        if not _visible(pkg, first_party_only=first_party_only):
             continue
         if category is not None and pkg.category != category:
             continue
@@ -319,10 +643,14 @@ def list_packages(
     return out
 
 
-def get_package(package_id: str) -> ProcessingPackage | None:
-    """The visible package for ``package_id``, or ``None`` if unknown/hidden."""
+def get_package(package_id: str, *, first_party_only: bool = False) -> ProcessingPackage | None:
+    """The visible package for ``package_id``, or ``None`` if unknown/hidden.
+
+    ``first_party_only`` mirrors the catalog gate for the detail endpoint;
+    internal validation callers (e.g. camera package requests) omit it so an
+    explicitly-chosen BYOM package still resolves."""
     for pkg in PACKAGE_CATALOG:
-        if pkg.package_id == package_id and _visible(pkg):
+        if pkg.package_id == package_id and _visible(pkg, first_party_only=first_party_only):
             return pkg
     return None
 

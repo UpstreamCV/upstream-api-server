@@ -372,6 +372,7 @@ Authenticated via `CurrentCaller`. The `resource_id` is the value the client rec
 | `UPSTREAM_SUPABASE_STORAGE_BUCKET` | no | Supabase Storage bucket for snapshot uploads (default `snapshots`) |
 | `UPSTREAM_SNAPSHOT_MAX_BYTES` | no | Per-request snapshot size limit (default 5 MB) |
 | `UPSTREAM_SENTRY_DSN` | no | Sentry exception reporting (M9.3: initialized at app startup when set, `send_default_pii=False`; unset is a no-op) |
+| `UPSTREAM_CATALOG_FIRST_PARTY_ONLY` | no | P5-K processing-package catalog gate (default `false`). `true` hides non-first-party (BYOM/AGPL) packages from `GET /v1/processing/packages` (list) and 404s them on detail; flip on at go-live |
 
 ## Endpoints — Phase 2: ingest webhooks (auth: `current_ingest`, except mediamtx-auth)
 
@@ -1201,8 +1202,20 @@ curated, in-process API-side snapshot of the processor's package registry —
 there is **no DB table** and no runtime dependency on the processor.
 
 Authenticated (any caller), **not** account-scoped (a conservative visibility
-gate hides only retired packages). Optional filters (query params):
-`category`, `status`, `runtime`, `test_mode_safe`.
+gate hides only retired packages, plus non-first-party packages when the
+`catalog_first_party_only` gate is on — see below). Optional filters (query
+params): `category`, `status`, `runtime`, `test_mode_safe`.
+
+P5-K expanded the catalog from 9 to **23 packages**. Categories now include
+`people_analytics`, the new `vehicle_analytics` (a single TrafficCamNet
+car/bicycle package, `deepstream.trafficcamnet_vehicle_probe.v0`), `diagnostic`,
+and `mock`. The people-analytics group gained 5 YOLOX-S + IOU use-case variants
+(`deepstream.yolox_people_{fast,high_recall,line_crossing,occupancy,dwell}_probe.v0`)
+and 8 per-model packages (`deepstream.{yolox_nano,yolox_tiny,yolox_m,yolo11n,
+yolo11s,yolo11m,yolov8n,peoplenet}_people_probe.v0`). Status spread across the
+new packages: `fast` / `high_recall` / `occupancy` / `dwell` are `probe`;
+everything else new (the vehicle package, `line_crossing`, and all 8 per-model
+packages) is `experimental`.
 
 Response 200: `{ "packages": [ProcessingPackage, ...], "categories": [{id,
 display_name}], "warnings": [str] }`. Status is one of `probe` /
@@ -1231,6 +1244,8 @@ non-`supported` (`production_ready: false`) package as recommended. Example
   "compute_tier": "high",
   "pricing_tier": "free_probe",
   "observation_volume_risk": "medium",
+  "license_class": "permissive",
+  "first_party": true,
   "warnings": ["Experimental. Runtime viability proven, but not promoted until a representative person-analytics A/B passes."],
   "limitations": [],
   "best_for": ["occlusion_robustness", "track_continuity"],
@@ -1242,11 +1257,33 @@ non-`supported` (`production_ready: false`) package as recommended. Example
 }
 ```
 
+P5-K added two licensing/provenance fields on every `ProcessingPackage`
+(orthogonal to `status`):
+- `license_class` — one of `"permissive"`, `"commercial_agreement"`, or
+  `"restrictive"`, mirroring the backing model's license. Permissive: YOLOX
+  family. `commercial_agreement`: TrafficCamNet / PeopleNet (NVIDIA TAO/NGC
+  EULA — bundled, never redistributed). `restrictive`: the AGPL Ultralytics
+  packages (`yolo11n/s/m`, `yolov8n`).
+- `first_party` — whether Upstream may auto-provide this as a first-party
+  hosted package. `false` for the restrictive (AGPL) Ultralytics models — those
+  are BYOM (the customer's own license), not auto-provided in production until
+  legal approval; the dashboard badges them.
+
+**`catalog_first_party_only` gate** (env `UPSTREAM_CATALOG_FIRST_PARTY_ONLY`,
+default **off**): when **off**, the list returns every visible package and the
+dashboard shows a BYOM badge on `first_party: false` ones (dev/demo posture).
+When **on** (the go-live switch), the list **hides** all non-`first_party`
+packages and the detail endpoint **404s** them — the 4 AGPL packages above stop
+being surfaced. The gate does NOT affect internal validation: an explicitly
+requested BYOM package on a camera package request still resolves.
+
 ### `GET /v1/processing/packages/{package_id}`
 
 P5-F. One processing package by id — the same `ProcessingPackage` shape (full
-detail incl. `readiness_notes` / `related_packages`). Unknown/hidden id → `404`
-with `error.code = "package_not_found"`.
+detail incl. `readiness_notes` / `related_packages`, plus the P5-K
+`license_class` / `first_party` fields). Unknown/hidden id → `404` with
+`error.code = "package_not_found"`. When `catalog_first_party_only` is **on**,
+a non-first-party (BYOM/AGPL) package id is treated as hidden and also 404s here.
 
 ### `GET /v1/cameras/{camera_id}/processing-config`
 
@@ -1402,8 +1439,12 @@ selected_classes?}, allow_experimental?: bool}` → validated against the P5-F
 catalog: unknown/`deprecated` package, a class not in `supported_classes`, a
 setting not in the package's `allowed_overrides`, or an out-of-range value →
 `422`; an `experimental` package requires `allow_experimental: true` (else
-`422`). On success: stores the requested config (revision bump), stamps
-`cameras.metadata.package_id`, audits, returns the GET shape.
+`422`) — P5-K extends this to the new experimental packages (the vehicle
+package, `line_crossing`, and all per-model packages). Internal validation here
+is NOT subject to the `catalog_first_party_only` gate, so an explicitly chosen
+BYOM/AGPL package still resolves. On success: stores the requested config
+(revision bump), stamps `cameras.metadata.package_id`, audits, returns the GET
+shape.
 
 `POST .../apply` → confirms the requested package as the active intent
 (idempotent re-stamp of `metadata.package_id`); `409 no_requested_config` if

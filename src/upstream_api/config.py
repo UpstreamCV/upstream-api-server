@@ -175,6 +175,12 @@ class Settings(BaseSettings):
     fanout_public_ws_url: str | None = None
     fanout_token_ttl_seconds: int = 600
 
+    # P5-K — processing-package catalog gate. When true, the package catalog
+    # hides non-first-party packages (AGPL/restrictive models that Upstream may
+    # not auto-provide as first-party hosted packages until legal/commercial
+    # approval). Default false so dev/demo can use them; flip true at go-live.
+    catalog_first_party_only: bool = False
+
     @property
     def is_production(self) -> bool:
         return self.environment == "production"
