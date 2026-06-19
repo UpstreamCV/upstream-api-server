@@ -17,9 +17,65 @@ from collections.abc import Sequence
 from typing import Any
 
 from upstream_api.schemas.processing_packages import (
+    ModelMetrics,
     ProcessingPackage,
     ProcessingPackageCategory,
 )
+
+# P5-L — published reference benchmarks per backing model_id, mirrored from the
+# processor model registry (app/packages/model_registry.json). PUBLISHED, NOT
+# Upstream-measured (upstream_measured=false). COCO mAP for the COCO-trained
+# YOLO detectors; the NVIDIA TAO models have no COCO mAP, so a clearly-labelled
+# vendor KPI rides in vendor_kpi_* (not comparable to COCO). A package inherits
+# its backing model's metrics in _pkg().
+_COCO = "COCO val2017"
+_YOLOX_SRC = "Published reference — YOLOX repo (Megvii, Apache-2.0)"
+_ULTRA_SRC = "Published reference — Ultralytics docs"
+
+
+def _coco_metrics(map50_95: float, params_m: float, input_size: int, source: str) -> ModelMetrics:
+    return ModelMetrics(
+        metric_source=source,
+        upstream_measured=False,
+        metric_dataset=_COCO,
+        coco_map50_95=map50_95,
+        params_m=params_m,
+        input_size=input_size,
+    )
+
+
+_MODEL_METRICS: dict[str, ModelMetrics] = {
+    "yolox_nano_v1": _coco_metrics(25.8, 0.91, 416, _YOLOX_SRC),
+    "yolox_tiny_v1": _coco_metrics(32.8, 5.06, 416, _YOLOX_SRC),
+    "yolox_s_v1": _coco_metrics(40.5, 9.0, 640, _YOLOX_SRC),
+    "yolox_m_v1": _coco_metrics(46.9, 25.3, 640, _YOLOX_SRC),
+    "yolov8n_v1": _coco_metrics(37.3, 3.2, 640, _ULTRA_SRC),
+    "yolo11n_v1": _coco_metrics(39.5, 2.6, 640, _ULTRA_SRC),
+    "yolo11s_v1": _coco_metrics(47.0, 9.4, 640, _ULTRA_SRC),
+    "yolo11m_v1": _coco_metrics(51.5, 20.1, 640, _ULTRA_SRC),
+    "peoplenet_v1": ModelMetrics(
+        metric_source="Published reference — NVIDIA TAO PeopleNet model card (NGC)",
+        upstream_measured=False,
+        metric_dataset="NVIDIA proprietary eval (IoU>0.5)",
+        backbone="ResNet-34",
+        vendor_kpi_label="NVIDIA mAP — person (proprietary eval)",
+        vendor_kpi_value=94.19,
+        vendor_kpi_note=(
+            "NVIDIA-reported on 90k+ proprietary images (IoU>0.5); not comparable to COCO mAP."
+        ),
+    ),
+    "trafficcamnet_v1": ModelMetrics(
+        metric_source="Published reference — NVIDIA TAO TrafficCamNet model card (NGC)",
+        upstream_measured=False,
+        metric_dataset="NVIDIA proprietary eval (IoU>0.5)",
+        backbone="ResNet-18",
+        vendor_kpi_label="NVIDIA TAO KPI",
+        vendor_kpi_note=(
+            "NVIDIA reports precision/recall on a proprietary eval (IoU>0.5) — see the NGC "
+            "model card; not comparable to COCO mAP."
+        ),
+    ),
+}
 
 # The 8 people-analytics observation types every analytics package emits.
 _ANALYTICS_OUTPUTS = (
@@ -125,6 +181,8 @@ def _pkg(
         requires_restart=runtime == "deepstream",
         readiness_notes=readiness_notes,
         related_packages=list(related_packages),
+        # P5-L: inherit the backing model's published-reference benchmarks.
+        model_metrics=_MODEL_METRICS.get(model_id) if model_id else None,
     )
 
 
