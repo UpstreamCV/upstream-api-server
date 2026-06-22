@@ -30,9 +30,21 @@ def _random_chars(length: int) -> str:
 # Scopes a dashboard user is allowed to request when minting a new token.
 # Open vocabulary enforced here (not in the DB). ``events:read`` (Module 6 M6.2)
 # grants an API token read access to the canonical event ledger; ``agent`` is
-# the edge-agent credential and does NOT imply event read access.
+# the edge-agent credential and does NOT imply event read access. The
+# ``reliability:*`` scopes (Reliability M1a) gate the Upstream Collector ingest
+# (``reliability:ingest``), issue reads (``reliability:read``), and issue
+# mutations such as resolve (``reliability:write``); each is explicit — none
+# implies another.
 ALLOWED_SCOPES: frozenset[str] = frozenset(
-    {"agent", "events:read", "destinations:read", "destinations:write"}
+    {
+        "agent",
+        "events:read",
+        "destinations:read",
+        "destinations:write",
+        "reliability:ingest",
+        "reliability:read",
+        "reliability:write",
+    }
 )
 
 

@@ -44,6 +44,8 @@ from upstream_api.routers import (
     processing_evidence,
     processor,
     reliability,
+    reliability_ingest,
+    reliability_issues,
     rules,
     snapshots,
     stream_sessions,
@@ -191,6 +193,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(snapshots.camera_router)  # /v1/cameras/{id}/latest-frame
     app.include_router(snapshots.ingest_router)  # /v1/ingest/snapshots
     app.include_router(reliability.router)  # /v1/cameras/{id}/reliability/*
+    app.include_router(reliability_ingest.router)  # /v1/reliability/observations (M1a)
+    app.include_router(reliability_issues.router)  # /v1/reliability/issues (M1a)
     app.include_router(ingest.router)
     app.include_router(processor.router)  # /v1/internal/processor/* (M8.0)
     app.include_router(models.router)  # /v1/models
