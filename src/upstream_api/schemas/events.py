@@ -37,6 +37,11 @@ EventType = Literal[
     "workflow.cooldown_suppressed",
     "alert.created",
     "workflow.finalized",
+    # Reliability M1a: an observation detector opened or resolved an issue
+    # (source ``reliability``). Promoted into the ledger so issue lifecycle
+    # rides the existing webhook delivery / read API with no new plumbing.
+    "reliability.issue_opened",
+    "reliability.issue_resolved",
 ]
 
 # Producer family that emitted the event.

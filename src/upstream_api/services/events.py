@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
 import asyncpg
@@ -297,6 +297,72 @@ async def emit_workflow_run_event(
         _logger.warning(
             "workflow_run_event_emit_failed",
             workflow_run_id=str(workflow_run_id),
+            event_type=event_type,
+            error=type(exc).__name__,
+        )
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Reliability issue lifecycle → canonical event (Reliability M1a emit seam).
+# ---------------------------------------------------------------------------
+
+
+def reliability_issue_event_type(kind: Literal["opened", "resolved"]) -> str:
+    """Map an issue transition to its canonical ``event_type``."""
+    return f"reliability.issue_{kind}"
+
+
+def reliability_issue_dedupe_key(issue_id: UUID, kind: Literal["opened", "resolved"]) -> str:
+    """Stable idempotency key per (issue, transition). ``kind`` MUST be in the
+    key or the resolved emit would collide with the opened one and be swallowed
+    by ``ON CONFLICT``."""
+    return f"reliability_issue:{issue_id}:{kind}"
+
+
+async def emit_reliability_issue_event(
+    conn: asyncpg.Connection,
+    *,
+    issue_id: UUID,
+    kind: Literal["opened", "resolved"],
+    account_id: UUID,
+    occurred_at: datetime,
+    camera_id: UUID | None = None,
+    payload: dict[str, Any] | None = None,
+    evidence: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Emit the canonical event for a reliability issue open/resolve.
+
+    Best-effort by design (same contract as ``emit_workflow_run_event``): the
+    insert runs in its own savepoint so a ledger failure — including the events
+    table not being migrated, or any unexpected error — is isolated and logged,
+    never rolling back the issue write that produced it. A successful insert
+    still belongs to the outer transaction and rolls back with it. The
+    ``cv_issues`` id is carried in ``payload`` (the events table has no
+    ``source_issue_id`` column; ``source_finding_id`` semantically points at
+    ``reliability_findings`` and is deliberately not reused)."""
+    event_type = reliability_issue_event_type(kind)
+    dedupe_key = reliability_issue_dedupe_key(issue_id, kind)
+    event_payload: dict[str, Any] = {"issue_id": str(issue_id)}
+    if payload:
+        event_payload.update(payload)
+    try:
+        async with conn.transaction():
+            return await insert_event(
+                conn,
+                account_id=account_id,
+                event_type=event_type,
+                source="reliability",
+                dedupe_key=dedupe_key,
+                occurred_at=occurred_at,
+                camera_id=camera_id,
+                payload=event_payload,
+                evidence=evidence or {},
+            )
+    except Exception as exc:  # emission is best-effort: it must never fail ingest.
+        _logger.warning(
+            "reliability_issue_event_emit_failed",
+            issue_id=str(issue_id),
             event_type=event_type,
             error=type(exc).__name__,
         )
