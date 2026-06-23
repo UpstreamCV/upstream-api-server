@@ -24,6 +24,7 @@ from fastapi import APIRouter, Query
 
 from upstream_api.errors import NotFoundError
 from upstream_api.schemas.reliability_observations import (
+    CollectorStatusResponse,
     ReliabilityIssueRecord,
     ReliabilityIssueResolveRequest,
     ReliabilityIssuesResponse,
@@ -36,6 +37,7 @@ from upstream_api.security.deps import (
     require_token_scope,
 )
 from upstream_api.services.processor import coerce_jsonb
+from upstream_api.services.reliability_collector_status import get_collector_status
 from upstream_api.services.reliability_issues import (
     get_issue,
     list_issues,
@@ -97,6 +99,25 @@ def _resolve_account_for_write(caller: CallerAuth, account_id: UUID | None) -> U
         assert caller.user is not None
         require_account_role(caller.user, account, "owner", "admin")
     return account
+
+
+@router.get("/collector-status", response_model=CollectorStatusResponse)
+async def get_collector_status_summary(
+    caller: CurrentCaller,
+    pool: PoolDep,
+    account_id: Annotated[UUID | None, Query()] = None,
+) -> CollectorStatusResponse:
+    """Account-scoped collector ingest health (M1c).
+
+    Cloud-visible summary of the cv_* tables for the dashboard's
+    /agents/collector page: last ingest, recent batches/observations, active
+    sources, open issues, and the latest collector heartbeat. Bounded to the
+    last 24h. Empty account → empty/null, not 404."""
+    require_token_scope(caller, "reliability:read")
+    scope_account = caller.resolve_account(account_id)
+    async with pool.acquire() as conn:
+        data = await get_collector_status(conn, account_id=scope_account)
+    return CollectorStatusResponse.model_validate(data)
 
 
 @router.get("/issues", response_model=ReliabilityIssuesResponse)
