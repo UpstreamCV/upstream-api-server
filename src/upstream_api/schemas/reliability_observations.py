@@ -119,3 +119,61 @@ class ReliabilityIssuesResponse(BaseModel):
 
 class ReliabilityIssueResolveRequest(BaseModel):
     resolved_reason: str | None = Field(default=None, max_length=512)
+
+
+# ---------------------------------------------------------------------------
+# M1c — collector status summary (GET /v1/reliability/collector-status).
+# Cloud-visible ingest health derived from the cv_* tables; account_id omitted.
+# ---------------------------------------------------------------------------
+
+
+class CollectorBatchSummary(BaseModel):
+    id: UUID
+    source: str
+    external_camera_key: str | None
+    observation_count: int
+    status: str
+    received_at: datetime
+
+
+class CollectorSourceStatus(BaseModel):
+    source: str
+    external_camera_key: str | None
+    last_seen_at: datetime | None
+    recent_observations: int
+    recent_events: int
+    recent_detection_summaries: int
+    open_issues: int
+
+
+class CollectorHeartbeat(BaseModel):
+    """The latest cloud-visible ``collector_heartbeat`` — safe counters only.
+
+    Every field is optional: the row may predate a field, and unknown payload
+    keys are dropped server-side before this is built (the raw payload dict is
+    never echoed)."""
+
+    observed_at: datetime
+    source: str | None = None
+    version: str | None = None
+    running: bool | None = None
+    cloud_reachable: bool | None = None
+    spooled_batches: int | None = None
+    spooled_observations: int | None = None
+    uploaded_batches: int | None = None
+    uploaded_observations: int | None = None
+    dropped_batches: int | None = None
+    dropped_observations: int | None = None
+    last_upload_at: datetime | None = None
+    last_error_code: str | None = None
+
+
+class CollectorStatusResponse(BaseModel):
+    last_received_at: datetime | None
+    recent_batch_count: int
+    recent_observation_count: int
+    active_source_count: int
+    open_issue_count: int
+    latest_collector_heartbeat: CollectorHeartbeat | None
+    sources: list[CollectorSourceStatus]
+    recent_batches: list[CollectorBatchSummary]
