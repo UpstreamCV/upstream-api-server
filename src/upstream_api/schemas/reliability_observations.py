@@ -47,6 +47,12 @@ ReliabilityObservationType = Literal[
 # processor-side ``ReliabilityCategory`` — observation issues bucket differently.
 ReliabilityIssueCategory = Literal["count", "confidence", "liveness", "tracker"]
 
+# M2a source registry vocabularies (both CHECK-constrained / derived at the DB
+# layer). ``source_kind`` classifies a registry row; ``status_hint`` is a
+# lightweight derived liveness label for display only (real liveness is M2b).
+SourceKind = Literal["collector", "external_camera", "observation_source", "unknown"]
+SourceStatusHint = Literal["active", "recent", "unknown"]
+
 
 class ReliabilityObservationItem(BaseModel):
     """One observation in an ingest batch.
@@ -177,3 +183,49 @@ class CollectorStatusResponse(BaseModel):
     latest_collector_heartbeat: CollectorHeartbeat | None
     sources: list[CollectorSourceStatus]
     recent_batches: list[CollectorBatchSummary]
+
+
+# ---------------------------------------------------------------------------
+# M2a — source registry (GET /v1/reliability/sources). Durable per-source
+# identity projected from the observation stream; account_id omitted.
+# ---------------------------------------------------------------------------
+
+
+class ReliabilitySourceRecord(BaseModel):
+    """One ``cv_sources`` row, shaped for a read response.
+
+    ``open_issue_count`` counts open ``cv_issues`` matching this source's
+    ``external_camera_key``; it is 0 for keyless rows (collector /
+    observation_source) and does not include camera-keyed issues — M2a does not
+    map sources to managed cameras. ``status_hint`` is a display-only freshness
+    label (active ≤5m, recent ≤24h, else unknown); real liveness is M2b."""
+
+    id: UUID
+    source: str
+    external_camera_key: str | None
+    display_name: str | None
+    source_kind: SourceKind
+
+    first_seen_at: datetime
+    last_seen_at: datetime
+    last_observation_at: datetime | None
+    last_event_at: datetime | None
+    last_detection_summary_at: datetime | None
+    last_collector_heartbeat_at: datetime | None
+    last_config_changed_at: datetime | None
+
+    last_model_name: str | None
+    last_model_version: str | None
+
+    observation_count_total: int
+    event_count_total: int
+    detection_summary_count_total: int
+    collector_heartbeat_count_total: int
+    config_changed_count_total: int
+
+    open_issue_count: int
+    status_hint: SourceStatusHint
+
+
+class ReliabilitySourcesResponse(BaseModel):
+    sources: list[ReliabilitySourceRecord]

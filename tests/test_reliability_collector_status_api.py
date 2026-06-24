@@ -53,6 +53,7 @@ class FakeStatusConn:
         batches: list[dict[str, Any]] | None = None,
         recent_observation_count: int = 0,
         sources: list[dict[str, Any]] | None = None,
+        active_source_count: int = 0,
         open_issue_count: int = 0,
         open_by_key: list[dict[str, Any]] | None = None,
         heartbeat: dict[str, Any] | None = None,
@@ -62,6 +63,7 @@ class FakeStatusConn:
         self._batches = batches or []
         self._recent_observation_count = recent_observation_count
         self._sources = sources or []
+        self._active_source_count = active_source_count
         self._open_issue_count = open_issue_count
         self._open_by_key = open_by_key or []
         self._heartbeat = heartbeat
@@ -78,6 +80,8 @@ class FakeStatusConn:
     async def fetchrow(self, query: str, *args: Any) -> dict[str, Any] | None:
         if "max(received_at)" in query:
             return {"last_received_at": self._last_received_at}
+        if "from cv_sources" in query and "count(*)" in query:  # M2a active count
+            return {"n": self._active_source_count}
         if "from cv_observation_batches" in query and "count(*)" in query:
             return {"n": self._recent_batch_count}
         if "from cv_observations" in query and "count(*)" in query:
@@ -184,6 +188,9 @@ def test_summarizes_batches_and_sources() -> None:
                 "recent_detection_summaries": 112,
             }
         ],
+        # M2a: active_source_count derives from the cv_sources registry (a
+        # separate query), not from len(sources).
+        active_source_count=1,
         open_issue_count=3,
         open_by_key=[{"external_camera_key": "dock-12", "n": 1}],
     )

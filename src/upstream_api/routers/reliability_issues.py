@@ -28,6 +28,10 @@ from upstream_api.schemas.reliability_observations import (
     ReliabilityIssueRecord,
     ReliabilityIssueResolveRequest,
     ReliabilityIssuesResponse,
+    ReliabilitySourceRecord,
+    ReliabilitySourcesResponse,
+    SourceKind,
+    SourceStatusHint,
 )
 from upstream_api.security.deps import (
     CallerAuth,
@@ -43,11 +47,15 @@ from upstream_api.services.reliability_issues import (
     list_issues,
     resolve_issue_by_id,
 )
+from upstream_api.services.reliability_sources import list_sources
 
 router = APIRouter(prefix="/v1/reliability", tags=["reliability"])
 
 _ISSUES_DEFAULT_LIMIT = 50
 _ISSUES_MAX_LIMIT = 200
+
+_SOURCES_DEFAULT_LIMIT = 100
+_SOURCES_MAX_LIMIT = 500
 
 IssueStatus = Literal["open", "resolved", "suppressed", "ignored"]
 
@@ -118,6 +126,38 @@ async def get_collector_status_summary(
     async with pool.acquire() as conn:
         data = await get_collector_status(conn, account_id=scope_account)
     return CollectorStatusResponse.model_validate(data)
+
+
+@router.get("/sources", response_model=ReliabilitySourcesResponse)
+async def list_reliability_sources(
+    caller: CurrentCaller,
+    pool: PoolDep,
+    account_id: Annotated[UUID | None, Query()] = None,
+    source_kind: Annotated[SourceKind | None, Query()] = None,
+    status_hint: Annotated[SourceStatusHint | None, Query()] = None,
+    limit: Annotated[int, Query(ge=1, le=_SOURCES_MAX_LIMIT)] = _SOURCES_DEFAULT_LIMIT,
+) -> ReliabilitySourcesResponse:
+    """Account-scoped collector source registry (M2a), most-recently-seen first.
+
+    Durable per-(source, external_camera_key) identity projected from the
+    observation stream: when each source last sent data, what types, latest
+    model, totals, a display-only ``status_hint``, and open-issue count. These
+    are external collector/CV sources, not managed Upstream cameras. Optional
+    ``source_kind`` / ``status_hint`` filters (bogus → 422). Empty account →
+    empty list, not 404."""
+    require_token_scope(caller, "reliability:read")
+    scope_account = caller.resolve_account(account_id)
+    async with pool.acquire() as conn:
+        rows = await list_sources(
+            conn,
+            account_id=scope_account,
+            source_kind=source_kind,
+            status_hint=status_hint,
+            limit=limit,
+        )
+    return ReliabilitySourcesResponse(
+        sources=[ReliabilitySourceRecord.model_validate(r) for r in rows]
+    )
 
 
 @router.get("/issues", response_model=ReliabilityIssuesResponse)
