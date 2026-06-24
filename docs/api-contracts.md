@@ -2666,3 +2666,77 @@ audit reads are too. Params: `account_id`, `limit` (default 50, max 100),
 user_id}, event_type, resource_type, resource_id, summary, metadata}],
 next_cursor}`. `next_cursor` = last item's created_at when the page is
 full. Stored `ip_address`/`user_agent` are never returned.
+
+## Endpoints — Reliability / Upstream Collector (auth: dual `CurrentCaller`)
+
+The cloud-side receiving end for the **Upstream Collector**: a customer's CV
+system (or the local collector bundled in `upstream-agent`) pushes batches of
+**observations**; detectors open/refresh/resolve deduped **issues**; M2a projects
+a durable per-source **registry**. Lives under `/v1/reliability`. Storage:
+`cv_observation_batches` (upload header + idempotency anchor on
+`(account_id, client_batch_id)`), `cv_observations` (append-only detail),
+`cv_issues` (deduped; partial-unique on the open row), `cv_sources` (M2a
+registry). Tenant `account_id` is always derived from the credential, never the
+body. These sources are **external collector/CV sources — not managed Upstream
+cameras** (no camera mapping yet).
+
+Scopes (`ALLOWED_SCOPES`): `reliability:ingest`, `reliability:read`,
+`reliability:write` — each explicit, none implies another. Dashboard JWT callers
+bypass token scopes (gated by account membership/role instead).
+
+### `POST /v1/reliability/observations`
+
+Ingest a batch. **Token scope: `agent` OR `reliability:ingest`** (any-of) — the
+managed agent's local collector reuses its existing `agent` token by design,
+while external CV systems use a dedicated `reliability:ingest` token. Body:
+`{client_batch_id, source, observations: [{type, external_camera_key?,
+camera_id?, observed_at, payload}]}` (1–500 observations; `type` is open
+vocabulary — `event_observed`, `detection_summary`, `collector_heartbeat`,
+`config_changed`, …). Referenced `camera_id`s are ownership-checked (cross-account
+→ 404, not 403). **Idempotent** on `(account_id, client_batch_id)`: a replay
+inserts nothing and returns the original `batch_id` + accepted count, and re-runs
+neither detectors nor the source-registry upsert. On a fresh batch the
+observations commit, then — each in its own savepoint so a bad payload can never
+reject accepted observations — the `cv_sources` registry is upserted and the
+reliability detectors run. Response 200: `{accepted, batch_id, server_time}`.
+
+### `GET /v1/reliability/sources` (M2a)
+
+Account-scoped source registry, most-recently-seen first. Auth:
+`reliability:read`. Query params (all optional): `source_kind`
+(`collector|external_camera|observation_source|unknown`; bogus → 422),
+`status_hint` (`active|recent|unknown`; bogus → 422), `limit` (default 100, max
+500; over → 422). Response 200: `{sources: [ReliabilitySourceRecord]}` where each
+record is `{id, source, external_camera_key, display_name, source_kind,
+first_seen_at, last_seen_at, last_observation_at, last_event_at,
+last_detection_summary_at, last_collector_heartbeat_at, last_config_changed_at,
+last_model_name, last_model_version, observation_count_total, event_count_total,
+detection_summary_count_total, collector_heartbeat_count_total,
+config_changed_count_total, open_issue_count, status_hint}`. `status_hint` is a
+**display-only** freshness label (`active` ≤5m, `recent` ≤24h, else `unknown`) —
+real liveness (expected intervals + offline issues) is M2b. `open_issue_count` is
+open `cv_issues` matched by `external_camera_key` (0 for keyless
+collector/observation_source rows; camera-keyed issues are not joined — no camera
+mapping in M2a). Empty account → `{sources: []}` (not 404).
+
+### `GET /v1/reliability/collector-status` (M1c)
+
+Bounded 24h cloud-ingest summary for the dashboard's `/agents/collector` page.
+Auth: `reliability:read`. Response: `{last_received_at, recent_batch_count,
+recent_observation_count, active_source_count, open_issue_count,
+latest_collector_heartbeat, sources, recent_batches}`. Heartbeat plumbing
+(`collector_heartbeat` observations / `collector-heartbeat:%` batches) is excluded
+from the activity/source aggregates and surfaced only via
+`latest_collector_heartbeat` (safe counters only — never the raw payload). M2a:
+`active_source_count` reads the `cv_sources` registry (rows seen in 24h, excluding
+`source_kind='collector'`) instead of re-counting raw observation groups.
+
+### `GET /v1/reliability/issues`, `GET /v1/reliability/issues/{id}`, `POST /v1/reliability/issues/{id}/resolve`
+
+Account-wide observation-issue inbox. List (`reliability:read`; optional `status`
+filter, `limit` default 50 max 200) → `{issues: [ReliabilityIssueRecord]}`,
+newest-seen first. Get-by-id (`reliability:read`) → record; cross-account/unknown
+→ 404. Resolve (`reliability:write` for tokens; owner/admin for JWT users) body
+`{resolved_reason?}` → the resolved record; idempotent (re-resolving emits no
+second event); unknown/cross-account → 404. Resolving emits the canonical
+`reliability.issue_resolved` event (opening emits `reliability.issue_opened`).

@@ -4,6 +4,77 @@ Reverse chronological. Newest at top. Every meaningful commit gets an entry foll
 
 ---
 
+## 2026-06-24 - fix(reliability): let the agent scope ingest observations (5afcbe1)
+
+### Summary
+The local Upstream Collector reuses the agent's `api.token` by design, but the
+ingest endpoint required a separate `reliability:ingest` scope that the dashboard
+never mints on agent tokens — so a logged-in agent got `403 forbidden.scope`
+(surfaced in the collector as the fatal `auth_failed`). Ingest now accepts the
+`agent` OR `reliability:ingest` scope; external CV systems still use a dedicated
+`reliability:ingest` token. Reads (`reliability:read`) and resolve
+(`reliability:write`) are unchanged.
+
+### Files touched
+- `src/upstream_api/security/deps.py` — new `require_any_token_scope`.
+- `src/upstream_api/routers/reliability_ingest.py` — ingest uses it.
+- `tests/test_reliability_observation_ingest_api.py` — agent→200, reliability:ingest→200, neither→403.
+
+### Functions/classes changed
+- `require_any_token_scope(caller, *allowed)` — ANY-of scope check (vs. the
+  all-of `require_token_scope`); JWT callers bypass, same as the existing helper.
+
+### System interaction notes
+`POST /v1/reliability/observations` → `require_any_token_scope(caller, "agent",
+"reliability:ingest")` → record batch → savepoint source upsert + detectors.
+
+### Testing/checks
+`uv run pytest -q` (1500 passed), `ruff`, `mypy` all clean. Verified live: the
+collector's parked batch uploaded (`auth_failed` cleared) after deploy + restart.
+
+### Follow-up TODOs
+Dashboard token-create dialog still has no scope picker (fine now that `agent`
+ingests; add one only if external `reliability:ingest`-only tokens are needed).
+
+## 2026-06-24 - feat(reliability): M2a source registry — cv_sources + GET /v1/reliability/sources (51b5e75)
+
+### Summary
+Promote collector sources from re-aggregated strings to a durable account-scoped
+`cv_sources` registry, upserted from the observation ingest flow (idempotency-
+gated via the inserted-batch gate, savepoint-isolated so a bad payload can't
+reject accepted observations) and read via `GET /v1/reliability/sources`.
+`collector-status` `active_source_count` now reads the registry. No camera mapping
+or scheduled liveness sweep yet (M2b).
+
+### Files touched
+- `supabase/migrations/20260624120000_reliability_sources.sql` — `cv_sources` (unique expr index on `(account_id, source, coalesce(external_camera_key,''))`, CHECKs, RLS member-select, grant, updated_at trigger).
+- `src/upstream_api/services/reliability_sources.py` — `upsert_sources_from_observation_batch` + `list_sources`.
+- `src/upstream_api/routers/reliability_ingest.py` — savepoint-isolated `_run_source_upsert_safe`, gated on a fresh batch.
+- `src/upstream_api/routers/reliability_issues.py` — `GET /v1/reliability/sources` handler.
+- `src/upstream_api/schemas/reliability_observations.py` — `ReliabilitySourceRecord` / `ReliabilitySourcesResponse` + `SourceKind` / `SourceStatusHint`.
+- `src/upstream_api/services/reliability_collector_status.py` — `active_source_count` from `cv_sources`.
+- `tests/test_reliability_sources_{migration,service,api}.py`; updated collector-status test fake.
+
+### Functions/classes changed
+- `upsert_sources_from_observation_batch` — Python-aggregates a batch by `external_camera_key`, one `INSERT … ON CONFLICT DO UPDATE` per group (ON CONFLICT expr byte-identical to the unique index); `greatest()` timestamps, additive counters (literal 0 for absent types), latest non-empty model, never-downgrade `source_kind`.
+- `list_sources` — CTE deriving `status_hint` (active ≤5m / recent ≤24h / unknown) + LEFT JOIN open-issue count by `external_camera_key`; filter → order → limit.
+
+### System interaction notes
+`POST /v1/reliability/observations` → fresh batch → `_run_source_upsert_safe`
+(savepoint) → `upsert_sources_from_observation_batch` → `cv_sources`.
+`GET /v1/reliability/sources` → `require_token_scope(reliability:read)` →
+`list_sources`.
+
+### Testing/checks
+`uv run pytest -q` (1499 passed at the time), `ruff`, `mypy` clean. In-process
+smoke through the real app confirmed dock-12 external_camera row + edge-box-4
+collector row + idempotent replay (no double-count).
+
+### Follow-up TODOs
+M2b: per-source expected intervals + scheduled liveness sweep opening
+`cv_issues` (category `liveness`) for silent/offline sources. Camera mapping
+(`external_camera_key`→`camera_id`) still deferred.
+
 ## 2026-06-19 - feat(processing): P5-L published model metrics on processing packages
 
 **Why:** the dashboard's model-comparison UI needs per-model benchmark numbers
