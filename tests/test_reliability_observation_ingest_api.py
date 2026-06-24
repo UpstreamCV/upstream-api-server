@@ -142,14 +142,27 @@ def _body(**overrides: Any) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def test_ingest_requires_ingest_scope() -> None:
+def test_ingest_rejects_token_without_agent_or_ingest_scope() -> None:
+    # A token with neither `agent` nor `reliability:ingest` cannot push.
     account = uuid4()
-    r = _client(FakeIngestConn(), _agent_caller(account, ("agent",))).post(_URL, json=_body())
+    r = _client(FakeIngestConn(), _agent_caller(account, ("events:read",))).post(
+        _URL, json=_body()
+    )
     assert r.status_code == 403
     assert r.json()["error"]["code"] == "forbidden.scope"
 
 
-def test_ingest_with_scope_succeeds() -> None:
+def test_ingest_with_agent_scope_succeeds() -> None:
+    # The managed agent's local collector reuses its `agent` token to ingest.
+    account = uuid4()
+    conn = FakeIngestConn()
+    r = _client(conn, _agent_caller(account, ("agent",))).post(_URL, json=_body())
+    assert r.status_code == 200, r.text
+    assert r.json()["accepted"] == 1
+
+
+def test_ingest_with_reliability_ingest_scope_succeeds() -> None:
+    # External CV systems use a dedicated reliability:ingest token.
     account = uuid4()
     conn = FakeIngestConn()
     r = _client(conn, _agent_caller(account, ("reliability:ingest",))).post(_URL, json=_body())

@@ -29,7 +29,7 @@ from upstream_api.schemas.reliability_observations import (
     ReliabilityObservationBatchResponse,
     ReliabilityObservationItem,
 )
-from upstream_api.security.deps import CurrentCaller, PoolDep, require_token_scope
+from upstream_api.security.deps import CurrentCaller, PoolDep, require_any_token_scope
 from upstream_api.services.reliability_observation_detectors import (
     evaluate_observation_batch,
 )
@@ -121,12 +121,15 @@ async def ingest_observations(
 ) -> ReliabilityObservationBatchResponse:
     """Ingest a batch of reliability observations.
 
-    Requires the ``reliability:ingest`` scope for API tokens. The account is
-    resolved from the credential; a spoofed body ``account_id`` is ignored
-    (it is not a request field). Idempotent on ``client_batch_id``: a replay
-    returns the original ``batch_id`` and accepted count.
+    Requires the ``agent`` OR ``reliability:ingest`` scope for API tokens: the
+    managed agent's local collector reuses its existing ``agent`` token (it
+    reuses ``api.token`` by design), while external CV systems use a dedicated
+    ``reliability:ingest`` token. The account is resolved from the credential; a
+    spoofed body ``account_id`` is ignored (it is not a request field).
+    Idempotent on ``client_batch_id``: a replay returns the original ``batch_id``
+    and accepted count.
     """
-    require_token_scope(caller, "reliability:ingest")
+    require_any_token_scope(caller, "agent", "reliability:ingest")
     scope_account = caller.resolve_account(account_id)
     now = datetime.now(tz=UTC)
     camera_ids = {o.camera_id for o in body.observations if o.camera_id is not None}
