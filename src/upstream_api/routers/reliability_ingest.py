@@ -34,6 +34,7 @@ from upstream_api.services.reliability_observation_detectors import (
     evaluate_observation_batch,
 )
 from upstream_api.services.reliability_observation_ingest import record_observation_batch
+from upstream_api.services.reliability_sources import upsert_sources_from_observation_batch
 
 router = APIRouter(prefix="/v1/reliability", tags=["reliability"])
 
@@ -77,6 +78,40 @@ async def _run_detectors_safe(
         )
 
 
+async def _run_source_upsert_safe(
+    conn: asyncpg.Connection,
+    *,
+    account_id: UUID,
+    source: str,
+    batch_id: UUID,
+    observations: list[ReliabilityObservationItem],
+) -> None:
+    """Project the batch into the cv_sources registry, isolated in a savepoint.
+
+    The registry is a derived, product-critical projection of cv_observations
+    (the durable system of record). It runs in its own savepoint — separate from
+    the detector savepoint — so a pathological payload rolls back only the
+    registry write and never rejects already-stored observations; the registry
+    can be rebuilt from cv_observations. A failure here is projection drift (a
+    stronger signal than best-effort analytics), so it is logged at error level.
+    """
+    try:
+        async with conn.transaction():
+            await upsert_sources_from_observation_batch(
+                conn,
+                account_id=account_id,
+                source=source,
+                observations=observations,
+            )
+    except Exception as exc:
+        _logger.error(
+            "reliability_source_upsert_failed",
+            account_id=str(account_id),
+            batch_id=str(batch_id),
+            error=type(exc).__name__,
+        )
+
+
 @router.post("/observations", response_model=ReliabilityObservationBatchResponse)
 async def ingest_observations(
     body: ReliabilityObservationBatchRequest,
@@ -109,6 +144,17 @@ async def ingest_observations(
             observations=body.observations,
         )
         if result.inserted:
+            # Registry projection first (its own savepoint), then detectors — so
+            # a detector-savepoint rollback can't lose the registry update. Both
+            # are gated on the freshly-inserted batch, so idempotent replays
+            # never double-count source counters.
+            await _run_source_upsert_safe(
+                conn,
+                account_id=scope_account,
+                source=body.source,
+                batch_id=result.batch_id,
+                observations=body.observations,
+            )
             await _run_detectors_safe(
                 conn,
                 account_id=scope_account,

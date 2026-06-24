@@ -84,6 +84,18 @@ select b.source                                                    as source,
  limit {_SOURCE_LIMIT}
 """
 
+# M2a: "sources active" reads the durable cv_sources registry rather than
+# re-counting raw observation groups. Heartbeat-only collector rows are excluded
+# (source_kind <> 'collector') to stay consistent with the heartbeat-excluded
+# ``sources`` array. The detailed, stable source list lives at /v1/reliability/sources.
+_ACTIVE_SOURCE_COUNT_SQL = f"""
+select count(*) as n
+  from cv_sources
+ where account_id = $1
+   and source_kind <> 'collector'
+   and last_seen_at > now() - interval '{_RECENT_WINDOW}'
+"""
+
 _OPEN_ISSUES_TOTAL_SQL = """
 select count(*) as n
   from cv_issues
@@ -161,6 +173,7 @@ async def get_collector_status(
     batches = await conn.fetch(_RECENT_BATCHES_SQL, account_id)
     obs_count = await conn.fetchrow(_RECENT_OBSERVATION_COUNT_SQL, account_id)
     source_rows = await conn.fetch(_SOURCES_SQL, account_id)
+    active_count = await conn.fetchrow(_ACTIVE_SOURCE_COUNT_SQL, account_id)
     open_total = await conn.fetchrow(_OPEN_ISSUES_TOTAL_SQL, account_id)
     open_by_key_rows = await conn.fetch(_OPEN_ISSUES_BY_KEY_SQL, account_id)
     heartbeat_row = await conn.fetchrow(_LATEST_HEARTBEAT_SQL, account_id)
@@ -200,7 +213,7 @@ async def get_collector_status(
         ),
         "recent_batch_count": _int(batch_count["n"]) if batch_count else 0,
         "recent_observation_count": _int(obs_count["n"]) if obs_count else 0,
-        "active_source_count": len(sources),
+        "active_source_count": _int(active_count["n"]) if active_count else 0,
         "open_issue_count": _int(open_total["n"]) if open_total else 0,
         "latest_collector_heartbeat": _heartbeat(heartbeat_row),
         "sources": sources,
