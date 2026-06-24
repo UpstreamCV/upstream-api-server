@@ -56,6 +56,7 @@ class FakeStatusConn:
         active_source_count: int = 0,
         open_issue_count: int = 0,
         open_by_key: list[dict[str, Any]] | None = None,
+        health_counts: list[dict[str, Any]] | None = None,
         heartbeat: dict[str, Any] | None = None,
     ) -> None:
         self._last_received_at = last_received_at
@@ -66,6 +67,7 @@ class FakeStatusConn:
         self._active_source_count = active_source_count
         self._open_issue_count = open_issue_count
         self._open_by_key = open_by_key or []
+        self._health_counts = health_counts or []
         self._heartbeat = heartbeat
 
     async def fetch(self, query: str, *args: Any) -> list[dict[str, Any]]:
@@ -75,6 +77,8 @@ class FakeStatusConn:
             return self._sources
         if "group by external_camera_key" in query:  # open issues by key
             return self._open_by_key
+        if "group by health_status" in query:  # M2b source health rollup
+            return self._health_counts
         return []
 
     async def fetchrow(self, query: str, *args: Any) -> dict[str, Any] | None:
@@ -246,3 +250,32 @@ def test_response_has_no_account_id() -> None:
     conn = FakeStatusConn(recent_observation_count=5)
     r = _client(conn, _agent_caller(uuid4(), ("reliability:read",))).get(_URL)
     assert "account_id" not in r.text
+
+
+def test_empty_account_has_all_zero_health_counts() -> None:
+    r = _client(FakeStatusConn(), _agent_caller(uuid4(), ("reliability:read",))).get(_URL)
+    counts = r.json()["source_health_counts"]
+    assert counts == {
+        "healthy": 0,
+        "delayed": 0,
+        "silent": 0,
+        "collector_offline": 0,
+        "unknown": 0,
+        "disabled": 0,
+    }
+
+
+def test_source_health_counts_rolled_up() -> None:
+    conn = FakeStatusConn(
+        health_counts=[
+            {"health_status": "healthy", "n": 3},
+            {"health_status": "silent", "n": 1},
+            {"health_status": "collector_offline", "n": 1},
+        ]
+    )
+    r = _client(conn, _agent_caller(uuid4(), ("reliability:read",))).get(_URL)
+    counts = r.json()["source_health_counts"]
+    assert counts["healthy"] == 3
+    assert counts["silent"] == 1
+    assert counts["collector_offline"] == 1
+    assert counts["delayed"] == 0

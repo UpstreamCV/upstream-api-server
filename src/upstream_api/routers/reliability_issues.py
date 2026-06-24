@@ -25,11 +25,13 @@ from fastapi import APIRouter, Query
 from upstream_api.errors import NotFoundError
 from upstream_api.schemas.reliability_observations import (
     CollectorStatusResponse,
+    LivenessSettingsUpdate,
     ReliabilityIssueRecord,
     ReliabilityIssueResolveRequest,
     ReliabilityIssuesResponse,
     ReliabilitySourceRecord,
     ReliabilitySourcesResponse,
+    SourceHealthStatus,
     SourceKind,
     SourceStatusHint,
 )
@@ -47,7 +49,11 @@ from upstream_api.services.reliability_issues import (
     list_issues,
     resolve_issue_by_id,
 )
-from upstream_api.services.reliability_sources import list_sources
+from upstream_api.services.reliability_source_liveness import effective_intervals
+from upstream_api.services.reliability_sources import (
+    list_sources,
+    update_source_liveness,
+)
 
 router = APIRouter(prefix="/v1/reliability", tags=["reliability"])
 
@@ -99,6 +105,15 @@ def _record(row: dict[str, Any]) -> ReliabilityIssueRecord:
     )
 
 
+def _source_record(row: dict[str, Any]) -> ReliabilitySourceRecord:
+    # Resolve NULL intervals to the per-kind default so the response always shows
+    # a concrete interval (the central default lives in the liveness service).
+    expected, grace = effective_intervals(row)
+    return ReliabilitySourceRecord.model_validate(
+        {**row, "expected_interval_seconds": expected, "liveness_grace_seconds": grace}
+    )
+
+
 def _resolve_account_for_write(caller: CallerAuth, account_id: UUID | None) -> UUID:
     # API tokens are authorized by scope; dashboard users by owner/admin role.
     require_token_scope(caller, "reliability:write")
@@ -135,16 +150,17 @@ async def list_reliability_sources(
     account_id: Annotated[UUID | None, Query()] = None,
     source_kind: Annotated[SourceKind | None, Query()] = None,
     status_hint: Annotated[SourceStatusHint | None, Query()] = None,
+    health_status: Annotated[SourceHealthStatus | None, Query()] = None,
     limit: Annotated[int, Query(ge=1, le=_SOURCES_MAX_LIMIT)] = _SOURCES_DEFAULT_LIMIT,
 ) -> ReliabilitySourcesResponse:
-    """Account-scoped collector source registry (M2a), most-recently-seen first.
+    """Account-scoped collector source registry, most-recently-seen first.
 
     Durable per-(source, external_camera_key) identity projected from the
     observation stream: when each source last sent data, what types, latest
-    model, totals, a display-only ``status_hint``, and open-issue count. These
-    are external collector/CV sources, not managed Upstream cameras. Optional
-    ``source_kind`` / ``status_hint`` filters (bogus → 422). Empty account →
-    empty list, not 404."""
+    model, totals, the real ``health_status`` (M2b liveness) + effective expected
+    interval, and open-issue count. These are external collector/CV sources, not
+    managed Upstream cameras. Optional ``source_kind`` / ``status_hint`` /
+    ``health_status`` filters (bogus → 422). Empty account → empty list, not 404."""
     require_token_scope(caller, "reliability:read")
     scope_account = caller.resolve_account(account_id)
     async with pool.acquire() as conn:
@@ -153,11 +169,38 @@ async def list_reliability_sources(
             account_id=scope_account,
             source_kind=source_kind,
             status_hint=status_hint,
+            health_status=health_status,
             limit=limit,
         )
-    return ReliabilitySourcesResponse(
-        sources=[ReliabilitySourceRecord.model_validate(r) for r in rows]
-    )
+    return ReliabilitySourcesResponse(sources=[_source_record(r) for r in rows])
+
+
+@router.patch("/sources/{source_id}/liveness", response_model=ReliabilitySourceRecord)
+async def update_reliability_source_liveness(
+    source_id: UUID,
+    caller: CurrentCaller,
+    pool: PoolDep,
+    body: LivenessSettingsUpdate,
+    account_id: Annotated[UUID | None, Query()] = None,
+) -> ReliabilitySourceRecord:
+    """Update a source's liveness settings (M2b). Requires ``reliability:write``
+    (tokens) / owner|admin (JWT users). All body fields optional: an explicit
+    ``null`` interval resets it to the per-kind default, an absent field is left
+    unchanged. Invalid intervals → 422; unknown/cross-account id → 404."""
+    scope_account = _resolve_account_for_write(caller, account_id)
+    async with pool.acquire() as conn, conn.transaction():
+        row = await update_source_liveness(
+            conn,
+            account_id=scope_account,
+            source_id=source_id,
+            fields_set=body.model_fields_set,
+            liveness_enabled=body.liveness_enabled,
+            expected_interval_seconds=body.expected_interval_seconds,
+            liveness_grace_seconds=body.liveness_grace_seconds,
+        )
+    if row is None:
+        raise NotFoundError("Source not found.", code="source_not_found")
+    return _source_record(row)
 
 
 @router.get("/issues", response_model=ReliabilityIssuesResponse)

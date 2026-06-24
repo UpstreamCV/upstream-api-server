@@ -26,7 +26,7 @@ from datetime import datetime
 from typing import Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from upstream_api.schemas.reliability import ReliabilitySeverity, ReliabilityStatus
 
@@ -52,6 +52,11 @@ ReliabilityIssueCategory = Literal["count", "confidence", "liveness", "tracker"]
 # lightweight derived liveness label for display only (real liveness is M2b).
 SourceKind = Literal["collector", "external_camera", "observation_source", "unknown"]
 SourceStatusHint = Literal["active", "recent", "unknown"]
+
+# M2b real health states (must match the cv_sources.health_status CHECK).
+SourceHealthStatus = Literal[
+    "healthy", "delayed", "silent", "collector_offline", "unknown", "disabled"
+]
 
 
 class ReliabilityObservationItem(BaseModel):
@@ -183,6 +188,8 @@ class CollectorStatusResponse(BaseModel):
     latest_collector_heartbeat: CollectorHeartbeat | None
     sources: list[CollectorSourceStatus]
     recent_batches: list[CollectorBatchSummary]
+    # M2b: per-account source health rollup (all 6 states present, default 0).
+    source_health_counts: dict[str, int] = Field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -226,6 +233,48 @@ class ReliabilitySourceRecord(BaseModel):
     open_issue_count: int
     status_hint: SourceStatusHint
 
+    # M2b liveness/health. ``expected_interval_seconds``/``liveness_grace_seconds``
+    # are the EFFECTIVE values (stored override, else the per-kind default), so
+    # the dashboard always shows a concrete interval. ``health_status`` is the
+    # real liveness state (vs the display-only ``status_hint``).
+    health_status: SourceHealthStatus
+    health_reason: str | None
+    health_message: str | None
+    liveness_enabled: bool
+    expected_interval_seconds: int
+    liveness_grace_seconds: int
+    last_liveness_checked_at: datetime | None
+    last_health_status_changed_at: datetime | None
+    liveness_silence_started_at: datetime | None
+    last_liveness_issue_id: UUID | None
+
 
 class ReliabilitySourcesResponse(BaseModel):
     sources: list[ReliabilitySourceRecord]
+
+
+class LivenessSettingsUpdate(BaseModel):
+    """PATCH body for source liveness settings. All fields optional; an explicit
+    ``null`` interval RESETS it to the per-kind default (stored NULL), while an
+    absent field is left unchanged (distinguished via ``model_fields_set``).
+    This null=reset semantics is M2b-specific and intentional."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    liveness_enabled: bool | None = None
+    expected_interval_seconds: int | None = None
+    liveness_grace_seconds: int | None = None
+
+    @field_validator("expected_interval_seconds")
+    @classmethod
+    def _check_expected(cls, v: int | None) -> int | None:
+        if v is not None and v <= 0:
+            raise ValueError("expected_interval_seconds must be > 0")
+        return v
+
+    @field_validator("liveness_grace_seconds")
+    @classmethod
+    def _check_grace(cls, v: int | None) -> int | None:
+        if v is not None and v < 0:
+            raise ValueError("liveness_grace_seconds must be >= 0")
+        return v

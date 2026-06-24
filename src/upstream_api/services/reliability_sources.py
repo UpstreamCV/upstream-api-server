@@ -64,10 +64,11 @@ insert into cv_sources (
     last_event_at, last_detection_summary_at, last_collector_heartbeat_at,
     last_config_changed_at, last_model_name, last_model_version,
     observation_count_total, event_count_total, detection_summary_count_total,
-    collector_heartbeat_count_total, config_changed_count_total
+    collector_heartbeat_count_total, config_changed_count_total,
+    health_status, last_health_status_changed_at
 )
 values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
-        $15, $16, $17, $18, $19)
+        $15, $16, $17, $18, $19, 'healthy', $7)
 on conflict (account_id, source, coalesce(external_camera_key, '')) do update set
     last_seen_at = greatest(cv_sources.last_seen_at, excluded.last_seen_at),
     last_observation_at = greatest(
@@ -95,32 +96,49 @@ on conflict (account_id, source, coalesce(external_camera_key, '')) do update se
         when cv_sources.source_kind = 'collector' or excluded.source_kind = 'collector'
             then 'collector'
         else 'observation_source'
-    end
+    end,
+    -- M2b: fresh data is a recovery signal. Flip a monitored source back to
+    -- healthy + clear silence markers; the next liveness sweep resolves the
+    -- open issue (it owns the issue lifecycle). Disabled sources are untouched.
+    health_status = case when cv_sources.liveness_enabled then 'healthy'
+                         else cv_sources.health_status end,
+    health_reason = case when cv_sources.liveness_enabled then null
+                         else cv_sources.health_reason end,
+    health_message = case when cv_sources.liveness_enabled then null
+                          else cv_sources.health_message end,
+    liveness_silence_started_at = case when cv_sources.liveness_enabled then null
+                                       else cv_sources.liveness_silence_started_at end,
+    last_health_status_changed_at = case
+        when cv_sources.liveness_enabled and cv_sources.health_status <> 'healthy' then now()
+        else cv_sources.last_health_status_changed_at end
 """
 
-# Read: registry rows for the account + a lightweight derived status_hint and an
-# open-issue count joined by external_camera_key. status_hint/source_kind filters
-# and the limit are applied AFTER the derivation (outer query over the CTE) so a
-# status_hint filter never under-fills the page. open_issue_count is 0 for
-# keyless rows (the join key is null) — documented; camera-keyed issues are not
-# joined (no camera mapping in M2a).
-_LIST_SOURCES_SQL = """
-with src as (
-    select
-        id, source, external_camera_key, display_name, source_kind,
-        first_seen_at, last_seen_at, last_observation_at,
-        last_event_at, last_detection_summary_at, last_collector_heartbeat_at,
-        last_config_changed_at, last_model_name, last_model_version,
-        observation_count_total, event_count_total, detection_summary_count_total,
-        collector_heartbeat_count_total, config_changed_count_total,
-        case
-            when last_seen_at > now() - interval '5 minutes' then 'active'
-            when last_seen_at > now() - interval '24 hours' then 'recent'
-            else 'unknown'
-        end as status_hint
-    from cv_sources
-    where account_id = $1
-),
+# Read: registry rows for the account + a derived status_hint, the M2b
+# liveness/health columns, and an open-issue count joined by external_camera_key.
+# status_hint/source_kind/health_status filters + the limit are applied AFTER the
+# derivation (outer query over the CTE) so a filter never under-fills the page.
+# open_issue_count is 0 for keyless rows (the join key is null) — documented;
+# camera-keyed issues are not joined (no camera mapping). Intervals are returned
+# RAW (NULL = use default); the router resolves them via effective_intervals.
+_SOURCE_COLUMNS = """
+    id, source, external_camera_key, display_name, source_kind,
+    first_seen_at, last_seen_at, last_observation_at,
+    last_event_at, last_detection_summary_at, last_collector_heartbeat_at,
+    last_config_changed_at, last_model_name, last_model_version,
+    observation_count_total, event_count_total, detection_summary_count_total,
+    collector_heartbeat_count_total, config_changed_count_total,
+    liveness_enabled, expected_interval_seconds, liveness_grace_seconds,
+    health_status, health_reason, health_message,
+    last_liveness_checked_at, last_health_status_changed_at,
+    liveness_silence_started_at, last_liveness_issue_id,
+    case
+        when last_seen_at > now() - interval '5 minutes' then 'active'
+        when last_seen_at > now() - interval '24 hours' then 'recent'
+        else 'unknown'
+    end as status_hint
+"""
+
+_OPEN_ISSUES_CTE = """
 open_issues as (
     select external_camera_key, count(*) as n
         from cv_issues
@@ -129,13 +147,36 @@ open_issues as (
             and external_camera_key is not null
         group by external_camera_key
 )
+"""
+
+_LIST_SOURCES_SQL = f"""
+with src as (
+    select {_SOURCE_COLUMNS}
+    from cv_sources
+    where account_id = $1
+),
+{_OPEN_ISSUES_CTE}
 select src.*, coalesce(oi.n, 0) as open_issue_count
     from src
     left join open_issues oi on oi.external_camera_key = src.external_camera_key
     where ($2::text is null or src.source_kind = $2)
         and ($3::text is null or src.status_hint = $3)
+        and ($5::text is null or src.health_status = $5)
     order by src.last_seen_at desc
     limit $4
+"""
+
+# Single source by id (the PATCH response re-fetch), same shape as the list.
+_GET_SOURCE_SQL = f"""
+with src as (
+    select {_SOURCE_COLUMNS}
+    from cv_sources
+    where account_id = $1 and id = $2
+),
+{_OPEN_ISSUES_CTE}
+select src.*, coalesce(oi.n, 0) as open_issue_count
+    from src
+    left join open_issues oi on oi.external_camera_key = src.external_camera_key
 """
 
 
@@ -275,11 +316,84 @@ async def list_sources(
     account_id: UUID,
     source_kind: str | None = None,
     status_hint: str | None = None,
+    health_status: str | None = None,
     limit: int = _LIST_DEFAULT_LIMIT,
 ) -> list[dict[str, Any]]:
-    """Account-scoped registry rows + derived status_hint + open_issue_count,
-    most-recently-seen first. Bounded by ``limit``."""
+    """Account-scoped registry rows + derived status_hint + health/liveness
+    columns + open_issue_count, most-recently-seen first. Bounded by ``limit``.
+    Intervals are returned raw (NULL = default); the router resolves them."""
     rows = await conn.fetch(
-        _LIST_SOURCES_SQL, account_id, source_kind, status_hint, limit
+        _LIST_SOURCES_SQL, account_id, source_kind, status_hint, limit, health_status
     )
     return [dict(r) for r in rows]
+
+
+async def get_source_for_response(
+    conn: asyncpg.Connection,
+    *,
+    account_id: UUID,
+    source_id: UUID,
+) -> dict[str, Any] | None:
+    """One account-scoped source in the same shape as :func:`list_sources` (for
+    the PATCH response). ``None`` when missing/cross-account → router 404."""
+    row = await conn.fetchrow(_GET_SOURCE_SQL, account_id, source_id)
+    return dict(row) if row is not None else None
+
+
+async def update_source_liveness(
+    conn: asyncpg.Connection,
+    *,
+    account_id: UUID,
+    source_id: UUID,
+    fields_set: set[str],
+    liveness_enabled: bool | None,
+    expected_interval_seconds: int | None,
+    liveness_grace_seconds: int | None,
+) -> dict[str, Any] | None:
+    """Apply a liveness-settings PATCH (account-scoped). Returns the updated
+    source in list shape, or ``None`` if missing/cross-account (→ router 404).
+
+    Field semantics: a field present in ``fields_set`` is applied (an interval
+    set to ``None`` RESETS it to the per-kind default = stored NULL); a field
+    absent from ``fields_set`` is untouched. Toggling ``liveness_enabled``
+    re-baselines ``health_status`` so the next sweep re-evaluates — disabled is
+    set immediately (the sweep skips disabled rows), re-enabled goes 'unknown'.
+    """
+    sets: list[str] = []
+    args: list[Any] = [account_id, source_id]
+
+    def _add(col: str, value: Any) -> None:
+        args.append(value)
+        sets.append(f"{col} = ${len(args)}")
+
+    if "expected_interval_seconds" in fields_set:
+        _add("expected_interval_seconds", expected_interval_seconds)
+    if "liveness_grace_seconds" in fields_set:
+        _add("liveness_grace_seconds", liveness_grace_seconds)
+    if "liveness_enabled" in fields_set and liveness_enabled is not None:
+        _add("liveness_enabled", liveness_enabled)
+        _add("health_status", "disabled" if not liveness_enabled else "unknown")
+        sets.append("last_health_status_changed_at = now()")
+        if not liveness_enabled:
+            sets.append("health_reason = null")
+            sets.append("health_message = null")
+            sets.append("last_liveness_issue_id = null")
+            sets.append("liveness_silence_started_at = null")
+
+    if not sets:  # no-op PATCH — still account-scoped (cross-account → None → 404)
+        return await get_source_for_response(
+            conn, account_id=account_id, source_id=source_id
+        )
+
+    # Column names are hardcoded literals; only values are parameterized ($N).
+    sql = (
+        "update cv_sources set "
+        + ", ".join(sets)
+        + " where account_id = $1 and id = $2 returning id"
+    )
+    updated = await conn.fetchrow(sql, *args)
+    if updated is None:
+        return None
+    return await get_source_for_response(
+        conn, account_id=account_id, source_id=source_id
+    )

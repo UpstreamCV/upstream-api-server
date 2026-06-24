@@ -4,6 +4,41 @@ Reverse chronological. Newest at top. Every meaningful commit gets an entry foll
 
 ---
 
+## 2026-06-25 - feat(reliability): M2b source health + liveness monitoring
+
+### Summary
+Make Upstream actively catch "data stopped flowing." Extends `cv_sources` with
+liveness settings + a real `health_status`, adds a scheduled sweep that opens/
+refreshes/auto-resolves `source_silent` + `collector_offline` `cv_issues`,
+flips a recovering source back to healthy on fresh ingest, and exposes health on
+the reads + a `PATCH …/liveness` settings endpoint. Sweep is ON by default
+(interval 60s, single-instance posture, OFF in tests since the lifespan doesn't
+run under TestClient). No camera mapping; no global /issues; no agent change.
+
+### Files touched
+- `supabase/migrations/20260625120000_reliability_source_liveness.sql` — ALTER cv_sources: liveness_enabled, expected_interval_seconds, liveness_grace_seconds, health_status (CHECK 6 states), health_reason/message, last_liveness_checked_at/last_health_status_changed_at/liveness_silence_started_at, last_liveness_issue_id (no FK); claim + health indexes.
+- `services/reliability_source_liveness.py` (NEW) — `default_intervals`/`effective_intervals`, pure `evaluate_source_health`, claim-then-process `run_source_liveness_sweep` + loop.
+- `services/reliability_sources.py` — upsert recovery (INSERT health='healthy'; ON CONFLICT flip healthy + clear silence when monitored); list_sources health columns + `health_status` filter; `get_source_for_response`; `update_source_liveness`.
+- `services/reliability_collector_status.py` — `source_health_counts` rollup.
+- `routers/reliability_issues.py` — `/sources` health fields + filter + effective-interval mapping; `PATCH /sources/{id}/liveness`.
+- `routers/reliability_source_liveness.py` (NEW) — `POST /v1/internal/reliability/source-liveness/run` (current_processor).
+- `schemas/reliability_observations.py` — `SourceHealthStatus`, record health fields, `source_health_counts`, `LivenessSettingsUpdate` (null=reset via model_fields_set).
+- `config.py` (sweep interval/limit), `app.py` (lifespan loop + register router + `PATCH` in CORS).
+- Tests: `test_reliability_source_liveness_{migration,eval,sweep}.py`; extended sources-service/api, collector-status, app-routes CORS.
+
+### Functions/classes changed
+- `evaluate_source_health(source, now)` — pure: disabled/unknown/healthy/delayed/silent/collector_offline by `expected (+grace)`; never-seen → unknown; rejects naive `now`.
+- `run_source_liveness_sweep(pool, *, now, limit)` — claim (`FOR UPDATE SKIP LOCKED`, stamp checked_at) then per-source txn: evaluate → upsert/resolve issue → update health. Idempotent, multi-worker safe.
+
+### System interaction notes
+lifespan → `source_liveness_sweep_loop` → `run_source_liveness_sweep` → per source `upsert_open_issue`/`resolve_open_issues_by_dedupe` (emit `reliability.issue_*`) + cv_sources health UPDATE. Ingest upsert flips health→healthy on fresh data; the sweep owns issue open/resolve.
+
+### Testing/checks
+`uv run pytest -q` (1538 passed), `ruff`, `mypy` clean. Sweep/eval driven directly + via the internal endpoint (no scheduler in tests).
+
+### Follow-up TODOs
+Liveness-settings edit UI (the PATCH foundation is built); optional `delayed` issues; camera mapping still deferred.
+
 ## 2026-06-24 - fix(reliability): let the agent scope ingest observations (5afcbe1)
 
 ### Summary

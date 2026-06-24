@@ -64,5 +64,5 @@ def test_cors_middleware_uses_explicit_methods_and_headers() -> None:
     headers = cors.kwargs["allow_headers"]
     assert "*" not in methods
     assert "*" not in headers
-    assert set(methods) == {"GET", "POST", "DELETE"}
+    assert set(methods) == {"GET", "POST", "PATCH", "DELETE"}
     assert "Authorization" in headers

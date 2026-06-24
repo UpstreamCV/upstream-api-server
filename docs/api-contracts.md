@@ -2700,36 +2700,80 @@ observations commit, then — each in its own savepoint so a bad payload can nev
 reject accepted observations — the `cv_sources` registry is upserted and the
 reliability detectors run. Response 200: `{accepted, batch_id, server_time}`.
 
-### `GET /v1/reliability/sources` (M2a)
+### `GET /v1/reliability/sources` (M2a + M2b health)
 
 Account-scoped source registry, most-recently-seen first. Auth:
 `reliability:read`. Query params (all optional): `source_kind`
 (`collector|external_camera|observation_source|unknown`; bogus → 422),
-`status_hint` (`active|recent|unknown`; bogus → 422), `limit` (default 100, max
-500; over → 422). Response 200: `{sources: [ReliabilitySourceRecord]}` where each
-record is `{id, source, external_camera_key, display_name, source_kind,
-first_seen_at, last_seen_at, last_observation_at, last_event_at,
-last_detection_summary_at, last_collector_heartbeat_at, last_config_changed_at,
-last_model_name, last_model_version, observation_count_total, event_count_total,
+`status_hint` (`active|recent|unknown`; bogus → 422), `health_status`
+(`healthy|delayed|silent|collector_offline|unknown|disabled`; bogus → 422),
+`limit` (default 100, max 500; over → 422). Response 200:
+`{sources: [ReliabilitySourceRecord]}` where each record is `{id, source,
+external_camera_key, display_name, source_kind, first_seen_at, last_seen_at,
+last_observation_at, last_event_at, last_detection_summary_at,
+last_collector_heartbeat_at, last_config_changed_at, last_model_name,
+last_model_version, observation_count_total, event_count_total,
 detection_summary_count_total, collector_heartbeat_count_total,
-config_changed_count_total, open_issue_count, status_hint}`. `status_hint` is a
-**display-only** freshness label (`active` ≤5m, `recent` ≤24h, else `unknown`) —
-real liveness (expected intervals + offline issues) is M2b. `open_issue_count` is
-open `cv_issues` matched by `external_camera_key` (0 for keyless
-collector/observation_source rows; camera-keyed issues are not joined — no camera
-mapping in M2a). Empty account → `{sources: []}` (not 404).
+config_changed_count_total, open_issue_count, status_hint, health_status,
+health_reason, health_message, liveness_enabled, expected_interval_seconds,
+liveness_grace_seconds, last_liveness_checked_at, last_health_status_changed_at,
+liveness_silence_started_at, last_liveness_issue_id}`. **M2b:** `health_status` is
+the real liveness state (computed by the sweep, below); `expected_interval_seconds`
+/ `liveness_grace_seconds` are the EFFECTIVE values (stored override, else the
+per-kind default) so they are always concrete. `status_hint` remains the M2a
+display-only freshness label. `open_issue_count` is open `cv_issues` matched by
+`external_camera_key` (0 for keyless collector/observation_source rows — a
+`collector_offline` issue surfaces via `health_status` + `last_liveness_issue_id`
+instead; no camera mapping). Empty account → `{sources: []}` (not 404).
 
-### `GET /v1/reliability/collector-status` (M1c)
+### `GET /v1/reliability/collector-status` (M1c + M2b health counts)
 
 Bounded 24h cloud-ingest summary for the dashboard's `/agents/collector` page.
 Auth: `reliability:read`. Response: `{last_received_at, recent_batch_count,
 recent_observation_count, active_source_count, open_issue_count,
-latest_collector_heartbeat, sources, recent_batches}`. Heartbeat plumbing
-(`collector_heartbeat` observations / `collector-heartbeat:%` batches) is excluded
-from the activity/source aggregates and surfaced only via
+latest_collector_heartbeat, sources, recent_batches, source_health_counts}`.
+Heartbeat plumbing (`collector_heartbeat` observations / `collector-heartbeat:%`
+batches) is excluded from the activity/source aggregates and surfaced only via
 `latest_collector_heartbeat` (safe counters only — never the raw payload). M2a:
 `active_source_count` reads the `cv_sources` registry (rows seen in 24h, excluding
-`source_kind='collector'`) instead of re-counting raw observation groups.
+`source_kind='collector'`). **M2b:** `source_health_counts` is the per-account
+rollup of `cv_sources.health_status` — all six states present (default 0):
+`{healthy, delayed, silent, collector_offline, unknown, disabled}`.
+
+### `PATCH /v1/reliability/sources/{source_id}/liveness` (M2b)
+
+Update a source's liveness settings. Auth: `reliability:write` (tokens) /
+owner|admin (JWT users) — same posture as the issue resolve. Body (all fields
+optional): `{liveness_enabled?: bool, expected_interval_seconds?: int,
+liveness_grace_seconds?: int}`. **Field semantics (M2b-specific):** an explicit
+`null` interval RESETS it to the per-kind default (stored NULL); an absent field
+is left unchanged (distinguished via Pydantic `model_fields_set` — note this
+intentionally diverges from the repo's other "null = unchanged" PATCHes).
+Invalid intervals (`expected_interval_seconds ≤ 0` / `liveness_grace_seconds < 0`)
+→ 422. Toggling `liveness_enabled=false` also sets `health_status='disabled'`
+inline (the sweep skips disabled rows); re-enabling sets `'unknown'` for the next
+sweep to re-evaluate. Unknown/cross-account id → 404. Returns the updated
+`ReliabilitySourceRecord`.
+
+### Source liveness sweep (M2b — scheduled background job)
+
+A bounded, idempotent in-process loop
+(`services/reliability_source_liveness.py`) detects sources that stopped sending:
+**external** sources whose `last_seen_at` exceeds `expected + grace` open a
+`source_silent` issue (warning); **collector** rows whose
+`last_collector_heartbeat_at` exceeds `expected + grace` open a `collector_offline`
+issue (critical) — both `category='liveness'`, deduped on
+`source_liveness:<source_id>:<issue_type>`, emitting `reliability.issue_opened`.
+When fresh data resumes the source flips back to `healthy` (the ingest upsert does
+this immediately) and the next sweep tick auto-resolves the issue
+(`reliability.issue_resolved`). The sweep claims the least-recently-checked enabled
+rows (`FOR UPDATE SKIP LOCKED`, claim-then-process) so it is multi-worker safe.
+Default per-kind intervals (resolved from NULL): collector `(180, 60)` → offline
+~4 min; external `(600, 300)` → silent ~15 min. `delayed` is a dashboard-only
+state (no issue). Config (env `UPSTREAM_*`): `source_liveness_sweep_interval_seconds`
+(default 60; 0 disables — OFF in tests since the lifespan doesn't run),
+`source_liveness_sweep_limit` (default 500). Cron/test trigger:
+`POST /v1/internal/reliability/source-liveness/run` (auth `current_processor`).
 
 ### `GET /v1/reliability/issues`, `GET /v1/reliability/issues/{id}`, `POST /v1/reliability/issues/{id}/resolve`
 
