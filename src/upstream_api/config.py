@@ -79,6 +79,16 @@ class Settings(BaseSettings):
     # the workflow evaluator above.
     health_sample_interval_seconds: int = 60
 
+    # Reliability M2b: interval + batch size for the in-process source-liveness
+    # sweep (services/reliability_source_liveness.py) that detects silent
+    # external sources / offline collectors and opens/resolves cv_issues. 0
+    # disables the loop — the internal endpoint
+    # (POST /v1/internal/reliability/source-liveness/run) still works for cron.
+    # Same gated single-instance posture as the workflow evaluator; OFF in tests
+    # because TestClient doesn't run the lifespan.
+    source_liveness_sweep_interval_seconds: int = 60
+    source_liveness_sweep_limit: int = 500
+
     # Module 6 M6.4 — in-process webhook delivery worker. Defaults OFF so the
     # outbound capability is a deliberate per-deploy opt-in (set
     # UPSTREAM_WEBHOOK_DELIVERY_ENABLED=true in prod). The durable

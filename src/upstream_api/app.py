@@ -46,6 +46,7 @@ from upstream_api.routers import (
     reliability,
     reliability_ingest,
     reliability_issues,
+    reliability_source_liveness,
     rules,
     snapshots,
     stream_sessions,
@@ -58,6 +59,7 @@ from upstream_api.routers import (
 )
 from upstream_api.services.health_sampler import health_sampler_loop
 from upstream_api.services.http_client import build_http_client
+from upstream_api.services.reliability_source_liveness import source_liveness_sweep_loop
 from upstream_api.services.webhook_delivery import webhook_delivery_loop
 from upstream_api.services.workflow_evaluator import workflow_evaluator_loop
 
@@ -100,6 +102,25 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             "health_sampler_loop_started",
             interval_seconds=settings.health_sample_interval_seconds,
         )
+    # Reliability M2b: in-process source-liveness sweep. Detects silent external
+    # sources / offline collectors and opens/resolves cv_issues. 0 disables (the
+    # internal endpoint still drives it for cron/tests). Same gated single-
+    # instance posture as the evaluator; multi-worker safe via the claim-then-
+    # process FOR UPDATE SKIP LOCKED batch.
+    liveness_sweep_task: asyncio.Task[None] | None = None
+    if settings.source_liveness_sweep_interval_seconds > 0:
+        liveness_sweep_task = asyncio.create_task(
+            source_liveness_sweep_loop(
+                pool,
+                settings.source_liveness_sweep_interval_seconds,
+                settings.source_liveness_sweep_limit,
+            )
+        )
+        _logger.info(
+            "source_liveness_sweep_loop_started",
+            interval_seconds=settings.source_liveness_sweep_interval_seconds,
+            limit=settings.source_liveness_sweep_limit,
+        )
     # Module 6 M6.4: in-process webhook delivery worker. Defaults OFF — enable
     # in prod with UPSTREAM_WEBHOOK_DELIVERY_ENABLED=true. Uses a dedicated
     # httpx client (tight timeout) so a slow tenant endpoint can't starve the
@@ -124,7 +145,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         yield
     finally:
         _logger.info("shutdown")
-        for task in (evaluator_task, sampler_task, webhook_delivery_task):
+        for task in (evaluator_task, sampler_task, liveness_sweep_task, webhook_delivery_task):
             if task is not None:
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
@@ -170,7 +191,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         CORSMiddleware,
         allow_origins=settings.allowed_origins,
         allow_credentials=True,
-        allow_methods=["GET", "POST", "DELETE"],
+        allow_methods=["GET", "POST", "PATCH", "DELETE"],
         allow_headers=["Authorization", "Content-Type", "X-Request-ID"],
         expose_headers=["X-Request-ID"],
     )
@@ -195,6 +216,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(reliability.router)  # /v1/cameras/{id}/reliability/*
     app.include_router(reliability_ingest.router)  # /v1/reliability/observations (M1a)
     app.include_router(reliability_issues.router)  # /v1/reliability/issues (M1a)
+    app.include_router(
+        reliability_source_liveness.router
+    )  # /v1/internal/reliability/source-liveness (M2b)
     app.include_router(ingest.router)
     app.include_router(processor.router)  # /v1/internal/processor/* (M8.0)
     app.include_router(models.router)  # /v1/models

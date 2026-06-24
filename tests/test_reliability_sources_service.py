@@ -15,6 +15,7 @@ from uuid import uuid4
 
 from upstream_api.schemas.reliability_observations import ReliabilityObservationItem
 from upstream_api.services.reliability_sources import (
+    _UPSERT_SQL,
     list_sources,
     upsert_sources_from_observation_batch,
 )
@@ -222,7 +223,24 @@ async def test_list_sources_passes_filters_and_returns_dicts() -> None:
         account_id=account,
         source_kind="external_camera",
         status_hint="active",
+        health_status="silent",
         limit=25,
     )
     assert out[0]["source"] == "edge-box-4"
-    assert conn.calls[0] == (account, "external_camera", "active", 25)
+    # fetch arg order: account, source_kind, status_hint, limit, health_status.
+    assert conn.calls[0] == (account, "external_camera", "active", 25, "silent")
+
+
+def test_upsert_sql_sets_health_on_insert_and_recovers_on_conflict() -> None:
+    # M2b recovery is SQL-level (ON CONFLICT) so it can't be exercised via the
+    # arg-capturing fake; pin the clauses structurally. Intervals are NOT in the
+    # INSERT (left NULL = per-kind default, resolved at read).
+    sql = _UPSERT_SQL.lower()
+    assert "health_status, last_health_status_changed_at\n)" in sql or (
+        "health_status" in sql and "last_health_status_changed_at" in sql
+    )
+    assert "'healthy', $7)" in sql  # new source starts healthy
+    # ON CONFLICT recovery: monitored sources flip back to healthy on fresh data.
+    assert "health_status = case when cv_sources.liveness_enabled then 'healthy'" in sql
+    assert "liveness_silence_started_at = case when cv_sources.liveness_enabled" in sql
+    assert "expected_interval_seconds" not in sql.split("on conflict")[0]

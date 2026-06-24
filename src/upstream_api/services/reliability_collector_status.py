@@ -96,6 +96,23 @@ select count(*) as n
    and last_seen_at > now() - interval '{_RECENT_WINDOW}'
 """
 
+# M2b: per-account source health rollup for the dashboard health-summary card.
+_HEALTH_COUNTS_SQL = """
+select health_status, count(*) as n
+  from cv_sources
+ where account_id = $1
+ group by health_status
+"""
+
+_HEALTH_STATES = (
+    "healthy",
+    "delayed",
+    "silent",
+    "collector_offline",
+    "unknown",
+    "disabled",
+)
+
 _OPEN_ISSUES_TOTAL_SQL = """
 select count(*) as n
   from cv_issues
@@ -176,7 +193,13 @@ async def get_collector_status(
     active_count = await conn.fetchrow(_ACTIVE_SOURCE_COUNT_SQL, account_id)
     open_total = await conn.fetchrow(_OPEN_ISSUES_TOTAL_SQL, account_id)
     open_by_key_rows = await conn.fetch(_OPEN_ISSUES_BY_KEY_SQL, account_id)
+    health_rows = await conn.fetch(_HEALTH_COUNTS_SQL, account_id)
     heartbeat_row = await conn.fetchrow(_LATEST_HEARTBEAT_SQL, account_id)
+
+    health_counts = dict.fromkeys(_HEALTH_STATES, 0)
+    for r in health_rows:
+        if r["health_status"] in health_counts:
+            health_counts[r["health_status"]] = _int(r["n"])
 
     open_by_key = {
         r["external_camera_key"]: _int(r["n"]) for r in open_by_key_rows
@@ -218,4 +241,5 @@ async def get_collector_status(
         "latest_collector_heartbeat": _heartbeat(heartbeat_row),
         "sources": sources,
         "recent_batches": recent_batches,
+        "source_health_counts": health_counts,
     }
