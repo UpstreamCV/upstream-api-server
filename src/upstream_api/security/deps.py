@@ -332,6 +332,26 @@ def require_token_scope(caller: CallerAuth, *required: str) -> None:
         )
 
 
+def require_any_token_scope(caller: CallerAuth, *allowed: str) -> None:
+    """Like :func:`require_token_scope` but ANY-of: the API token must carry at
+    least one of ``allowed`` (vs. all of them).
+
+    For endpoints where several scopes are each sufficient. Reliability
+    observation ingest uses this so the managed agent's local collector can push
+    with its existing ``agent`` token (it reuses ``api.token`` by design) while
+    external CV systems use a dedicated ``reliability:ingest`` token. JWT callers
+    (no agent) bypass scope checks, same as :func:`require_token_scope`.
+    """
+    if caller.agent is None:
+        return
+    if not any(s in caller.agent.scopes for s in allowed):
+        raise ForbiddenError(
+            "API token is missing a required scope.",
+            code="forbidden.scope",
+            details={"required_any": sorted(allowed)},
+        )
+
+
 def require_account_role(
     user: UserAuth,
     account_id: UUID,
