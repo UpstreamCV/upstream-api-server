@@ -5,10 +5,11 @@ from datetime import UTC, datetime
 from typing import Annotated
 from uuid import UUID
 
+import asyncpg
 from fastapi import APIRouter, Query
 
 from upstream_api.config import get_settings
-from upstream_api.errors import NotFoundError
+from upstream_api.errors import ForbiddenError, NotFoundError
 from upstream_api.observability.context import agent_id_var
 from upstream_api.schemas.agents import (
     AgentListResponse,
@@ -26,6 +27,7 @@ from upstream_api.schemas.bootstrap import (
     BootstrapUsage,
 )
 from upstream_api.security.deps import CurrentAgent, CurrentCaller, PoolDep
+from upstream_api.services.account_audit import try_record_account_audit_log
 from upstream_api.services.agent_version_policy import build_agent_version_policy
 from upstream_api.services.limits import load_account_limits
 
@@ -64,6 +66,21 @@ async def register_agent(
     pool: PoolDep,
 ) -> AgentRegisterResponse:
     async with pool.acquire() as conn, conn.transaction():
+        # Device-scoped, already-bound tokens may only re-register their own
+        # agent. Checked BEFORE the upsert so a stolen token can't even
+        # create a differently-named agents row (the upsert would insert).
+        if auth.is_device_scoped and auth.agent_id is not None:
+            existing = await conn.fetchval(
+                "select id from agents where account_id = $1 and name = $2",
+                auth.account_id,
+                body.name,
+            )
+            if existing != auth.agent_id:
+                raise ForbiddenError(
+                    "Device token is bound to a different agent.",
+                    code="device_token_agent_mismatch",
+                )
+
         row = await conn.fetchrow(
             f"""
             insert into agents (
@@ -87,7 +104,55 @@ async def register_agent(
             body.python_version,
             json.dumps(body.capabilities),
         )
-    assert row is not None
+        assert row is not None
+
+        # Trust-on-first-use bind: the first register through an unbound
+        # device token locks the token to this agent, permanently. The
+        # `agent_id is null` guard makes concurrent registers race-safe —
+        # exactly one wins the bind; a loser targeting a DIFFERENT agent is
+        # rejected (and its upsert rolled back), while a same-agent replay
+        # sails through as a plain re-register. The partial unique index
+        # api_tokens_one_active_per_agent_idx blocks the hijack case — an
+        # unbound token adopting an agent that already has a live device
+        # token (token rotation revokes the old one first, so it passes).
+        if auth.is_device_scoped and auth.agent_id is None:
+            try:
+                bound = await conn.fetchrow(
+                    """
+                    update api_tokens
+                       set agent_id = $2
+                     where id = $1 and agent_id is null
+                    returning agent_id
+                    """,
+                    auth.token_id,
+                    row["id"],
+                )
+            except asyncpg.UniqueViolationError as exc:
+                raise ForbiddenError(
+                    "Agent already has an active device token; revoke it before binding a new one.",
+                    code="device_token_agent_conflict",
+                ) from exc
+            if bound is None:
+                current = await conn.fetchval(
+                    "select agent_id from api_tokens where id = $1",
+                    auth.token_id,
+                )
+                if current != row["id"]:
+                    raise ForbiddenError(
+                        "Device token is bound to a different agent.",
+                        code="device_token_agent_mismatch",
+                    )
+            else:
+                await try_record_account_audit_log(
+                    conn,
+                    account_id=auth.account_id,
+                    actor_type="system",
+                    event_type="api_token.bound",
+                    resource_type="api_token",
+                    resource_id=str(auth.token_id),
+                    summary=f"Device token bound to agent {body.name!r} on first register.",
+                    metadata={"agent_id": str(row["id"]), "agent_name": body.name},
+                )
     agent_id_var.set(row["id"])
 
     return AgentRegisterResponse(agent=_row_to_agent(row), server_time=datetime.now(tz=UTC))
@@ -107,6 +172,12 @@ async def bootstrap(auth: CurrentAgent, pool: PoolDep) -> BootstrapResponse:
     # Local import to avoid a routers<->routers cycle if cameras ever imports
     # from this module; reuses the camera column list + response mapper.
     from upstream_api.routers.cameras import _CAMERA_COLUMNS, _camera_to_response
+
+    # Bound device tokens see only their own agent's slice of the account —
+    # the fleet's other agents/cameras/sessions are not this device's
+    # business. Account-scoped tokens (and unbound device tokens, which
+    # need the full picture exactly once, pre-register) keep the full view.
+    scope_agent: UUID | None = auth.agent_id if auth.is_device_scoped else None
 
     async with pool.acquire() as conn:
         account_row = await conn.fetchrow(
@@ -128,9 +199,11 @@ async def bootstrap(auth: CurrentAgent, pool: PoolDep) -> BootstrapResponse:
             select id, name, status, version, last_seen_at
               from agents
              where account_id = $1
+               and ($2::uuid is null or id = $2)
              order by last_seen_at desc nulls last, created_at desc
             """,
             auth.account_id,
+            scope_agent,
         )
 
         limits = await load_account_limits(conn, auth.account_id)
@@ -156,9 +229,11 @@ async def bootstrap(auth: CurrentAgent, pool: PoolDep) -> BootstrapResponse:
             select {_CAMERA_COLUMNS}
               from cameras
              where account_id = $1 and status <> 'disabled'
+               and ($2::uuid is null or agent_id = $2)
              order by created_at desc
             """,
             auth.account_id,
+            scope_agent,
         )
 
         session_rows = await conn.fetch(
@@ -168,9 +243,11 @@ async def bootstrap(auth: CurrentAgent, pool: PoolDep) -> BootstrapResponse:
                    lim_latency_mode
               from stream_sessions
              where account_id = $1 and state in ('approved', 'streaming')
+               and ($2::uuid is null or agent_id = $2)
              order by created_at desc
             """,
             auth.account_id,
+            scope_agent,
         )
 
     return BootstrapResponse(

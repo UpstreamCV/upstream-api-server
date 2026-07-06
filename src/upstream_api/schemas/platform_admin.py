@@ -267,6 +267,8 @@ class AdminAccountLimits(BaseModel):
     allowed_codecs: list[str]
     monthly_minutes_quota: int
     snapshot_storage_mb: int
+    # Appliance-class override; None = platform default TTL.
+    session_ttl_seconds: int | None
     updated_at: datetime
 
 
@@ -323,6 +325,11 @@ class AdminAccountLimitsUpdate(BaseModel):
     allowed_codecs: list[str] | None = None
     monthly_minutes_quota: int | None = Field(default=None, ge=0)
     snapshot_storage_mb: int | None = Field(default=None, ge=0)
+    # Appliance-class session TTL override (seconds). Omitted = unchanged;
+    # clearing back to the platform default is a manual SQL operation (the
+    # exclude_none PATCH semantics cannot express "set to NULL"). Upper
+    # bound of 10 years keeps a fat-fingered value inside int4 range.
+    session_ttl_seconds: int | None = Field(default=None, ge=1, le=315_360_000)
 
 
 class AdminAccountMember(BaseModel):

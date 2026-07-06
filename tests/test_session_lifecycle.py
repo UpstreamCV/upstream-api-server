@@ -60,6 +60,7 @@ class FakeConn:
                 "allowed_stream_types": ["webcam", "rtsp"],
                 "monthly_minutes_quota": 600,
                 "snapshot_storage_mb": 1024,
+                "session_ttl_seconds": None,
             }
         if "insert into stream_sessions" in query:
             if self.insert_raises is not None:

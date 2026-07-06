@@ -67,6 +67,7 @@ class FakeReliabilityConn:
         self,
         *,
         camera_account_id: UUID | None,
+        camera_agent_id: UUID | None = None,
         session_row: dict[str, Any] | None = None,
         snapshot_row: dict[str, Any] | None = None,
         observation_at: datetime | None = None,
@@ -96,6 +97,7 @@ class FakeReliabilityConn:
         confidence_trend_by_config_rows: list[dict[str, Any]] | None = None,
     ) -> None:
         self.camera_account_id = camera_account_id
+        self.camera_agent_id = camera_agent_id
         self.session_row = session_row
         self.snapshot_row = snapshot_row
         self.observation_at = observation_at
@@ -122,7 +124,7 @@ class FakeReliabilityConn:
         if "from cameras where id" in query:
             if self.camera_account_id is None:
                 return None
-            return {"account_id": self.camera_account_id}
+            return {"account_id": self.camera_account_id, "agent_id": self.camera_agent_id}
 
         # Evaluator fact queries.
         if "from stream_sessions" in query:

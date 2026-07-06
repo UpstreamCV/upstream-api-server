@@ -100,6 +100,7 @@ def _session_row(
     return {
         "id": uuid4(),
         "account_id": account_id,
+        "agent_id": None,
         "state": state,
         "streamid": streamid,
     }

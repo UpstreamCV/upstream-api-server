@@ -4,6 +4,58 @@ Reverse chronological. Newest at top. Every meaningful commit gets an entry foll
 
 ---
 
+## 2026-07-06 - feat(platform): Phase 0 — appliance session TTL + device-scoped tokens
+
+### Summary
+CrowdCount-migration Phase 0 platform prerequisites (see
+`~/Documents/CrowdCount-Upstream-Migration/`). Two capabilities that let a
+24/7 appliance fleet live on the Upstream session/token model. (1)
+**Appliance session TTL** — a per-account `account_limits.session_ttl_seconds`
+override (NULL = platform default) read at session start and baked into both
+the DB `expires_at` and the JWT `exp`, so start-once/heartbeat-forever edge
+clients no longer get killed ~6×/day at the 4h default TTL. Paired with an
+in-process **session-maintenance loop** (expiry sweeper + MediaMTX restart
+reconciler, replica-safe via `pg_try_advisory_xact_lock`, gated by
+`UPSTREAM_SESSION_MAINTENANCE_INTERVAL_SECONDS`; also drivable by external
+cron via `POST /v1/internal/session-maintenance/run`). Expiry enforcement
+defaults on (`sweeper_expiry_mode=enforce`, a no-op on admission since every
+read path already treats `expires_at < now()` as dead); staleness defaults to
+report-only. (2) **Device-scoped API tokens** — a `device` scope binding a
+token to exactly one agent trust-on-first-use at `POST /v1/agents/register`
+(`api_tokens.agent_id`, partial unique index for the anti-hijack rule),
+enforced on every agent-authed write path so one stolen SD card no longer
+compromises the whole fleet. See `docs/device-tokens.md`.
+
+### Files touched
+- `supabase/migrations/20260706120000_appliance_session_ttl.sql` — adds
+  `account_limits.session_ttl_seconds int` (nullable = default).
+- `supabase/migrations/20260706121000_device_scoped_tokens.sql` — adds
+  `api_tokens.agent_id uuid`, its lookup index, and the one-active-bound-
+  token-per-agent partial unique index.
+- `src/upstream_api/services/session_maintenance.py`, `routers/session_maintenance.py`
+  — the maintenance tick (expiry + stale sweep, path reconcile) and its
+  internal trigger endpoint.
+- `src/upstream_api/services/session_lifecycle.py`, `services/limits.py`
+  (`effective_session_ttl_seconds`), `config.py`, `app.py` — TTL override
+  wiring + loop startup.
+- `src/upstream_api/security/deps.py`, `security/api_tokens.py`,
+  `routers/agents.py`, `schemas/api_tokens.py`, `scripts/mint_device_tokens.py`
+  — device-token binding, enforcement helper, minting CLI.
+- Router touch-ups for enforcement: `routers/{cameras,heartbeats,snapshots,stream_sessions,accounts,api_tokens,platform_admin/accounts}.py`.
+
+### Testing/checks
+`make test` → 1242 passed; `ruff check` + `ruff format --check` clean; `mypy src` clean.
+
+### Follow-up TODOs
+- KNOWN: `_sweep_expired` bills a stuck `streaming` session for the full TTL
+  window (`ended_at = expires_at`), so a multi-week appliance TTL over-counts
+  usage for a session that died early (no `runOnNotReady`). De-risked by the
+  fleet running on an unlimited-quota account (see the quota commit); usage
+  metering is still slightly high for such sessions. Fix later by billing to
+  the last session heartbeat.
+- Turn on `sweeper_stale_mode=enforce` after a report-only soak, once the
+  fleet actually sends session-scoped heartbeats.
+
 ## 2026-06-25 - feat(reliability): M2b source health + liveness monitoring
 
 ### Summary

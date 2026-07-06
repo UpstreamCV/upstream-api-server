@@ -20,7 +20,7 @@ from upstream_api.config import Settings, get_settings
 from upstream_api.db.pool import get_pool
 from upstream_api.errors import ForbiddenError, UnauthorizedError
 from upstream_api.observability.context import account_id_var, agent_id_var
-from upstream_api.security.api_tokens import split_token, verify_secret_async
+from upstream_api.security.api_tokens import DEVICE_SCOPE, split_token, verify_secret_async
 from upstream_api.security.shared_secret import verify_shared_secret
 from upstream_api.security.supabase_jwt import SupabaseJwtError, verify_supabase_token
 
@@ -43,6 +43,14 @@ class AgentAuth:
     account_id: UUID
     token_id: UUID
     scopes: tuple[str, ...]
+    # Device-scoped tokens bind to exactly one agents row (trust-on-first-use
+    # at /v1/agents/register). None for account-scoped tokens, and for device
+    # tokens that haven't registered yet.
+    agent_id: UUID | None = None
+
+    @property
+    def is_device_scoped(self) -> bool:
+        return DEVICE_SCOPE in self.scopes
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,7 +90,8 @@ async def current_agent(
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
-            select id, account_id, hash, scopes, expires_at, revoked_at, last_used_at
+            select id, account_id, agent_id, hash, scopes, expires_at, revoked_at,
+                   last_used_at
               from api_tokens
              where prefix = $1
             """,
@@ -110,6 +119,7 @@ async def current_agent(
         account_id=row["account_id"],
         token_id=row["id"],
         scopes=tuple(row["scopes"]),
+        agent_id=row["agent_id"],
     )
     account_id_var.set(auth.account_id)
     return auth
@@ -368,6 +378,69 @@ def require_account_role(
             "Insufficient role for this account.",
             code="forbidden.role",
             details={"required": sorted(allowed), "account_id": str(account_id)},
+        )
+
+
+def require_agent_access(auth: AgentAuth, agent_id: UUID) -> None:
+    """Enforce a device-scoped token's agent binding on one target agent.
+
+    Account-scoped ('agent') tokens pass unconditionally. Device-scoped
+    tokens must (a) already be bound — the bind happens exactly once, at
+    POST /v1/agents/register — and (b) be bound to the agent this request
+    targets. Shared by every agent-authed write path that carries an agent
+    identity (camera register/claim, session start/stop, heartbeats,
+    snapshot upload) so the rule cannot drift between routers.
+    """
+    if not auth.is_device_scoped:
+        return
+    if auth.agent_id is None:
+        raise ForbiddenError(
+            "Device token is not bound to an agent yet; call /v1/agents/register first.",
+            code="device_token_unbound",
+        )
+    if auth.agent_id != agent_id:
+        raise ForbiddenError(
+            "Device token is bound to a different agent.",
+            code="device_token_agent_mismatch",
+        )
+
+
+def require_caller_agent_access(caller: CallerAuth, agent_id: UUID | None) -> None:
+    """`require_agent_access` for dual-auth (CurrentCaller) endpoints.
+
+    Dashboard users and account-scoped agent tokens pass unconditionally.
+    Device-scoped tokens must be bound to exactly the agent that owns the
+    target resource; an unassigned resource (``agent_id is None``) is by
+    definition not theirs. Applied to every mutating CurrentCaller endpoint
+    that resolves to a camera/session (geometry + processing config, camera
+    update, perception stream-token mint, WHEP) so a stolen device token
+    cannot reach across its account's fleet.
+    """
+    if caller.agent is None or not caller.agent.is_device_scoped:
+        return
+    if caller.agent.agent_id is None:
+        raise ForbiddenError(
+            "Device token is not bound to an agent yet; call /v1/agents/register first.",
+            code="device_token_unbound",
+        )
+    if agent_id is None or caller.agent.agent_id != agent_id:
+        raise ForbiddenError(
+            "Device token is bound to a different agent.",
+            code="device_token_agent_mismatch",
+        )
+
+
+def forbid_device_scoped(caller: CallerAuth) -> None:
+    """Deny device-scoped tokens outright on account-wide controls.
+
+    Some CurrentCaller surfaces operate on the whole account (e.g. the
+    processing master switch) where per-agent binding has no meaning — a
+    single appliance must never be able to flip them for the fleet.
+    """
+    if caller.agent is not None and caller.agent.is_device_scoped:
+        raise ForbiddenError(
+            "Account-wide controls are not available to device tokens.",
+            code="device_token_forbidden",
         )
 
 

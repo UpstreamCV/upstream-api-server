@@ -58,7 +58,7 @@ async def list_tokens(
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
-            select id, account_id, name, prefix, last_four, scopes,
+            select id, account_id, name, prefix, last_four, scopes, agent_id,
                    last_used_at, expires_at, revoked_at, created_at
               from api_tokens
              where account_id = $1
@@ -74,6 +74,7 @@ async def list_tokens(
             prefix=r["prefix"],
             last_four=r["last_four"],
             scopes=list(r["scopes"]),
+            agent_id=r["agent_id"],
             last_used_at=r["last_used_at"],
             expires_at=r["expires_at"],
             revoked_at=r["revoked_at"],
@@ -110,7 +111,7 @@ async def create_token(
             insert into api_tokens
               (account_id, name, prefix, hash, last_four, scopes, expires_at, created_by)
             values ($1, $2, $3, $4, $5, $6, $7, $8)
-            returning id, account_id, name, prefix, last_four, scopes,
+            returning id, account_id, name, prefix, last_four, scopes, agent_id,
                       last_used_at, expires_at, revoked_at, created_at
             """,
             body.account_id,
@@ -142,6 +143,7 @@ async def create_token(
         prefix=row["prefix"],
         last_four=row["last_four"],
         scopes=list(row["scopes"]),
+        agent_id=row["agent_id"],
         last_used_at=row["last_used_at"],
         expires_at=row["expires_at"],
         revoked_at=row["revoked_at"],
