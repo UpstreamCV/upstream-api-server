@@ -39,6 +39,7 @@ from upstream_api.security.deps import (
     CurrentIngest,
     PoolDep,
     SettingsDep,
+    require_agent_access,
 )
 from upstream_api.services.storage import create_signed_url, upload_bytes
 from upstream_api.services.stream_validation import load_session_state
@@ -229,6 +230,8 @@ async def upload_snapshot(
     height: Annotated[int | None, Form(ge=1, le=4320)] = None,
 ) -> SnapshotUploadResponse:
     """Agent-token authed upload. Ownership checked against ``cameras``."""
+    # Device-scoped tokens may only upload as their bound agent.
+    require_agent_access(auth, agent_id)
     data = await _read_validated_jpeg(file, settings)
 
     async with pool.acquire() as conn, conn.transaction():

@@ -343,6 +343,7 @@ class QuotaFakeConn:
             "allowed_stream_types": ["webcam", "rtsp"],
             "monthly_minutes_quota": self.quota,
             "snapshot_storage_mb": 1024,
+            "session_ttl_seconds": None,
         }
 
     async def fetchval(self, query: str, *args: Any) -> Any:

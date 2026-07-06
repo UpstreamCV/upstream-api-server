@@ -98,6 +98,7 @@ class FakeConn:
                 "allowed_stream_types": self.allowed_stream_types,
                 "monthly_minutes_quota": 600,
                 "snapshot_storage_mb": 1024,
+                "session_ttl_seconds": None,
             }
         if "select id from cameras" in query:
             if self.existing_camera_id is not None:
@@ -247,6 +248,7 @@ class LimitsFakeConn:
             "allowed_stream_types": ["webcam", "rtsp"],
             "monthly_minutes_quota": 600,
             "snapshot_storage_mb": 1024,
+            "session_ttl_seconds": None,
             "created_at": _NOW,
             "updated_at": _NOW,
         }

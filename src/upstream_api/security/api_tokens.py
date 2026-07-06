@@ -28,16 +28,27 @@ def _random_chars(length: int) -> str:
 
 
 # Scopes a dashboard user is allowed to request when minting a new token.
-# Open vocabulary enforced here (not in the DB). ``events:read`` (Module 6 M6.2)
-# grants an API token read access to the canonical event ledger; ``agent`` is
-# the edge-agent credential and does NOT imply event read access. The
-# ``reliability:*`` scopes (Reliability M1a) gate the Upstream Collector ingest
-# (``reliability:ingest``), issue reads (``reliability:read``), and issue
-# mutations such as resolve (``reliability:write``); each is explicit — none
-# implies another.
+# Open vocabulary enforced here (not in the DB).
+#
+# - "agent": account-wide — may act as any agent in its account. The right
+#   shape for one operator installing on machines they control.
+# - "device": bound to exactly one agent, trust-on-first-use — the first
+#   POST /v1/agents/register locks the token (api_tokens.agent_id) to the
+#   registered agent, and every agent-authed write path then enforces the
+#   binding. The right shape for appliance fleets on customer premises:
+#   compromising one device's storage compromises one device, and
+#   revocation is per-device.
+# - "events:read" (Module 6 M6.2) grants read access to the canonical event
+#   ledger; "agent" does NOT imply it.
+# - "destinations:read"/"destinations:write" (Module 6) gate webhook
+#   destination reads/mutations.
+# - "reliability:ingest"/"reliability:read"/"reliability:write" (Reliability
+#   M1a) gate the Upstream Collector ingest, issue reads, and issue mutations
+#   such as resolve; each is explicit — none implies another.
 ALLOWED_SCOPES: frozenset[str] = frozenset(
     {
         "agent",
+        "device",
         "events:read",
         "destinations:read",
         "destinations:write",
@@ -46,6 +57,9 @@ ALLOWED_SCOPES: frozenset[str] = frozenset(
         "reliability:write",
     }
 )
+
+# Marker scope for the per-agent binding behavior above.
+DEVICE_SCOPE = "device"
 
 
 @dataclass(frozen=True, slots=True)
