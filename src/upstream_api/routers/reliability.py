@@ -33,7 +33,12 @@ from upstream_api.schemas.reliability import (
     ReliabilityFindingsResponse,
     ReliabilitySummaryResponse,
 )
-from upstream_api.security.deps import CurrentCaller, PoolDep, SettingsDep
+from upstream_api.security.deps import (
+    CurrentCaller,
+    PoolDep,
+    SettingsDep,
+    require_caller_agent_access,
+)
 from upstream_api.services.reliability_config_comparison import (
     DEFAULT_MIN_SAMPLES,
     get_config_comparison_summary,
@@ -75,11 +80,16 @@ async def get_reliability_summary(
     scope_account = caller.resolve_account(account_id)
     async with pool.acquire() as conn, conn.transaction():
         owner_row = await conn.fetchrow(
-            "select account_id from cameras where id = $1",
+            "select account_id, agent_id from cameras where id = $1",
             camera_id,
         )
         if owner_row is None or owner_row["account_id"] != scope_account:
             raise NotFoundError("Camera not found.", code="camera_not_found")
+        # Evaluate-on-read persists reliability_findings, so a device-scoped
+        # token must be bound to this camera's agent — the same binding the
+        # mutating camera endpoints enforce. Dashboard users and account-scoped
+        # agent tokens pass unconditionally.
+        require_caller_agent_access(caller, owner_row["agent_id"])
 
         return await get_summary_for_camera(
             conn,
@@ -116,11 +126,14 @@ async def get_reliability_findings(
     scope_account = caller.resolve_account(account_id)
     async with pool.acquire() as conn, conn.transaction():
         owner_row = await conn.fetchrow(
-            "select account_id from cameras where id = $1",
+            "select account_id, agent_id from cameras where id = $1",
             camera_id,
         )
         if owner_row is None or owner_row["account_id"] != scope_account:
             raise NotFoundError("Camera not found.", code="camera_not_found")
+        # Evaluate-on-read persists reliability_findings, so a device-scoped
+        # token must be bound to this camera's agent (see summary above).
+        require_caller_agent_access(caller, owner_row["agent_id"])
 
         return await get_findings_for_camera(
             conn,
