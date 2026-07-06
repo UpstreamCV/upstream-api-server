@@ -56,7 +56,7 @@ class FakeCameraConn:
         if "from cameras where id" in query:
             if self.camera_account_id is None:
                 return None
-            return {"account_id": self.camera_account_id}
+            return {"account_id": self.camera_account_id, "agent_id": None}
         return None
 
 

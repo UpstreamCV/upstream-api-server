@@ -365,6 +365,7 @@ def _token_conn(account: UUID) -> AuditCapturingConn:
                 "prefix": args[2],
                 "last_four": args[4],
                 "scopes": list(args[5]),
+                "agent_id": None,
                 "last_used_at": None,
                 "expires_at": None,
                 "revoked_at": None,
@@ -729,6 +730,7 @@ class SessionRejectConn(AuditCapturingConn):
                     "allowed_stream_types": ["webcam"],
                     "monthly_minutes_quota": 600,
                     "snapshot_storage_mb": 1024,
+                    "session_ttl_seconds": None,
                 },
             ),
         ]

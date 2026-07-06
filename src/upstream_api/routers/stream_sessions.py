@@ -12,6 +12,7 @@ from upstream_api.errors import (
     BadGatewayError,
     BadRequestError,
     ConflictError,
+    ForbiddenError,
     LimitExceeded,
     NotFoundError,
     UnsupportedMediaTypeError,
@@ -28,7 +29,13 @@ from upstream_api.schemas.stream_validations import (
     StreamValidationListResponse,
     StreamValidationResponse,
 )
-from upstream_api.security.deps import CurrentAgent, CurrentCaller, PoolDep, SettingsDep
+from upstream_api.security.deps import (
+    CurrentAgent,
+    CurrentCaller,
+    PoolDep,
+    SettingsDep,
+    require_caller_agent_access,
+)
 from upstream_api.security.streamid import extract_stream_key
 from upstream_api.services.account_audit import try_record_account_audit_log
 from upstream_api.services.http_client import HttpClientDep
@@ -141,6 +148,14 @@ async def start(
     settings: SettingsDep,
     http: HttpClientDep,
 ) -> StreamSessionStartResponse:
+    # A device-scoped token must be bound (register-first) and may only
+    # stream cameras assigned to its bound agent; start_session enforces the
+    # camera↔agent match once it has the camera row in hand.
+    if auth.is_device_scoped and auth.agent_id is None:
+        raise ForbiddenError(
+            "Device token is not bound to an agent yet; call /v1/agents/register first.",
+            code="device_token_unbound",
+        )
     try:
         async with pool.acquire() as conn, conn.transaction():
             result = await start_session(
@@ -156,6 +171,7 @@ async def start(
                     bitrate_kbps=body.requested.bitrate_kbps,
                     latency_mode=body.requested.latency_mode,
                 ),
+                required_agent_id=auth.agent_id if auth.is_device_scoped else None,
             )
     except LimitExceeded as exc:
         # The rejected transaction rolled back, so the audit row needs its
@@ -234,11 +250,17 @@ async def stop(
     settings: SettingsDep,
     http: HttpClientDep,
 ) -> StreamSessionResponse:
+    if auth.is_device_scoped and auth.agent_id is None:
+        raise ForbiddenError(
+            "Device token is not bound to an agent yet; call /v1/agents/register first.",
+            code="device_token_unbound",
+        )
     async with pool.acquire() as conn, conn.transaction():
         row = await stop_session(
             conn,
             account_id=auth.account_id,
             session_id=session_id,
+            required_agent_id=auth.agent_id if auth.is_device_scoped else None,
         )
     # After COMMIT — a rollback must not count the transition.
     row.transition.record()
@@ -432,11 +454,13 @@ async def whep_offer(
     scope_account = caller.resolve_account(account_id)
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            "select account_id, state, streamid from stream_sessions where id = $1",
+            "select account_id, agent_id, state, streamid from stream_sessions where id = $1",
             session_id,
         )
     if row is None or row["account_id"] != scope_account:
         raise NotFoundError("Session not found.", code="session_not_found")
+    # Device-scoped tokens may only play back their own agent's sessions.
+    require_caller_agent_access(caller, row["agent_id"])
     if row["state"] != "streaming":
         raise ConflictError(
             "Session is not currently streaming.",
@@ -514,11 +538,13 @@ async def whep_delete(
     scope_account = caller.resolve_account(account_id)
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            "select account_id, streamid from stream_sessions where id = $1",
+            "select account_id, agent_id, streamid from stream_sessions where id = $1",
             session_id,
         )
     if row is None or row["account_id"] != scope_account:
         raise NotFoundError("Session not found.", code="session_not_found")
+    # Same binding rule as the offer path above.
+    require_caller_agent_access(caller, row["agent_id"])
 
     path = _mediamtx_path_from_streamid(row["streamid"])
     if path is None:

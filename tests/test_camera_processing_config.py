@@ -106,7 +106,7 @@ class FakeProcessingConn:
         if "from cameras where id" in query:
             if self.camera_account_id is None:
                 return None
-            return {"account_id": self.camera_account_id}
+            return {"account_id": self.camera_account_id, "agent_id": None}
         if "insert into camera_processing_configs" in query:
             self.upserts.append(args)
             now = datetime.now(tz=UTC)

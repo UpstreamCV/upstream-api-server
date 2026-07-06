@@ -30,6 +30,11 @@ class AccountLimits:
     allowed_stream_types: frozenset[str]
     monthly_minutes_quota: int
     snapshot_storage_mb: int
+    # Appliance-class override: per-account session TTL in seconds. None means
+    # "use the platform default" (Settings.session_token_ttl_seconds). Large
+    # values (e.g. 30 days) turn every session the account starts into an
+    # appliance-class session for 24/7 start-once edge clients.
+    session_ttl_seconds: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,7 +86,7 @@ async def load_account_limits(conn: asyncpg.Connection, account_id: UUID) -> Acc
         """
         select max_cameras, max_concurrent_sessions, max_fps, max_width, max_height,
                max_bitrate_kbps, allowed_codecs, allowed_stream_types,
-               monthly_minutes_quota, snapshot_storage_mb
+               monthly_minutes_quota, snapshot_storage_mb, session_ttl_seconds
           from account_limits
          where account_id = $1
         """,
@@ -104,6 +109,7 @@ async def load_account_limits(conn: asyncpg.Connection, account_id: UUID) -> Acc
         allowed_stream_types=frozenset(row["allowed_stream_types"]),
         monthly_minutes_quota=row["monthly_minutes_quota"],
         snapshot_storage_mb=row["snapshot_storage_mb"],
+        session_ttl_seconds=row["session_ttl_seconds"],
     )
 
 
@@ -210,6 +216,26 @@ async def check_session_start(
         bitrate_kbps=requested.bitrate_kbps,
         latency_mode=requested.latency_mode,
     )
+
+
+async def effective_session_ttl_seconds(
+    conn: asyncpg.Connection,
+    *,
+    account_id: UUID,
+    default_ttl_seconds: int,
+) -> int:
+    """Resolve the session TTL for one account.
+
+    Appliance-class accounts carry a ``session_ttl_seconds`` override on
+    ``account_limits``; everyone else gets the platform default. A missing
+    limits row falls back to the default too — ``load_account_limits`` has
+    already 404'd earlier in the session-start path if the row is required.
+    """
+    override = await conn.fetchval(
+        "select session_ttl_seconds from account_limits where account_id = $1",
+        account_id,
+    )
+    return int(override) if override is not None else default_ttl_seconds
 
 
 async def check_camera_slot_available(

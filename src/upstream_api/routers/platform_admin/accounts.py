@@ -77,6 +77,7 @@ def _limits_from_row(row: dict[str, Any] | None) -> AdminAccountLimits | None:
         allowed_codecs=list(row["allowed_codecs"]),
         monthly_minutes_quota=row["monthly_minutes_quota"],
         snapshot_storage_mb=row["snapshot_storage_mb"],
+        session_ttl_seconds=row["session_ttl_seconds"],
         updated_at=row["updated_at"],
     )
 
@@ -137,7 +138,8 @@ async def get_account(
             """
             select max_cameras, max_concurrent_sessions, max_fps, max_width,
                    max_height, max_bitrate_kbps, allowed_codecs,
-                   monthly_minutes_quota, snapshot_storage_mb, updated_at
+                   monthly_minutes_quota, snapshot_storage_mb,
+                   session_ttl_seconds, updated_at
               from account_limits
              where account_id = $1
             """,
@@ -361,6 +363,7 @@ async def patch_account_limits(
         "allowed_codecs",
         "monthly_minutes_quota",
         "snapshot_storage_mb",
+        "session_ttl_seconds",
     ]
     async with pool.acquire() as conn, conn.transaction():
         before_row = await conn.fetchrow(

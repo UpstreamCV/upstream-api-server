@@ -14,7 +14,12 @@ from upstream_api.schemas.heartbeats import (
     HeartbeatListResponse,
     HeartbeatRecord,
 )
-from upstream_api.security.deps import CurrentAgent, CurrentCaller, PoolDep
+from upstream_api.security.deps import (
+    CurrentAgent,
+    CurrentCaller,
+    PoolDep,
+    require_agent_access,
+)
 from upstream_api.services.heartbeats import record_batch
 from upstream_api.services.usage import record_event
 
@@ -63,6 +68,8 @@ async def submit_heartbeats(
     account's token) the heartbeats belong to. Cameras and sessions referenced
     in the batch must belong to that agent.
     """
+    # Device-scoped tokens may only report heartbeats as their bound agent.
+    require_agent_access(auth, agent_id)
     async with pool.acquire() as conn, conn.transaction():
         # Validate agent_id ownership before any insert. Cross-account agents
         # return the same 404 as unknown agents to avoid leaking existence.

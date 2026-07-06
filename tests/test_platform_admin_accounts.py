@@ -49,6 +49,7 @@ def _limits_row(**overrides: Any) -> dict[str, Any]:
         "allowed_codecs": ["h264"],
         "monthly_minutes_quota": 600,
         "snapshot_storage_mb": 1024,
+        "session_ttl_seconds": None,
         "updated_at": datetime.now(tz=UTC),
     }
     row.update(overrides)

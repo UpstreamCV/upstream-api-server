@@ -43,6 +43,7 @@ def _limits_row() -> dict[str, Any]:
         "allowed_stream_types": ["webcam", "rtsp"],
         "monthly_minutes_quota": 600,
         "snapshot_storage_mb": 1024,
+        "session_ttl_seconds": None,
     }
 
 

@@ -12,7 +12,7 @@ from upstream_api.schemas.processing_config import (
     ProcessingConfigResponse,
     ProcessingConfigUpdate,
 )
-from upstream_api.security.deps import CurrentCaller, PoolDep
+from upstream_api.security.deps import CurrentCaller, PoolDep, forbid_device_scoped
 from upstream_api.services.processing_config import (
     get_processing_config,
     update_processing_config,
@@ -142,6 +142,9 @@ async def patch_account_processing_config(
     ``GET /v1/account/limits`` (resolve the caller's account, no path
     parameter).
     """
+    # Account-wide control: a single appliance's device token must never be
+    # able to pause processing for the whole fleet.
+    forbid_device_scoped(caller)
     scope_account = caller.resolve_account(account_id)
     async with pool.acquire() as conn, conn.transaction():
         result = await update_processing_config(

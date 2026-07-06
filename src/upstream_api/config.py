@@ -101,6 +101,32 @@ class Settings(BaseSettings):
     webhook_delivery_timeout_seconds: float = 5.0
     webhook_delivery_max_attempts: int = 5
 
+    # M10.1/M10.2 — session maintenance loop (services/session_maintenance.py):
+    # the expiry sweeper (FU-5) + MediaMTX restart reconciler (FU-7) from
+    # design doc 04-restart-and-recovery. 0 disables the in-process loop —
+    # POST /v1/internal/session-maintenance/run still works for external
+    # cron. Unlike the two loops above this one is replica-safe (each tick
+    # is guarded by pg_try_advisory_xact_lock), but single-instance stays
+    # the recommended posture.
+    session_maintenance_interval_seconds: int = 30
+
+    # Expiry clause rollout gate. 'enforce' transitions overdue sessions to
+    # `expired` and deprovisions their MediaMTX paths (evicting any zombie
+    # publisher); 'report' only logs + counts what it would do. Enforce is
+    # the safe default: every read path (token auth, processor eligibility,
+    # validate-stream, mediamtx-auth) ALREADY treats expires_at < now() as
+    # dead, so enforcement changes no admission decision — it makes the DB
+    # state honest and observable.
+    sweeper_expiry_mode: Literal["report", "enforce"] = "enforce"
+
+    # Staleness clause (design doc 04 §2 clause 2): `streaming` sessions with
+    # no session-scoped heartbeat for N minutes get flagged (report) or swept
+    # to ended/swept_stale (enforce). Report-only default per the doc's
+    # rollout rule — enable enforcement after a report-only soak, and only
+    # once the fleet actually sends session-scoped heartbeats.
+    sweeper_stale_mode: Literal["off", "report", "enforce"] = "report"
+    sweeper_stale_minutes: int = 5
+
     # Module 7 M2 — Stripe Checkout + Customer Portal. ALL optional: with
     # stripe_secret_key unset, /v1/billing/* and /v1/webhooks/stripe return
     # 503 billing_not_configured and the dashboard shows its "coming soon"
