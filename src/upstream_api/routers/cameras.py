@@ -42,6 +42,8 @@ from upstream_api.security.deps import (
     CurrentCaller,
     PoolDep,
     require_account_role,
+    require_agent_access,
+    require_caller_agent_access,
 )
 from upstream_api.security.fanout_token import mint_fanout_token
 from upstream_api.services.account_audit import try_record_account_audit_log
@@ -115,6 +117,8 @@ async def register_camera(
     auth: CurrentAgent,
     pool: PoolDep,
 ) -> CameraResponse:
+    # Device-scoped tokens may only attach cameras to their bound agent.
+    require_agent_access(auth, body.agent_id)
     async with pool.acquire() as conn, conn.transaction():
         # Confirm agent belongs to this account.
         agent_row = await conn.fetchrow(
@@ -416,6 +420,8 @@ async def claim_camera(
     409 ``camera_claimed_by_other_agent`` when another agent holds it —
     reassignment is a dashboard/operator decision, not an agent race.
     """
+    # Device-scoped tokens may only claim cameras for their bound agent.
+    require_agent_access(auth, body.agent_id)
     async with pool.acquire() as conn, conn.transaction():
         agent_row = await conn.fetchrow(
             "select account_id from agents where id = $1",
@@ -669,11 +675,13 @@ async def mint_perception_stream_token(
     scope_account = caller.resolve_account(account_id)
     async with pool.acquire() as conn:
         owner_row = await conn.fetchrow(
-            "select account_id from cameras where id = $1",
+            "select account_id, agent_id from cameras where id = $1",
             camera_id,
         )
     if owner_row is None or owner_row["account_id"] != scope_account:
         raise NotFoundError("Camera not found.", code="camera_not_found")
+    # Device-scoped tokens may only mint stream tokens for their own camera.
+    require_caller_agent_access(caller, owner_row["agent_id"])
 
     if caller.user is not None:
         subject = str(caller.user.user_id)
@@ -821,11 +829,13 @@ async def put_geometry_config(
     scope_account = caller.resolve_account(account_id)
     async with pool.acquire() as conn, conn.transaction():
         owner_row = await conn.fetchrow(
-            "select account_id from cameras where id = $1",
+            "select account_id, agent_id from cameras where id = $1",
             camera_id,
         )
         if owner_row is None or owner_row["account_id"] != scope_account:
             raise NotFoundError("Camera not found.", code="camera_not_found")
+        # Device-scoped tokens may only write their own camera's geometry.
+        require_caller_agent_access(caller, owner_row["agent_id"])
 
         record = await upsert_geometry_config(
             conn,
@@ -897,11 +907,13 @@ async def put_processing_config(
     scope_account = caller.resolve_account(account_id)
     async with pool.acquire() as conn, conn.transaction():
         owner_row = await conn.fetchrow(
-            "select account_id from cameras where id = $1",
+            "select account_id, agent_id from cameras where id = $1",
             camera_id,
         )
         if owner_row is None or owner_row["account_id"] != scope_account:
             raise NotFoundError("Camera not found.", code="camera_not_found")
+        # Device-scoped tokens may only write their own camera's config.
+        require_caller_agent_access(caller, owner_row["agent_id"])
 
         record = await upsert_camera_processing_config(
             conn,
@@ -1062,9 +1074,7 @@ async def apply_package_config(
             conn, account_id=scope_account, camera_id=camera_id
         )
         if current.requested is None:
-            raise ConflictError(
-                "No requested package config to apply.", code="no_requested_config"
-            )
+            raise ConflictError("No requested package config to apply.", code="no_requested_config")
         # Idempotent re-stamp of metadata.package_id from the requested config
         # (does not bump the requested revision). The next session picks it up.
         await conn.execute(

@@ -62,6 +62,27 @@ session_start_to_streaming_seconds = Histogram(
     registry=registry,
 )
 
+# M10.1 — session sweeper actions per tick. Actions: expired_approved /
+# expired_streaming (expiry clause enforce), would_expire (expiry report
+# mode), would_sweep_stale (staleness report mode), swept_stale (staleness
+# enforce).
+sweeper_actions_total = Counter(
+    "sweeper_actions_total",
+    "Session-maintenance sweeper actions.",
+    labelnames=("action",),
+    registry=registry,
+)
+
+# M10.2 — MediaMTX path drift observed by the restart reconciler:
+# kind=missing (live session, no MediaMTX path — re-provisioned) and
+# kind=extra (sess_* path with no live session — logged only).
+mediamtx_path_drift = Gauge(
+    "mediamtx_path_drift",
+    "Per-reconcile-tick drift between live sessions and MediaMTX paths.",
+    labelnames=("kind",),
+    registry=registry,
+)
+
 db_pool_size = Gauge(
     "db_pool_size",
     "asyncpg pool size (open connections).",
@@ -89,6 +110,16 @@ def record_transition(frm: str, to: str) -> None:
 
 def observe_time_to_streaming(seconds: float) -> None:
     session_start_to_streaming_seconds.observe(seconds)
+
+
+def record_sweeper_action(action: str, count: int = 1) -> None:
+    if count > 0:
+        sweeper_actions_total.labels(action=action).inc(count)
+
+
+def record_path_drift(*, missing: int, extra: int) -> None:
+    mediamtx_path_drift.labels(kind="missing").set(missing)
+    mediamtx_path_drift.labels(kind="extra").set(extra)
 
 
 @dataclass(frozen=True, slots=True)

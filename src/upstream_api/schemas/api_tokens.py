@@ -20,6 +20,10 @@ class ApiTokenSummary(BaseModel):
     prefix: str
     last_four: str
     scopes: list[str]
+    # Device-scoped tokens: the agent this token is bound to (None until the
+    # trust-on-first-use bind at /v1/agents/register). Always None for
+    # account-scoped tokens.
+    agent_id: UUID | None = None
     last_used_at: datetime | None
     expires_at: datetime | None
     revoked_at: datetime | None

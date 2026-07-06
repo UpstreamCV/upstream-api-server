@@ -48,6 +48,7 @@ from upstream_api.routers import (
     reliability_issues,
     reliability_source_liveness,
     rules,
+    session_maintenance,
     snapshots,
     stream_sessions,
     stripe_webhooks,
@@ -60,6 +61,7 @@ from upstream_api.routers import (
 from upstream_api.services.health_sampler import health_sampler_loop
 from upstream_api.services.http_client import build_http_client
 from upstream_api.services.reliability_source_liveness import source_liveness_sweep_loop
+from upstream_api.services.session_maintenance import session_maintenance_loop
 from upstream_api.services.webhook_delivery import webhook_delivery_loop
 from upstream_api.services.workflow_evaluator import workflow_evaluator_loop
 
@@ -140,12 +142,38 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             interval_seconds=settings.webhook_delivery_interval_seconds,
             batch_size=settings.webhook_delivery_batch_size,
         )
+    # M10.1/M10.2: expiry sweeper + MediaMTX restart reconciler. Gated by
+    # config (0 disables — external cron can drive
+    # POST /v1/internal/session-maintenance/run instead). Replica-safe via
+    # the tick's advisory lock; see services/session_maintenance.py.
+    maintenance_task: asyncio.Task[None] | None = None
+    if settings.session_maintenance_interval_seconds > 0:
+        maintenance_task = asyncio.create_task(
+            session_maintenance_loop(
+                pool,
+                app.state.http_client,
+                settings,
+                settings.session_maintenance_interval_seconds,
+            )
+        )
+        _logger.info(
+            "session_maintenance_loop_started",
+            interval_seconds=settings.session_maintenance_interval_seconds,
+            expiry_mode=settings.sweeper_expiry_mode,
+            stale_mode=settings.sweeper_stale_mode,
+        )
     _logger.info("startup", environment=settings.environment, port=settings.port)
     try:
         yield
     finally:
         _logger.info("shutdown")
-        for task in (evaluator_task, sampler_task, liveness_sweep_task, webhook_delivery_task):
+        for task in (
+            evaluator_task,
+            sampler_task,
+            liveness_sweep_task,
+            webhook_delivery_task,
+            maintenance_task,
+        ):
             if task is not None:
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
@@ -223,9 +251,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(processor.router)  # /v1/internal/processor/* (M8.0)
     app.include_router(models.router)  # /v1/models
     app.include_router(processing.router)  # /v1/processing/packages (P5-F catalog)
-    app.include_router(
-        processing_evidence.router
-    )  # /v1/cameras/{id}/processing/evidence (P5-J)
+    app.include_router(processing_evidence.router)  # /v1/cameras/{id}/processing/evidence (P5-J)
     app.include_router(users.router)
     app.include_router(accounts.router)
     app.include_router(dashboard.router)
@@ -236,6 +262,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(event_destinations.router)  # /v1/event-destinations (Module 6 M6.3)
     app.include_router(event_delivery_attempts.router)  # /v1/event-delivery-attempts (M6.4)
     app.include_router(workflow_evaluator.router)  # /v1/internal/workflow-evaluator (M4)
+    app.include_router(session_maintenance.router)  # /v1/internal/session-maintenance (M10)
     app.include_router(workflows.router)  # /v1/workflows (Workflow Engine M5)
     app.include_router(usage.router)  # /v1/usage (Module 7 M1)
     app.include_router(audit_logs.router)  # /v1/audit-logs (Module 7 M3)

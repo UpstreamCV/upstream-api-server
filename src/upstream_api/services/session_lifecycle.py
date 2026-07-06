@@ -16,7 +16,7 @@ from uuid import UUID, uuid4
 import asyncpg
 
 from upstream_api.config import Settings
-from upstream_api.errors import ConflictError, NotFoundError
+from upstream_api.errors import ConflictError, ForbiddenError, NotFoundError
 from upstream_api.observability.metrics import NO_TRANSITION, TransitionRecord
 from upstream_api.security.session_jwt import (
     SessionLimits,
@@ -24,7 +24,12 @@ from upstream_api.security.session_jwt import (
     mint_session_token,
 )
 from upstream_api.security.streamid import build_streamid, mint_stream_key
-from upstream_api.services.limits import LimitsSnapshot, RequestedStream, check_session_start
+from upstream_api.services.limits import (
+    LimitsSnapshot,
+    RequestedStream,
+    check_session_start,
+    effective_session_ttl_seconds,
+)
 from upstream_api.services.usage import record_event
 
 
@@ -111,10 +116,15 @@ async def start_session(
     account_id: UUID,
     camera_id: UUID,
     requested: RequestedStream,
+    required_agent_id: UUID | None = None,
 ) -> StartSessionResult:
     """Create a new ``approved`` session row and mint its session token.
 
     Caller must own a transaction (use ``async with conn.transaction(): ...``).
+
+    ``required_agent_id`` carries a device-scoped token's agent binding: when
+    set, the camera must be assigned to exactly that agent — a stolen device
+    token cannot start sessions on the account's other cameras.
     """
     camera = await conn.fetchrow(
         """
@@ -131,6 +141,11 @@ async def start_session(
             code="camera_unassigned",
         )
     agent_id: UUID = camera["agent_id"]
+    if required_agent_id is not None and agent_id != required_agent_id:
+        raise ForbiddenError(
+            "Camera is not assigned to this device token's agent.",
+            code="device_token_agent_mismatch",
+        )
 
     # Concurrent-session check on the same camera.
     busy = await conn.fetchval(
@@ -157,7 +172,16 @@ async def start_session(
 
     session_id = uuid4()
     jti = uuid4()
-    expires_at = datetime.now(tz=UTC) + timedelta(seconds=settings.session_token_ttl_seconds)
+    # Appliance-class accounts override the platform TTL (account_limits.
+    # session_ttl_seconds); the effective value is snapshotted into both the
+    # row's expires_at and the JWT exp so a later limits change never touches
+    # an in-flight session.
+    ttl_seconds = await effective_session_ttl_seconds(
+        conn,
+        account_id=account_id,
+        default_ttl_seconds=settings.session_token_ttl_seconds,
+    )
+    expires_at = datetime.now(tz=UTC) + timedelta(seconds=ttl_seconds)
 
     session_token, claims = mint_session_token(
         secret=settings.session_jwt_secret.get_secret_value(),
@@ -172,7 +196,7 @@ async def start_session(
             codec=approved.codec,
             bitrate_kbps=approved.bitrate_kbps,
         ),
-        ttl_seconds=settings.session_token_ttl_seconds,
+        ttl_seconds=ttl_seconds,
         jti=jti,
     )
 
@@ -282,8 +306,13 @@ async def stop_session(
     account_id: UUID,
     session_id: UUID,
     reason: str = "agent_requested",
+    required_agent_id: UUID | None = None,
 ) -> StreamSessionRow:
-    """Idempotent stop: ``approved|streaming`` -> ``ended``. No-op on terminal."""
+    """Idempotent stop: ``approved|streaming`` -> ``ended``. No-op on terminal.
+
+    ``required_agent_id`` mirrors :func:`start_session` — a device-scoped
+    token may only stop sessions belonging to its bound agent.
+    """
     # FOR UPDATE pins the state read here as the state the UPDATE below
     # transitions from: without the row lock, a concurrent approved→streaming
     # commit between this read and the UPDATE would get the transition logged
@@ -302,6 +331,11 @@ async def stop_session(
     )
     if row is None or row["account_id"] != account_id:
         raise NotFoundError("Session not found.", code="session_not_found")
+    if required_agent_id is not None and row["agent_id"] != required_agent_id:
+        raise ForbiddenError(
+            "Session does not belong to this device token's agent.",
+            code="device_token_agent_mismatch",
+        )
 
     if row["state"] in ("approved", "streaming"):
         updated = await conn.fetchrow(
