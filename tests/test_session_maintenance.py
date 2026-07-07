@@ -445,6 +445,92 @@ async def test_expiry_bills_to_expires_at_not_now() -> None:
     assert "ended_at = now()" not in update_sql
 
 
+def _capture_billed(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """Capture the quantity of every ``session_ended`` usage event the sweep
+    records (the usage insert itself is skipped in these fake-conn tests)."""
+    billed: list[float] = []
+
+    async def _fake_record_event(
+        _conn: Any,
+        *,
+        account_id: Any,
+        event_type: str,
+        session_id: Any = None,
+        quantity: float = 1,
+        unit: str = "count",
+        metadata: Any = None,
+    ) -> None:
+        if event_type == "session_ended":
+            billed.append(float(quantity))
+
+    monkeypatch.setattr(
+        "upstream_api.services.session_maintenance.record_event", _fake_record_event
+    )
+    return billed
+
+
+@respx.mock
+async def test_expiry_clamps_billed_duration_to_last_heartbeat(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stream that died mid-TTL but was never swept (staleness in report
+    mode ends nothing early) must be billed only to its last heartbeat, not
+    the whole window up to expires_at — otherwise a multi-day appliance TTL
+    bills days of dead air. ended_at stays expires_at; only the billed
+    quantity is clamped."""
+    now = datetime.now(tz=UTC)
+    started = now - timedelta(days=7)  # opened a week ago
+    expires = now - timedelta(minutes=1)  # TTL just lapsed -> swept this tick
+    last_beat = started + timedelta(hours=1)  # stream died after one hour
+
+    row = _session_row(streaming=True, stream_key="sess_" + "cc" * 8)
+    row["started_at"] = started
+    row["ended_at"] = expires  # the real UPDATE sets ended_at = expires_at
+    row["last_beat"] = last_beat
+
+    conn = FakeConn(expired_rows=[row])
+    _mock_paths_list([])
+    respx.delete(url__regex=rf"^{_MEDIAMTX_API}/v3/config/paths/delete/.*").mock(
+        return_value=httpx.Response(200, json={})
+    )
+    billed = _capture_billed(monkeypatch)
+
+    async with httpx.AsyncClient() as http:
+        await run_session_maintenance(FakePool(conn), http, _settings())
+
+    # Billed the one streamed hour, NOT the 7-day wall-clock session lifetime.
+    assert billed == [pytest.approx(3600.0, abs=1.0)]
+
+
+@respx.mock
+async def test_expiry_without_heartbeat_bills_to_expires_at(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No session-scoped heartbeat at all (the never-streamed edge) falls back
+    to billing ended_at = expires_at — unchanged from the pre-clamp behavior,
+    so a session with no heartbeat is never under-billed to zero."""
+    now = datetime.now(tz=UTC)
+    started = now - timedelta(hours=2)
+    expires = now - timedelta(minutes=1)
+
+    row = _session_row(streaming=True, stream_key="sess_" + "dd" * 8)
+    row["started_at"] = started
+    row["ended_at"] = expires
+    row["last_beat"] = None
+
+    conn = FakeConn(expired_rows=[row])
+    _mock_paths_list([])
+    respx.delete(url__regex=rf"^{_MEDIAMTX_API}/v3/config/paths/delete/.*").mock(
+        return_value=httpx.Response(200, json={})
+    )
+    billed = _capture_billed(monkeypatch)
+
+    async with httpx.AsyncClient() as http:
+        await run_session_maintenance(FakePool(conn), http, _settings())
+
+    assert billed == [pytest.approx((expires - started).total_seconds(), abs=1.0)]
+
+
 @respx.mock
 async def test_stale_enforce_sets_ended_at_to_last_beat() -> None:
     """Never bill dead air: swept-stale ended_at must be the last heartbeat."""
