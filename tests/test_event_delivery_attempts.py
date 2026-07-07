@@ -396,8 +396,10 @@ def test_list_unauthenticated_401() -> None:
 def test_migration_shape_pin() -> None:
     root = Path(__file__).resolve().parents[1]
     sql = (
-        root / "supabase" / "migrations" / "20260621120000_event_delivery_attempts.sql"
-    ).read_text().lower()
+        (root / "supabase" / "migrations" / "20260621120000_event_delivery_attempts.sql")
+        .read_text()
+        .lower()
+    )
     assert "create table event_delivery_attempts" in sql
     assert "status in ('pending', 'delivering', 'delivered', 'failed', 'dead')" in sql
     assert "unique (event_id, destination_id)" in sql

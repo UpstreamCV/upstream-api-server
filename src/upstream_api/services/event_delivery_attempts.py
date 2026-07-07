@@ -52,9 +52,7 @@ def destination_matches_event(
 ) -> bool:
     if event_type_filters and event.event_type not in event_type_filters:
         return False
-    if camera_id_filters and (
-        event.camera_id is None or event.camera_id not in camera_id_filters
-    ):
+    if camera_id_filters and (event.camera_id is None or event.camera_id not in camera_id_filters):
         return False
     return not (
         workflow_id_filters
@@ -146,9 +144,7 @@ returning a.id, a.account_id, a.event_id, a.destination_id, a.attempt_count, a.m
 """
 
 
-async def claim_due_attempts(
-    conn: asyncpg.Connection, *, limit: int
-) -> list[dict[str, Any]]:
+async def claim_due_attempts(conn: asyncpg.Connection, *, limit: int) -> list[dict[str, Any]]:
     """Claim up to ``limit`` due attempts with FOR UPDATE SKIP LOCKED, flipping
     them to 'delivering' and bumping attempt_count. Call inside a transaction so
     the claim commits before the (slow) HTTP send releases the row lock."""

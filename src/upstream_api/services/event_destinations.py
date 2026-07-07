@@ -57,19 +57,13 @@ def validate_webhook_url(url: str) -> str:
         raise BadRequestError("Webhook URL is required.", code="invalid_webhook_url")
     parts = urlsplit(raw)
     if parts.scheme != "https":
-        raise BadRequestError(
-            "Webhook URL must use https://.", code="invalid_webhook_url"
-        )
+        raise BadRequestError("Webhook URL must use https://.", code="invalid_webhook_url")
     host = parts.hostname
     if not host:
-        raise BadRequestError(
-            "Webhook URL must include a host.", code="invalid_webhook_url"
-        )
+        raise BadRequestError("Webhook URL must include a host.", code="invalid_webhook_url")
     lowered = host.lower()
     if lowered in _BLOCKED_HOSTNAMES or lowered.endswith(".localhost"):
-        raise BadRequestError(
-            "Webhook URL host is not allowed.", code="invalid_webhook_url"
-        )
+        raise BadRequestError("Webhook URL host is not allowed.", code="invalid_webhook_url")
     try:
         ip = ipaddress.ip_address(host)
     except ValueError:

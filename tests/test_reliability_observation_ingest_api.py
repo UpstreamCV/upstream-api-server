@@ -145,9 +145,7 @@ def _body(**overrides: Any) -> dict[str, Any]:
 def test_ingest_rejects_token_without_agent_or_ingest_scope() -> None:
     # A token with neither `agent` nor `reliability:ingest` cannot push.
     account = uuid4()
-    r = _client(FakeIngestConn(), _agent_caller(account, ("events:read",))).post(
-        _URL, json=_body()
-    )
+    r = _client(FakeIngestConn(), _agent_caller(account, ("events:read",))).post(_URL, json=_body())
     assert r.status_code == 403
     assert r.json()["error"]["code"] == "forbidden.scope"
 

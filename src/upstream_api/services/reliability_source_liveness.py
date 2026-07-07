@@ -123,25 +123,17 @@ def evaluate_source_health(
     expected, grace = effective_intervals(source)
     is_collector = source.get("source_kind") == "collector"
     last_signal = (
-        source.get("last_collector_heartbeat_at")
-        if is_collector
-        else source.get("last_seen_at")
+        source.get("last_collector_heartbeat_at") if is_collector else source.get("last_seen_at")
     )
 
     if not source.get("liveness_enabled", True):
-        return HealthEvaluation(
-            DISABLED, None, None, last_signal, None, expected, grace
-        )
+        return HealthEvaluation(DISABLED, None, None, last_signal, None, expected, grace)
     if last_signal is None:
-        return HealthEvaluation(
-            UNKNOWN, None, None, None, None, expected, grace
-        )
+        return HealthEvaluation(UNKNOWN, None, None, None, None, expected, grace)
 
     age = (now - last_signal).total_seconds()
     if age <= expected:
-        return HealthEvaluation(
-            HEALTHY, None, None, last_signal, age, expected, grace
-        )
+        return HealthEvaluation(HEALTHY, None, None, last_signal, age, expected, grace)
     if age <= expected + grace:
         return HealthEvaluation(
             DELAYED,
@@ -383,9 +375,7 @@ async def _process_source(
     )
 
 
-async def source_liveness_sweep_loop(
-    pool: asyncpg.Pool, interval_seconds: int, limit: int
-) -> None:
+async def source_liveness_sweep_loop(pool: asyncpg.Pool, interval_seconds: int, limit: int) -> None:
     """In-process loop the app lifespan spawns when
     ``source_liveness_sweep_interval_seconds > 0``. Sleeps FIRST so a
     crash-restart can't hot-loop; a failed tick is logged and the loop keeps

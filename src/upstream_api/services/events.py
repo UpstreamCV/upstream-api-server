@@ -81,9 +81,7 @@ def workflow_run_event_type(status: str, action_result: str | None) -> str:
     return "workflow.finalized"
 
 
-def workflow_run_dedupe_key(
-    workflow_run_id: UUID, status: str, action_result: str | None
-) -> str:
+def workflow_run_dedupe_key(workflow_run_id: UUID, status: str, action_result: str | None) -> str:
     """Stable idempotency key for a run finalization. A run is finalized once
     with a deterministic (status, action_result), so re-finalizing produces the
     same key and is absorbed by ``ON CONFLICT (account_id, dedupe_key)``."""
