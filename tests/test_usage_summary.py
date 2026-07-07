@@ -344,6 +344,7 @@ class QuotaFakeConn:
             "monthly_minutes_quota": self.quota,
             "snapshot_storage_mb": 1024,
             "session_ttl_seconds": None,
+            "shared_inference_enabled": False,
         }
 
     async def fetchval(self, query: str, *args: Any) -> Any:

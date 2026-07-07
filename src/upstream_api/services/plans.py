@@ -74,9 +74,32 @@ PLAN_LIMITS: dict[str, PlanLimits] = {
         monthly_minutes_quota=15000,
         snapshot_storage_mb=10240,
     ),
+    # Comped fleet plan for the CrowdCount 24/7 counter fleet. NOT in
+    # PAID_PLAN_KEYS — it is applied by admin/ops, never sold through Stripe
+    # Checkout. 250 camera slots for the ~100-counter target with headroom.
+    # monthly_minutes_quota is account-wide: 250 cameras x 50,000 min/mo each =
+    # 12,500,000, which covers a fully-24/7 fleet (250 x ~43,200 = 10.8M/mo)
+    # with room to spare. Snapshot storage is left "unlimited" (int32-max
+    # sentinel). session_ttl_seconds and shared_inference_enabled are
+    # per-account settings this plan mapping does NOT overwrite (see
+    # _APPLY_PLAN_LIMITS_SQL), so the appliance TTL and shared-inference gate
+    # survive a plan (re)apply.
+    "crowdcount": PlanLimits(
+        max_cameras=250,
+        max_concurrent_sessions=250,
+        max_fps=60,
+        max_width=3840,
+        max_height=2160,
+        max_bitrate_kbps=12000,
+        allowed_codecs=("h264", "h265"),
+        allowed_stream_types=("webcam", "rtsp"),
+        monthly_minutes_quota=12500000,  # 250 cams x 50,000 min/mo
+        snapshot_storage_mb=2147483647,  # int32-max = "unlimited"
+    ),
 }
 
-# Plans purchasable through Checkout ('free' is the downgrade target only).
+# Plans purchasable through Checkout ('free' is the downgrade target only;
+# 'crowdcount' is a comped fleet plan applied by admin, never sold).
 PAID_PLAN_KEYS: tuple[str, ...] = ("starter", "pro")
 
 

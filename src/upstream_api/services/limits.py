@@ -35,6 +35,10 @@ class AccountLimits:
     # values (e.g. 30 days) turn every session the account starts into an
     # appliance-class session for 24/7 start-once edge clients.
     session_ttl_seconds: int | None = None
+    # Entitlement for execution_mode = shared_inference on camera processing
+    # configs. False = the account may only use per_session (per-worker
+    # in-process models); True unlocks the shared per-GPU inference sidecar.
+    shared_inference_enabled: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,7 +90,8 @@ async def load_account_limits(conn: asyncpg.Connection, account_id: UUID) -> Acc
         """
         select max_cameras, max_concurrent_sessions, max_fps, max_width, max_height,
                max_bitrate_kbps, allowed_codecs, allowed_stream_types,
-               monthly_minutes_quota, snapshot_storage_mb, session_ttl_seconds
+               monthly_minutes_quota, snapshot_storage_mb, session_ttl_seconds,
+               shared_inference_enabled
           from account_limits
          where account_id = $1
         """,
@@ -110,6 +115,7 @@ async def load_account_limits(conn: asyncpg.Connection, account_id: UUID) -> Acc
         monthly_minutes_quota=row["monthly_minutes_quota"],
         snapshot_storage_mb=row["snapshot_storage_mb"],
         session_ttl_seconds=row["session_ttl_seconds"],
+        shared_inference_enabled=row["shared_inference_enabled"],
     )
 
 
@@ -129,6 +135,23 @@ def check_stream_type_allowed(limits: AccountLimits, source_type: str | None) ->
                 "requested": source_type,
                 "allowed": sorted(limits.allowed_stream_types),
             },
+        )
+
+
+def check_execution_mode_allowed(limits: AccountLimits, execution_mode: str) -> None:
+    """Gate ``execution_mode = 'shared_inference'`` behind the per-account
+    entitlement.
+
+    ``per_session`` is always allowed; ``shared_inference`` — the shared
+    per-GPU inference sidecar — requires ``shared_inference_enabled`` on the
+    account's limits. Enforced here rather than in the config schema because a
+    pydantic validator has no DB access to read the account's entitlement.
+    """
+    if execution_mode == "shared_inference" and not limits.shared_inference_enabled:
+        raise ForbiddenError(
+            "Shared-inference execution mode is not enabled for this account.",
+            code="shared_inference_not_enabled",
+            details={"execution_mode": execution_mode},
         )
 
 

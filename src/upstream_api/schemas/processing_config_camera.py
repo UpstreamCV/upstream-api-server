@@ -49,6 +49,13 @@ class CameraProcessingConfig(BaseModel):
     tracker: str | None = Field(default=None, max_length=64)
     confidence_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
     processing_fps: int | None = Field(default=None, ge=1, le=30)
+    # per_session = the camera's worker runs its own in-process model;
+    # shared_inference = it draws detections from the shared per-GPU inference
+    # sidecar (mandatory at fleet scale). STRUCTURAL only here — the
+    # account-entitlement gate on shared_inference is enforced in the router
+    # (a pydantic validator has no DB access). The default keeps pre-existing
+    # stored configs (which carry no execution_mode key) valid on read.
+    execution_mode: Literal["per_session", "shared_inference"] = "per_session"
 
 
 class CameraProcessingConfigUpdateRequest(BaseModel):
