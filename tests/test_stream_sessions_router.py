@@ -92,6 +92,7 @@ class FakeConn:
                 "monthly_minutes_quota": 600,
                 "snapshot_storage_mb": 1024,
                 "session_ttl_seconds": None,
+                "shared_inference_enabled": False,
             }
         if "insert into stream_sessions" in query:
             # Override the generated session_id with our stable one so the

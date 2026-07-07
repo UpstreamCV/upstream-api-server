@@ -652,6 +652,7 @@ def test_bootstrap_scopes_queries_to_bound_agent() -> None:
                     "monthly_minutes_quota": 600,
                     "snapshot_storage_mb": 1024,
                     "session_ttl_seconds": None,
+                    "shared_inference_enabled": False,
                 }
             if "camera_count" in query:
                 return {

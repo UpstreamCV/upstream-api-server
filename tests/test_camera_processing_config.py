@@ -81,9 +81,12 @@ class FakeProcessingConn:
         *,
         camera_account_id: UUID | None,
         row: dict[str, Any] | None = None,
+        shared_inference_enabled: bool = False,
     ) -> None:
         self.camera_account_id = camera_account_id
         self.row = row
+        # Backs the account_limits load the PUT does to gate execution_mode.
+        self.shared_inference_enabled = shared_inference_enabled
         self.select_queries: list[tuple[Any, ...]] = []
         self.upserts: list[tuple[Any, ...]] = []
         # Package-assignment v1: records the cameras.metadata package stamp
@@ -107,6 +110,22 @@ class FakeProcessingConn:
             if self.camera_account_id is None:
                 return None
             return {"account_id": self.camera_account_id, "agent_id": None}
+        if "from account_limits" in query:
+            # The execution_mode gate reads the account's limits row.
+            return {
+                "max_cameras": 250,
+                "max_concurrent_sessions": 250,
+                "max_fps": 60,
+                "max_width": 3840,
+                "max_height": 2160,
+                "max_bitrate_kbps": 12000,
+                "allowed_codecs": ["h264", "h265"],
+                "allowed_stream_types": ["webcam", "rtsp"],
+                "monthly_minutes_quota": 2147483647,
+                "snapshot_storage_mb": 2147483647,
+                "session_ttl_seconds": 604800,
+                "shared_inference_enabled": self.shared_inference_enabled,
+            }
         if "insert into camera_processing_configs" in query:
             self.upserts.append(args)
             now = datetime.now(tz=UTC)
@@ -457,3 +476,70 @@ def test_models_catalog_exposes_package_ids() -> None:
     assert by_key["trafficcamnet_v1"].package_id == "deepstream.analytics_probe.v0"
     assert by_key["mock_detect_v0"].package_id == "mock.detect.v0"
     assert get_model("yolox_s_v1") is not None
+
+
+# ===========================================================================
+# execution_mode — shared_inference is gated by the account entitlement.
+#
+# per_session is always allowed; shared_inference requires
+# account_limits.shared_inference_enabled. The gate is enforced in the router
+# (the schema can only validate the value structurally), so it surfaces as a
+# 403 shared_inference_not_enabled, not a body 422.
+# ===========================================================================
+
+
+def test_put_default_execution_mode_is_per_session() -> None:
+    # A config that omits execution_mode stores per_session (backward-compat
+    # with pre-execution_mode rows) and needs no entitlement.
+    account, camera = uuid4(), uuid4()
+    conn = FakeProcessingConn(camera_account_id=account, row=None)
+    r = _caller_client(conn, account_id=account).put(
+        _PATH.format(camera_id=camera), json={"config": _config()}
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["processing_config"]["config"]["execution_mode"] == "per_session"
+
+
+def test_put_per_session_accepted_without_entitlement() -> None:
+    account, camera = uuid4(), uuid4()
+    conn = FakeProcessingConn(camera_account_id=account, row=None, shared_inference_enabled=False)
+    r = _caller_client(conn, account_id=account).put(
+        _PATH.format(camera_id=camera),
+        json={"config": _config(execution_mode="per_session")},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["processing_config"]["config"]["execution_mode"] == "per_session"
+
+
+def test_put_shared_inference_rejected_without_entitlement() -> None:
+    account, camera = uuid4(), uuid4()
+    conn = FakeProcessingConn(camera_account_id=account, shared_inference_enabled=False)
+    r = _caller_client(conn, account_id=account).put(
+        _PATH.format(camera_id=camera),
+        json={"config": _config(execution_mode="shared_inference")},
+    )
+    assert r.status_code == 403
+    assert r.json()["error"]["code"] == "shared_inference_not_enabled"
+    # Rejected before the write.
+    assert conn.upserts == []
+
+
+def test_put_shared_inference_accepted_with_entitlement() -> None:
+    account, camera = uuid4(), uuid4()
+    conn = FakeProcessingConn(camera_account_id=account, row=None, shared_inference_enabled=True)
+    r = _caller_client(conn, account_id=account).put(
+        _PATH.format(camera_id=camera),
+        json={"config": _config(execution_mode="shared_inference")},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["processing_config"]["config"]["execution_mode"] == "shared_inference"
+    assert len(conn.upserts) == 1
+
+
+def test_put_invalid_execution_mode_rejected() -> None:
+    # Even with the entitlement, an unknown mode is a structural 422, no write.
+    account, camera = uuid4(), uuid4()
+    conn = FakeProcessingConn(camera_account_id=account, shared_inference_enabled=True)
+    r = _put_bad(conn, account, camera, _config(execution_mode="turbo"))
+    assert r.status_code == 422
+    assert conn.upserts == []

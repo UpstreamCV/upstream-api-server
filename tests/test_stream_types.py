@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 
 from upstream_api.app import create_app
 from upstream_api.db.pool import get_pool
-from upstream_api.errors import LimitExceeded
+from upstream_api.errors import ForbiddenError, LimitExceeded
 from upstream_api.security.deps import (
     AgentAuth,
     CallerAuth,
@@ -19,7 +19,11 @@ from upstream_api.security.deps import (
     current_agent,
     current_caller,
 )
-from upstream_api.services.limits import AccountLimits, check_stream_type_allowed
+from upstream_api.services.limits import (
+    AccountLimits,
+    check_execution_mode_allowed,
+    check_stream_type_allowed,
+)
 
 ACCOUNT_ID = uuid4()
 AGENT_ID = uuid4()
@@ -27,7 +31,11 @@ AGENT_ID = uuid4()
 _NOW = datetime.now(tz=UTC)
 
 
-def _limits(allowed_stream_types: tuple[str, ...] = ("webcam", "rtsp")) -> AccountLimits:
+def _limits(
+    allowed_stream_types: tuple[str, ...] = ("webcam", "rtsp"),
+    *,
+    shared_inference_enabled: bool = False,
+) -> AccountLimits:
     return AccountLimits(
         max_cameras=5,
         max_concurrent_sessions=5,
@@ -39,6 +47,7 @@ def _limits(allowed_stream_types: tuple[str, ...] = ("webcam", "rtsp")) -> Accou
         allowed_stream_types=frozenset(allowed_stream_types),
         monthly_minutes_quota=600,
         snapshot_storage_mb=1024,
+        shared_inference_enabled=shared_inference_enabled,
     )
 
 
@@ -57,6 +66,29 @@ def test_stream_type_check_is_case_insensitive() -> None:
 
 def test_stream_type_check_default_allows_none() -> None:
     check_stream_type_allowed(_limits(("rtsp",)), None)  # no raise
+
+
+# ----------------------------------------------------------------------------
+# Unit: check_execution_mode_allowed
+# ----------------------------------------------------------------------------
+
+
+def test_execution_mode_per_session_always_allowed() -> None:
+    # per_session needs no entitlement, regardless of the gate.
+    check_execution_mode_allowed(_limits(shared_inference_enabled=False), "per_session")
+    check_execution_mode_allowed(_limits(shared_inference_enabled=True), "per_session")
+
+
+def test_execution_mode_shared_inference_requires_entitlement() -> None:
+    with pytest.raises(ForbiddenError) as exc:
+        check_execution_mode_allowed(_limits(shared_inference_enabled=False), "shared_inference")
+    assert exc.value.code == "shared_inference_not_enabled"
+
+
+def test_execution_mode_shared_inference_allowed_when_entitled() -> None:
+    check_execution_mode_allowed(
+        _limits(shared_inference_enabled=True), "shared_inference"
+    )  # no raise
 
 
 def test_stream_type_check_rejects_unlisted_type() -> None:
@@ -99,6 +131,7 @@ class FakeConn:
                 "monthly_minutes_quota": 600,
                 "snapshot_storage_mb": 1024,
                 "session_ttl_seconds": None,
+                "shared_inference_enabled": False,
             }
         if "select id from cameras" in query:
             if self.existing_camera_id is not None:
@@ -249,6 +282,7 @@ class LimitsFakeConn:
             "monthly_minutes_quota": 600,
             "snapshot_storage_mb": 1024,
             "session_ttl_seconds": None,
+            "shared_inference_enabled": False,
             "created_at": _NOW,
             "updated_at": _NOW,
         }

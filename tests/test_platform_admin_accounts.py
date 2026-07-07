@@ -50,6 +50,7 @@ def _limits_row(**overrides: Any) -> dict[str, Any]:
         "monthly_minutes_quota": 600,
         "snapshot_storage_mb": 1024,
         "session_ttl_seconds": None,
+        "shared_inference_enabled": False,
         "updated_at": datetime.now(tz=UTC),
     }
     row.update(overrides)
