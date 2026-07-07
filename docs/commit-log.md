@@ -4,6 +4,42 @@ Reverse chronological. Newest at top. Every meaningful commit gets an entry foll
 
 ---
 
+## 2026-07-07 - fix(ci): env-coupled tests + local CI parity (root-cause the red pushes)
+
+### Summary
+Two tests passed off a developer's local `.env` but failed in CI (which sets
+its own throwaway secrets), so every push went red on a *different* failure
+than the last. Root causes fixed, plus tooling so it can't recur silently:
+
+1. `routers/cameras.py::mint_perception_stream_token` read settings via a
+   direct `get_settings()` call instead of the `SettingsDep` dependency — so
+   `dependency_overrides[get_settings]` was ignored and the handler saw the
+   real env. In CI (no fanout secret) it 503'd before the device-token check,
+   failing `test_perception_stream_token_rejects_mismatched_device_token`
+   (expected 403). Now takes `settings: SettingsDep`; runtime behavior in prod
+   is identical, but it's overridable in tests. No other prod change.
+2. `test_session_maintenance.py::_internal_client` inherited the ambient
+   processor secret; the test hardcoded `"test-processor"` which mismatched
+   CI's `ci-processor` → 401. Now pins `processor_webhook_secret` in the test
+   override so it's env-independent.
+3. `Makefile`: `typecheck` ran `mypy src` but CI runs `mypy src tests` — local
+   type checks silently skipped the test tree (how the earlier test-file mypy
+   errors slipped through). Fixed to `mypy src tests`, and added a `make ci`
+   target that runs the full gate under CI's exact env block, so `make ci`
+   green == CI green.
+4. `.pre-commit-config.yaml`: local ruff format+check hooks (same version as
+   uv.lock/CI) so unformatted code can't be committed.
+
+### Testing/checks
+`make ci` clean: ruff + `mypy src tests` + full pytest **under CI env** →
+1588 passed. The two previously-failing tests verified green with
+`UPSTREAM_PROCESSOR_WEBHOOK_SECRET=ci-processor` and an empty fanout secret.
+
+### Follow-up TODOs
+- `routers/billing.py` and `routers/agents.py` still call `get_settings()`
+  directly (same anti-pattern, not currently failing) — migrate to
+  `SettingsDep` when touched.
+
 ## 2026-07-07 - chore(ci): clear pre-existing ruff-format + mypy debt on main
 
 ### Summary
