@@ -14,6 +14,7 @@ import httpx
 import pytest
 import respx
 from fastapi.testclient import TestClient
+from pydantic import SecretStr
 
 from upstream_api.app import create_app
 from upstream_api.config import get_settings
@@ -581,7 +582,9 @@ async def test_sweep_failure_makes_no_mediamtx_calls() -> None:
 def _internal_client(conn: FakeConn) -> TestClient:
     app = create_app()
     app.dependency_overrides[get_pool] = lambda: FakePool(conn)
-    app.dependency_overrides[get_settings] = lambda: _settings()
+    app.dependency_overrides[get_settings] = lambda: _settings(
+        processor_webhook_secret=SecretStr("test-processor")
+    )
     return TestClient(app)
 
 
