@@ -122,7 +122,9 @@ def _requested_meta(package_id: str = _IOU, revision: int = 1) -> dict[str, Any]
     }
 
 
-def _status(package_id: str, *, status: str = "processing", error_code: str | None = None) -> dict:
+def _status(
+    package_id: str, *, status: str = "processing", error_code: str | None = None
+) -> dict[str, Any]:
     return {
         "package_id": package_id,
         "status": status,

@@ -224,9 +224,7 @@ def test_list_account_isolation() -> None:
 
 def test_list_empty_account_returns_empty() -> None:
     account = uuid4()
-    r = _client(FakeConn([]), _user_caller(account)).get(
-        _PATH, params={"account_id": str(account)}
-    )
+    r = _client(FakeConn([]), _user_caller(account)).get(_PATH, params={"account_id": str(account)})
     assert r.status_code == 200, r.text
     assert r.json() == {"items": [], "next_before_seq": None}
 
@@ -242,16 +240,12 @@ def test_list_limit_and_before_seq_pagination() -> None:
     assert [e["seq"] for e in page1["items"]] == [5, 4]
     assert page1["next_before_seq"] == 4
     # Second page via before_seq: strictly older, no overlap with page 1.
-    r2 = client.get(
-        _PATH, params={"account_id": str(account), "limit": 2, "before_seq": 4}
-    )
+    r2 = client.get(_PATH, params={"account_id": str(account), "limit": 2, "before_seq": 4})
     page2 = r2.json()
     assert [e["seq"] for e in page2["items"]] == [3, 2]
     assert page2["next_before_seq"] == 2
     # Final page: not full -> cursor null, no duplicates across pages.
-    r3 = client.get(
-        _PATH, params={"account_id": str(account), "limit": 2, "before_seq": 2}
-    )
+    r3 = client.get(_PATH, params={"account_id": str(account), "limit": 2, "before_seq": 2})
     page3 = r3.json()
     assert [e["seq"] for e in page3["items"]] == [1]
     assert page3["next_before_seq"] is None

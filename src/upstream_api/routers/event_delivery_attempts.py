@@ -100,9 +100,7 @@ async def list_attempts_endpoint(
     )
 
 
-@router.get(
-    "/v1/events/{event_id}/delivery-attempts", response_model=DeliveryAttemptListResponse
-)
+@router.get("/v1/events/{event_id}/delivery-attempts", response_model=DeliveryAttemptListResponse)
 async def list_event_attempts_endpoint(
     event_id: UUID,
     caller: CurrentCaller,
