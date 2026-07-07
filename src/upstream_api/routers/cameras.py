@@ -8,7 +8,6 @@ from uuid import UUID
 
 from fastapi import APIRouter, Query
 
-from upstream_api.config import get_settings
 from upstream_api.errors import ApiError, ConflictError, ForbiddenError, NotFoundError
 from upstream_api.schemas.cameras import (
     CameraClaimRequest,
@@ -41,6 +40,7 @@ from upstream_api.security.deps import (
     CurrentAgent,
     CurrentCaller,
     PoolDep,
+    SettingsDep,
     require_account_role,
     require_agent_access,
     require_caller_agent_access,
@@ -641,6 +641,7 @@ async def mint_perception_stream_token(
     camera_id: UUID,
     caller: CurrentCaller,
     pool: PoolDep,
+    settings: SettingsDep,
     account_id: Annotated[UUID | None, Query()] = None,
 ) -> PerceptionStreamTokenResponse:
     """Mint a short-lived token for the perception-fanout WS hot path.
@@ -659,7 +660,6 @@ async def mint_perception_stream_token(
     the dashboard then stays on its Realtime + polling fallback. The
     token is returned once and never logged.
     """
-    settings = get_settings()
     # An empty-string env var yields SecretStr("") (not None), and the sidecar
     # fail-louds on the same empty value — treat empty as unconfigured here too
     # so the operator gets the clean 503 instead of unverifiable tokens.
