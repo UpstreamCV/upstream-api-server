@@ -51,9 +51,7 @@ _NOW = datetime(2026, 6, 14, 12, 0, 0, tzinfo=UTC)
         ("weird", "huh", "workflow.finalized"),
     ],
 )
-def test_workflow_run_event_type(
-    status: str, action_result: str | None, expected: str
-) -> None:
+def test_workflow_run_event_type(status: str, action_result: str | None, expected: str) -> None:
     assert workflow_run_event_type(status, action_result) == expected
 
 
@@ -146,12 +144,20 @@ async def test_duplicate_dedupe_key_does_not_insert_second_event() -> None:
     account, run = uuid4(), uuid4()
     key = f"workflow_run:{run}:completed:alert_created"
     first = await insert_event(
-        conn, account_id=account, event_type="alert.created", source="rule",
-        dedupe_key=key, occurred_at=_NOW,
+        conn,
+        account_id=account,
+        event_type="alert.created",
+        source="rule",
+        dedupe_key=key,
+        occurred_at=_NOW,
     )
     second = await insert_event(
-        conn, account_id=account, event_type="alert.created", source="rule",
-        dedupe_key=key, occurred_at=_NOW,
+        conn,
+        account_id=account,
+        event_type="alert.created",
+        source="rule",
+        dedupe_key=key,
+        occurred_at=_NOW,
     )
     assert first is not None
     assert second is None  # ON CONFLICT DO NOTHING -> no row returned
@@ -163,12 +169,20 @@ async def test_same_dedupe_key_different_account_is_not_a_conflict() -> None:
     run = uuid4()
     key = f"workflow_run:{run}:completed:alert_created"
     a = await insert_event(
-        conn, account_id=uuid4(), event_type="alert.created", source="rule",
-        dedupe_key=key, occurred_at=_NOW,
+        conn,
+        account_id=uuid4(),
+        event_type="alert.created",
+        source="rule",
+        dedupe_key=key,
+        occurred_at=_NOW,
     )
     b = await insert_event(
-        conn, account_id=uuid4(), event_type="alert.created", source="rule",
-        dedupe_key=key, occurred_at=_NOW,
+        conn,
+        account_id=uuid4(),
+        event_type="alert.created",
+        source="rule",
+        dedupe_key=key,
+        occurred_at=_NOW,
     )
     assert a is not None and b is not None
     assert len(conn.inserts) == 2
@@ -177,8 +191,12 @@ async def test_same_dedupe_key_different_account_is_not_a_conflict() -> None:
 async def test_payload_and_evidence_default_to_empty_objects() -> None:
     conn = FakeEventConn()
     await insert_event(
-        conn, account_id=uuid4(), event_type="alert.created", source="rule",
-        dedupe_key="k1", occurred_at=_NOW,
+        conn,
+        account_id=uuid4(),
+        event_type="alert.created",
+        source="rule",
+        dedupe_key="k1",
+        occurred_at=_NOW,
     )
     args = conn.inserts[0]
     assert args[14] == "{}"  # payload
@@ -189,8 +207,12 @@ async def test_payload_and_evidence_default_to_empty_objects() -> None:
 async def test_secret_keys_are_stripped_from_payload_and_evidence() -> None:
     conn = FakeEventConn()
     row = await insert_event(
-        conn, account_id=uuid4(), event_type="alert.created", source="rule",
-        dedupe_key="k1", occurred_at=_NOW,
+        conn,
+        account_id=uuid4(),
+        event_type="alert.created",
+        source="rule",
+        dedupe_key="k1",
+        occurred_at=_NOW,
         payload={"api_token": "ups_secret", "zone_id": "z-1"},
         evidence={"password": "hunter2", "track_id": "7"},
     )
@@ -284,8 +306,12 @@ async def test_event_is_rolled_back_with_the_outer_transaction() -> None:
     with pytest.raises(RuntimeError):
         async with conn.transaction():
             await insert_event(
-                conn, account_id=uuid4(), event_type="alert.created", source="rule",
-                dedupe_key="k1", occurred_at=_NOW,
+                conn,
+                account_id=uuid4(),
+                event_type="alert.created",
+                source="rule",
+                dedupe_key="k1",
+                occurred_at=_NOW,
             )
             assert conn.committed == []  # not committed yet
             raise RuntimeError("producer failed after the event insert")
@@ -298,8 +324,12 @@ async def test_event_commits_with_a_clean_transaction() -> None:
     conn = TxnConn()
     async with conn.transaction():
         await insert_event(
-            conn, account_id=uuid4(), event_type="alert.created", source="rule",
-            dedupe_key="k1", occurred_at=_NOW,
+            conn,
+            account_id=uuid4(),
+            event_type="alert.created",
+            source="rule",
+            dedupe_key="k1",
+            occurred_at=_NOW,
         )
     assert len(conn.committed) == 1
 
@@ -423,7 +453,7 @@ async def test_event_emission_failure_never_breaks_finalization() -> None:
 
     class RaisingConn(FakeFinalizeConn):
         async def fetchrow(self, query: str, *args: Any) -> dict[str, Any] | None:
-            raise RuntimeError("relation \"events\" does not exist")
+            raise RuntimeError('relation "events" does not exist')
 
     conn = RaisingConn()
     await finalize_workflow_run(

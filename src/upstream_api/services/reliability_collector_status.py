@@ -201,9 +201,7 @@ async def get_collector_status(
         if r["health_status"] in health_counts:
             health_counts[r["health_status"]] = _int(r["n"])
 
-    open_by_key = {
-        r["external_camera_key"]: _int(r["n"]) for r in open_by_key_rows
-    }
+    open_by_key = {r["external_camera_key"]: _int(r["n"]) for r in open_by_key_rows}
 
     sources = [
         {

@@ -139,13 +139,9 @@ async def get_destination_endpoint(
 ) -> EventDestination:
     scope_account = _resolve_for_read(caller, account_id)
     async with pool.acquire() as conn:
-        dest = await get_destination(
-            conn, account_id=scope_account, destination_id=destination_id
-        )
+        dest = await get_destination(conn, account_id=scope_account, destination_id=destination_id)
     if dest is None:
-        raise NotFoundError(
-            "Event destination not found.", code="event_destination_not_found"
-        )
+        raise NotFoundError("Event destination not found.", code="event_destination_not_found")
     return dest
 
 
@@ -164,9 +160,7 @@ async def update_destination_endpoint(
             conn, account_id=scope_account, destination_id=destination_id, patch=body
         )
         if dest is None:
-            raise NotFoundError(
-                "Event destination not found.", code="event_destination_not_found"
-            )
+            raise NotFoundError("Event destination not found.", code="event_destination_not_found")
         await try_record_account_audit_log(
             conn,
             account_id=scope_account,
@@ -198,9 +192,7 @@ async def delete_destination_endpoint(
             conn, account_id=scope_account, destination_id=destination_id
         )
         if not deleted:
-            raise NotFoundError(
-                "Event destination not found.", code="event_destination_not_found"
-            )
+            raise NotFoundError("Event destination not found.", code="event_destination_not_found")
         await try_record_account_audit_log(
             conn,
             account_id=scope_account,

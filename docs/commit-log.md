@@ -4,6 +4,22 @@ Reverse chronological. Newest at top. Every meaningful commit gets an entry foll
 
 ---
 
+## 2026-07-07 - chore(ci): clear pre-existing ruff-format + mypy debt on main
+
+### Summary
+`main` CI was red on `ruff format --check` (17 files) and would then have
+failed `mypy src tests` (6 errors) — all in pre-existing events/reliability/
+processing files, none from Phase 0. These surfaced under the pinned ruff
+0.15.12 / mypy (version drift from when those files were written). No logic
+changes: `ruff format src tests` reflow only; the 6 mypy fixes are type-level
+— removed 4 unused `# type: ignore` comments, typed a string-sentinel default
+as `dict | Literal["__default__"] | None` (dropping its now-unused assignment
+ignore), and parameterized a bare `-> dict` return as `-> dict[str, Any]`.
+
+### Testing/checks
+`ruff check` + `ruff format --check` + `mypy src tests` all clean; the 4
+touched test files pass (63). Full suite unchanged (type/format-only edits).
+
 ## 2026-07-06 - feat(platform): Phase 0 — appliance session TTL + device-scoped tokens
 
 ### Summary

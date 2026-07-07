@@ -16,7 +16,7 @@ import asyncio
 from collections import Counter
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID, uuid4
 
 import pytest
@@ -182,7 +182,7 @@ def _patch(
     monkeypatch: pytest.MonkeyPatch,
     *,
     pkg: SimpleNamespace | None = None,
-    status: dict[str, Any] | None = "__default__",  # type: ignore[assignment]
+    status: dict[str, Any] | Literal["__default__"] | None = "__default__",
 ) -> None:
     pkg = pkg or _pkg()
     status_row = _status() if status == "__default__" else status

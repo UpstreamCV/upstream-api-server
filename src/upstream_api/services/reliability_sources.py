@@ -381,9 +381,7 @@ async def update_source_liveness(
             sets.append("liveness_silence_started_at = null")
 
     if not sets:  # no-op PATCH — still account-scoped (cross-account → None → 404)
-        return await get_source_for_response(
-            conn, account_id=account_id, source_id=source_id
-        )
+        return await get_source_for_response(conn, account_id=account_id, source_id=source_id)
 
     # Column names are hardcoded literals; only values are parameterized ($N).
     sql = (
@@ -394,6 +392,4 @@ async def update_source_liveness(
     updated = await conn.fetchrow(sql, *args)
     if updated is None:
         return None
-    return await get_source_for_response(
-        conn, account_id=account_id, source_id=source_id
-    )
+    return await get_source_for_response(conn, account_id=account_id, source_id=source_id)

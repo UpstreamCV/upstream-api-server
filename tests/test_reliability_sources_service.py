@@ -87,7 +87,7 @@ def _obs(
 async def _upsert(observations: list[ReliabilityObservationItem]) -> list[dict[str, Any]]:
     conn = FakeUpsertConn()
     await upsert_sources_from_observation_batch(
-        conn,  # type: ignore[arg-type]
+        conn,
         account_id=uuid4(),
         source="edge-box-4",
         observations=observations,
@@ -207,7 +207,7 @@ async def test_multiple_keys_and_observations_aggregate_per_group() -> None:
 async def test_empty_observations_is_noop() -> None:
     conn = FakeUpsertConn()
     await upsert_sources_from_observation_batch(
-        conn,  # type: ignore[arg-type]
+        conn,
         account_id=uuid4(),
         source="edge-box-4",
         observations=[],
@@ -219,7 +219,7 @@ async def test_list_sources_passes_filters_and_returns_dicts() -> None:
     account = uuid4()
     conn = FakeListConn([{"id": uuid4(), "source": "edge-box-4", "status_hint": "active"}])
     out = await list_sources(
-        conn,  # type: ignore[arg-type]
+        conn,
         account_id=account,
         source_kind="external_camera",
         status_hint="active",
