@@ -35,6 +35,7 @@ DEFAULT_CAMERA_PROCESSING_CONFIG = CameraProcessingConfig(
     tracker=None,
     confidence_threshold=None,
     processing_fps=None,
+    execution_mode="per_session",
 )
 
 

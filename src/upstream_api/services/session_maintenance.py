@@ -170,7 +170,9 @@ async def _sweep_expired(
                end_reason = 'ttl_expired'
          where state in ('approved', 'streaming')
            and expires_at < now()
-        returning id, account_id, camera_id, streamid, started_at, ended_at
+        returning id, account_id, camera_id, streamid, started_at, ended_at,
+                  (select max(h.reported_at) from heartbeats h
+                    where h.session_id = stream_sessions.id) as last_beat
         """
     )
     swept: list[_SweptSession] = []
@@ -192,9 +194,22 @@ async def _sweep_expired(
             row["camera_id"],
         )
 
+        # Bill actual streamed time, not wall-clock session lifetime. A stream
+        # that died mid-TTL but was never swept (staleness runs in report mode
+        # by default, so nothing ends it early) would otherwise be billed all
+        # the way to expires_at — days of dead air on a multi-day appliance TTL,
+        # enough to exhaust a quota on its own. Clamp the billed end to the last
+        # session-scoped heartbeat, mirroring _sweep_stale's "never bill dead
+        # air" rule. No heartbeat at all -> fall back to ended_at (unchanged
+        # behavior; this is the never-streamed edge, since appliances heartbeat
+        # every ~15s). ended_at itself stays expires_at: the session's
+        # administrative end is its TTL; only the billed quantity is clamped.
         duration = 0.0
         if was_streaming and row["ended_at"] is not None:
-            duration = max(0.0, (row["ended_at"] - row["started_at"]).total_seconds())
+            billed_end = row["ended_at"]
+            if row["last_beat"] is not None and row["last_beat"] < billed_end:
+                billed_end = row["last_beat"]
+            duration = max(0.0, (billed_end - row["started_at"]).total_seconds())
         await record_event(
             conn,
             account_id=row["account_id"],

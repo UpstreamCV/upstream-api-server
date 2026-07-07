@@ -60,6 +60,7 @@ from upstream_api.services.limits import (
     RequestedStream,
     check_camera_defaults,
     check_camera_slot_available,
+    check_execution_mode_allowed,
     check_stream_type_allowed,
     load_account_limits,
 )
@@ -914,6 +915,12 @@ async def put_processing_config(
             raise NotFoundError("Camera not found.", code="camera_not_found")
         # Device-scoped tokens may only write their own camera's config.
         require_caller_agent_access(caller, owner_row["agent_id"])
+
+        # execution_mode = shared_inference is an account-gated capability; the
+        # config schema can only validate it structurally (no DB access), so the
+        # entitlement is enforced here before the write. per_session is a no-op.
+        limits = await load_account_limits(conn, scope_account)
+        check_execution_mode_allowed(limits, body.config.execution_mode)
 
         record = await upsert_camera_processing_config(
             conn,
