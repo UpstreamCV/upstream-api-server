@@ -644,8 +644,10 @@ def test_service_sql_encrypts_secret_and_never_selects_ciphertext() -> None:
 def test_migration_shape_pin() -> None:
     root = Path(__file__).resolve().parents[1]
     sql = (
-        root / "supabase" / "migrations" / "20260620120000_event_destinations.sql"
-    ).read_text().lower()
+        (root / "supabase" / "migrations" / "20260620120000_event_destinations.sql")
+        .read_text()
+        .lower()
+    )
     assert "create table event_destinations" in sql
     assert "signing_secret_encrypted  bytea not null" in sql
     assert "signing_secret_preview    text not null" in sql

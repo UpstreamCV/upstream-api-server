@@ -228,11 +228,7 @@ def test_collector_row_has_null_external_key() -> None:
     account = uuid4()
     conn = FakeSourcesConn(
         account=account,
-        rows=[
-            _source_row(
-                external_camera_key=None, source_kind="collector", status_hint="active"
-            )
-        ],
+        rows=[_source_row(external_camera_key=None, source_kind="collector", status_hint="active")],
     )
     r = _client(conn, _agent_caller(account, ("reliability:read",))).get(_URL)
     s = r.json()["sources"][0]

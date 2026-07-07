@@ -91,8 +91,18 @@ def test_backoff_schedule() -> None:
 
 @pytest.mark.parametrize(
     ("code", "retryable"),
-    [(408, True), (429, True), (500, True), (503, True), (599, True),
-     (400, False), (401, False), (403, False), (404, False), (422, False)],
+    [
+        (408, True),
+        (429, True),
+        (500, True),
+        (503, True),
+        (599, True),
+        (400, False),
+        (401, False),
+        (403, False),
+        (404, False),
+        (422, False),
+    ],
 )
 def test_is_retryable_status(code: int, retryable: bool) -> None:
     assert is_retryable_status(code) is retryable

@@ -148,7 +148,7 @@ class FakePool:
 
 
 async def _sweep(conn: FakeSweepConn, *, limit: int = 500) -> Any:
-    return await run_source_liveness_sweep(FakePool(conn), now=_NOW, limit=limit)  # type: ignore[arg-type]
+    return await run_source_liveness_sweep(FakePool(conn), now=_NOW, limit=limit)
 
 
 async def test_silent_external_opens_source_silent_issue() -> None:

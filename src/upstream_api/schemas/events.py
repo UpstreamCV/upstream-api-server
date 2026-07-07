@@ -90,4 +90,3 @@ class EventListResponse(BaseModel):
     # as ?before_seq= for the next, older page. Null when there are no more
     # rows. A seq keyset cursor, not an opaque token.
     next_before_seq: int | None
-

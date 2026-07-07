@@ -125,12 +125,8 @@ async def _fetch_observation_counts(
     now: datetime,
     window_hours: int,
 ) -> list[EvidenceObservationCount]:
-    rows = await conn.fetch(
-        _OBSERVATION_COUNTS_SQL, account_id, camera_id, now, window_hours
-    )
-    return [
-        EvidenceObservationCount(type=r["type"], count=int(r["count"])) for r in rows
-    ]
+    rows = await conn.fetch(_OBSERVATION_COUNTS_SQL, account_id, camera_id, now, window_hours)
+    return [EvidenceObservationCount(type=r["type"], count=int(r["count"])) for r in rows]
 
 
 async def _fetch_lifecycle(
@@ -141,9 +137,7 @@ async def _fetch_lifecycle(
     now: datetime,
     window_hours: int,
 ) -> EvidenceLifecycle:
-    row = await conn.fetchrow(
-        _INFERRED_EXITS_SQL, account_id, camera_id, now, window_hours
-    )
+    row = await conn.fetchrow(_INFERRED_EXITS_SQL, account_id, camera_id, now, window_hours)
     if row is None:
         return EvidenceLifecycle()
     return EvidenceLifecycle(
@@ -201,16 +195,10 @@ async def build_processing_evidence(
         conn, account_id=account_id, camera_id=camera_id
     )
     package = EvidencePackage(
-        requested_package_id=(
-            pkg_config.requested.package_id if pkg_config.requested else None
-        ),
-        applied_package_id=(
-            pkg_config.applied.package_id if pkg_config.applied else None
-        ),
+        requested_package_id=(pkg_config.requested.package_id if pkg_config.requested else None),
+        applied_package_id=(pkg_config.applied.package_id if pkg_config.applied else None),
         state=pkg_config.state,
-        requested_revision=(
-            pkg_config.requested.revision if pkg_config.requested else None
-        ),
+        requested_revision=(pkg_config.requested.revision if pkg_config.requested else None),
     )
 
     # Latest status → lineage (from payload directly) + status + tracking.
@@ -227,9 +215,7 @@ async def build_processing_evidence(
     status = EvidenceStatus(
         status=_str_or_none(latest.get("status")) if latest else None,
         last_seen_at=(
-            (latest.get("last_frame_at") or latest.get("last_observation_at"))
-            if latest
-            else None
+            (latest.get("last_frame_at") or latest.get("last_observation_at")) if latest else None
         ),
         last_error_code=_str_or_none(latest.get("error_code")) if latest else None,
         updated_at=latest.get("updated_at") if latest else None,
