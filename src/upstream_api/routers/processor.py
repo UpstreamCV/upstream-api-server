@@ -54,22 +54,26 @@ from upstream_api.services.workflow_sequencer import evaluate_sequences
 
 _logger = get_logger("processor")
 
-# M8.0 default. A camera may override via cameras.metadata->>'package_id'.
-# No package-registry table yet (deferred to a later milestone).
-_DEFAULT_PACKAGE_ID = "mock.detect.v0"
-# M8.0 advertises a single runtime. Runtime selection (python/deepstream)
-# lands with the processor supervisor (M8.5), not here.
+# Runtime selection (python/deepstream/crowdcount) is done by the processor
+# supervisor from the package_id via its package registry, not here — this
+# field is vestigial (kept for the wire contract).
 _DEFAULT_RUNTIME = "mock"
 
 router = APIRouter(prefix="/v1/internal/processor", tags=["processor"])
 
 
-def _resolve_package_id(camera_metadata: object) -> str:
+def _resolve_package_id(camera_metadata: object) -> str | None:
+    """The camera's assigned processing package, or None when it has none.
+
+    A camera with no package has nothing for a processor to do, so it is
+    excluded from eligible-sessions rather than defaulted to a placeholder
+    (mock) detector.
+    """
     meta = coerce_jsonb(camera_metadata)
     candidate = meta.get("package_id")
     if isinstance(candidate, str) and candidate.strip():
         return candidate
-    return _DEFAULT_PACKAGE_ID
+    return None
 
 
 @router.get("/eligible-sessions", response_model=ProcessorEligibleSessionsResponse)
@@ -111,6 +115,13 @@ async def eligible_sessions(
             )
             continue
 
+        package_id = _resolve_package_id(row["camera_metadata"])
+        if package_id is None:
+            # No package assigned -> nothing for a processor to do. Excluded
+            # (previously defaulted to a mock placeholder detector, which ran a
+            # fake detector on every unconfigured camera).
+            continue
+
         items.append(
             EligibleProcessorSession(
                 session_id=row["session_id"],
@@ -119,7 +130,7 @@ async def eligible_sessions(
                 account_id=row["account_id"],
                 external_id=row["external_id"],
                 internal_rtsp_url=f"{settings.mediamtx_rtsp_base}/{stream_key}",
-                package_id=_resolve_package_id(row["camera_metadata"]),
+                package_id=package_id,
                 runtime=_DEFAULT_RUNTIME,
                 approved=ApprovedStreamSummary(
                     codec=row["lim_codec"],
