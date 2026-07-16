@@ -4,6 +4,234 @@ Reverse chronological. Newest at top. Every meaningful commit gets an entry foll
 
 ---
 
+## 2026-07-16 - fix/sweep-register-metadata: server-owned camera metadata, catalog honesty
+
+### Summary
+Fixes from the 2026-07-16 migration sweep, the night the CrowdCount→Upstream
+path went live end-to-end. The important one is a **platform bug**:
+`register_camera` rebuilt `cameras.metadata` entirely from `body.metadata` and
+the UPDATE path bound `metadata = $12::jsonb` (full replacement), so **every
+device re-register wiped the server-owned keys** — `package_id` and
+`processing_config_requested`. Since c4120c8 excludes no-package cameras from
+eligible-sessions, that silently DISABLED processing for any operator-configured
+camera whose device re-registered; on CC-plan cameras auto-apply re-stamped them,
+which force-reverted an operator's manually-chosen package back to
+`overhead_people_counter.v1`. The same code passed device-supplied metadata
+through verbatim, so any device token on any plan could self-assign an arbitrary
+`package_id` (and forge a `processing_config_requested` envelope) — the
+supervisor spawns whatever runtime the resulting eligible-sessions row names, and
+`_resolve_package_id` applies no catalog/plan check. The comment claiming "a
+device cannot grant itself a package its account is not entitled to" was false;
+it is now true.
+
+### Files touched
+- `src/upstream_api/routers/cameras.py` — register metadata ownership + auto-apply gate.
+- `src/upstream_api/services/camera_package_config.py` — `SERVER_OWNED_METADATA_KEYS`, `requested_envelope()`.
+- `src/upstream_api/routers/processor.py` — `runtime` resolved from the catalog.
+- `src/upstream_api/services/package_catalog.py` — counting-package outputs, `people_counting` name, stale warning.
+- `tests/test_stream_types.py`, `tests/test_processor.py`, `tests/test_processing_packages.py` — coverage below.
+- `docs/api-contracts.md`, `docs/architecture.md` — the drift this all documents.
+
+### Functions/classes changed
+- `routers/cameras.register_camera` — the written metadata is now device-owned
+  keys from the body (`product`, `workload`, … — still updated as before) plus
+  server-owned keys carried over from the stored row. Server-owned keys are
+  stripped from the body; the re-register lookup was extended from `select id` to
+  `select id, metadata` to supply the carry-over. Auto-apply keeps its gate
+  (plan `crowdcount` AND device-declared workload) and adds a third condition:
+  the camera must not already have a package, so an operator's explicit choice
+  wins while a camera that never got one self-heals. INSERT path is unchanged in
+  effect (new camera: nothing to preserve, nothing granted from the body).
+- `services/camera_package_config.requested_envelope` — NEW. The stored
+  `processing_config_requested` shape, now with one writer shared by
+  `store_requested_package` and register-time auto-apply.
+- `services/camera_package_config.SERVER_OWNED_METADATA_KEYS` — NEW. The one
+  named definition of which metadata keys the server owns.
+- `routers/processor._runtime_for_package` — NEW. Replaces the hardcoded
+  `_DEFAULT_RUNTIME = "mock"` that was stamped onto every eligible-session row
+  including live crowdcount ones.
+
+### Decisions
+- **Auto-apply writes the P5-G envelope** (option (i)) rather than teaching
+  `_requested_from_metadata` to fall back to a bare `metadata.package_id`
+  (option (ii)). The service's model is that `requested` is an explicit
+  selection *with lineage* (revision / updated_at / updated_by). Auto-apply IS
+  an explicit selection — made by the server on the operator's behalf — so
+  recording it as `updated_by: "system:plan-auto-apply"`, `revision: 1` is the
+  truth, written once at write time. Option (ii) would instead synthesize a
+  phantom requested-config at read time, with null lineage, for any bare
+  `package_id`, and would silently change the model-picker path's reported state
+  too. Before this, the entire auto-applied CC fleet reported `state="unset"`
+  (`requested: null`) while the processor was actively running the package, and
+  `POST /processing-config/apply` 409'd `no_requested_config`.
+- **`overhead_people_counter.v1` keeps `status="supported"` +
+  `production_ready=True`** — it is live and verified in prod — but
+  `supported_outputs` drops to `[]`. It advertised `processor.line_crossing` +
+  `processor.line_crossing_object`; the worker emits **no Upstream observations
+  at all** (counts of record post to crowdcount-server, boxes go to the
+  perception fanout), so those reads never arrive. Empty violates no invariant
+  and breaks no test; `readiness_notes` carries the explanation.
+  `supported_triggers=("line_crossing",)` is deliberately UNTOUCHED — the
+  dashboard's bundled-package picker requires it non-empty (`isBundledPackage`)
+  and Guided matching keys off it.
+- `runtime` stays on the wire (cross-repo contract) rather than being removed,
+  and reports `"unknown"` rather than guessing for a package the API-side mirror
+  does not carry.
+
+### System interaction notes
+`current_agent → routers/cameras.register_camera → (agents⋈accounts plan lookup,
+cameras lookup by (agent_id, external_id) now returning metadata) → merged
+metadata → cameras INSERT/UPDATE`. Downstream: `cameras.metadata->>'package_id'`
+→ `routers/processor.eligible_sessions` → the processor supervisor's
+runtime/container choice. That chain is why the clobber was a processing-OFF bug
+and why a device-supplied `package_id` was a real privilege issue.
+
+### Testing/checks
+`uv run pytest -q` (full suite), `ruff check`, `ruff format --check`, and
+`mypy src tests` (CI runs all four) — green; 1600 passed on `main` before the
+change, 1613 after. New coverage: re-register auto-apply on the UPDATE bind;
+crowdcount plan without the declared workload → no stamp; re-register PRESERVES
+an existing `package_id` / `processing_config_requested`; re-register IGNORES a
+device-supplied `package_id` and a forged envelope; new-camera register ignores a
+device-supplied `package_id`; operator choice is not reverted by auto-apply; the
+auto-applied envelope's shape; `external_id` passthrough (set + null) on
+eligible-sessions; `runtime` from the catalog and `"unknown"` for an unmirrored
+package; the counting package's empty `supported_outputs`; the `People Counting`
+display name. `FakeConn` gained `existing_metadata`, served by the extended
+lookup, mirroring the real query shape.
+
+NOT verified against a live DB or a real device re-register — the fixes are
+covered by route-level tests over a fake connection only (same posture as the
+auto-apply work in 0088939).
+
+### Follow-up TODOs
+- The counting worker emits no `line_crossing` observations to Upstream
+  (`ObservationWriter` accepted-but-unused). When that lands, restore
+  `supported_outputs` and drop the `readiness_notes` caveat.
+- `_resolve_package_id` still serves any non-empty string with no catalog/plan
+  entitlement check. Closing the register hole means a device can no longer
+  *set* one, but a dashboard/API caller assigning a package their plan should not
+  have is a separate gate (relates to the known "non-CC-camera gating" gap: such
+  a camera gets the CrowdCount service credential and posts for an unregistered
+  external_id). Clean fix = per-account count-destination config.
+- The model picker (`PUT .../processing-config`) and `POST .../apply` still stamp
+  a bare `metadata.package_id` with no envelope; only auto-apply and
+  `PUT .../package` write one.
+
+---
+
+## 2026-07-16 - fix(ci): fake agent-lookup row now carries the plan column (b483802)
+
+### Summary
+Backfill. `register_camera`'s agent lookup grew a join reading `accounts.plan`
+for the counting-package auto-apply (0088939), but the `FakeConn` row in
+`test_stream_types` lacked the key, so the three register tests 500'd with
+`KeyError: 'plan'`. Mirrors the real schema in the fake and adds positive /
+negative auto-apply coverage. Test-fixture gap only; prod was unaffected.
+
+### Files touched
+- `tests/test_stream_types.py` — `plan` on the fake agent row; auto-apply tests.
+
+### Testing/checks
+CI green after.
+
+---
+
+## 2026-07-15 - fix: exclude no-package cameras instead of defaulting to mock (c4120c8)
+
+### Summary
+Backfill, and the most behaviorally significant of the three. Two changes to the
+processor eligible-sessions path:
+
+1. **Removed the `mock.detect.v0` default.** A camera with no assigned package
+   now resolves to no package and is **EXCLUDED from eligible-sessions**, rather
+   than defaulting to the mock placeholder detector — which meant a fake detector
+   ran, and posted synthetic observations, on every unconfigured camera.
+   `_resolve_package_id` returns `None`; the builder skips None-package rows.
+2. Fixed the CI failure from c2561f7: the eligible-sessions test row-builder was
+   missing the `external_id` column → `KeyError: 'external_id'`. Prod was
+   unaffected (the real SQL selects it) — a test-fixture gap.
+
+### Files touched
+- `src/upstream_api/routers/processor.py` — `_resolve_package_id` returns None; skip.
+- `tests/test_processor.py` — `external_id` in the fake row builder; explicit no-package tests.
+
+### System interaction notes
+This is what made the metadata clobber above a silent processing-OFF bug rather
+than a cosmetic one: after this commit, losing `metadata.package_id` does not
+degrade a camera to mock, it removes the camera from the processor's view
+entirely.
+
+### Follow-up TODOs
+- `docs/api-contracts.md` still claimed "`package_id` is `mock.detect.v0` unless
+  overridden" — corrected in the sweep entry above.
+
+---
+
+## 2026-07-15 - feat: crowdcount counting package — catalog + auto-apply (0088939, Milestone D)
+
+### Summary
+Backfill. Makes the CrowdCount overhead people-counter selectable in the
+dashboard and auto-applied to CrowdCount-fleet devices at register.
+
+- `package_catalog`: adds `overhead_people_counter.v1` (runtime `crowdcount`,
+  status `supported`, first-party, opaque — no model/tracker/analytics ids, so it
+  needs no geometry and no restart), in a new `people_counting` category. Appears
+  in `GET /v1/processing/packages`; assignable via the package picker.
+- `cameras.register_camera`: auto-apply — a device on the comped `crowdcount`
+  plan that declares the `overhead-people-counter-line-crossing` workload gets
+  `package_id` stamped onto its camera metadata, which the processor resolves at
+  session eligibility. **Account plan = authorization; device workload = hint.**
+
+### Files touched
+- `src/upstream_api/services/package_catalog.py` — the new package.
+- `src/upstream_api/routers/cameras.py` — the auto-apply block.
+
+### Testing/checks
+Verified at the time: the entry is in the catalog (supported, visible under the
+go-live first-party gate), the `production_ready` honesty invariant holds, no
+duplicate ids. Auto-apply integration (register → stamp) was NOT verified against
+a live DB.
+
+### Follow-up TODOs (all closed in the sweep entry above)
+- The new `people_counting` category was never added to `_CATEGORY_NAMES`, so the
+  list endpoint served the raw slug as its display name.
+- Auto-apply stamped only `package_id`, not the `processing_config_requested`
+  envelope → `state="unset"` for the whole auto-applied fleet.
+- "Folded into the written metadata so it survives the re-register overwrite" —
+  true for the CC fleet, but the overwrite itself was the bug: it wiped
+  server-owned keys for every OTHER camera.
+- `supported_outputs` advertised line-crossing observations the worker never emits.
+
+---
+
+## 2026-07-15 - milestone b step 5: external_id flow for processor sessions (c2561f7)
+
+### Summary
+Backfill (the original commit had no body). Carries the camera's `external_id`
+onto each eligible-session row so the counting worker can post counts of record
+to crowdcount-server: for a CrowdCount appliance camera, `external_id` IS the
+CrowdCount `device_id` (e.g. `P9386`). It is `null` for non-appliance cameras.
+Six added lines across three files, no behavior change for existing consumers
+(additive field).
+
+### Files touched
+- `src/upstream_api/services/processor.py` — `external_id` in the eligible-sessions SQL's cameras join.
+- `src/upstream_api/schemas/processor.py` — `external_id` on `EligibleProcessorSession`.
+- `src/upstream_api/routers/processor.py` — passes it through to the response.
+
+### System interaction notes
+`cameras.external_id → eligible-sessions row → supervisor → worker env →
+crowdcount-server counts POST (X-CC-Service-Signature)`. A worker handed a null
+`external_id` alongside a service secret cannot post counts.
+
+### Testing/checks
+Shipped red: the test row-builder was not updated with the new column, breaking
+`test_streaming_validated_unexpired_is_included` (fixed in c4120c8). Fixture gap
+only.
+
+---
+
 ## 2026-07-07 - fix(ci): env-coupled tests + local CI parity (root-cause the red pushes)
 
 ### Summary

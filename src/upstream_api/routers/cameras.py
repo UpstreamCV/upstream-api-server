@@ -24,6 +24,7 @@ from upstream_api.schemas.geometry import (
 from upstream_api.schemas.processing_config_camera import (
     CameraPackageConfigResponse,
     CameraPackageRequest,
+    CameraPackageSettings,
     CameraProcessingConfigResponse,
     CameraProcessingConfigUpdateRequest,
 )
@@ -48,7 +49,9 @@ from upstream_api.security.deps import (
 from upstream_api.security.fanout_token import mint_fanout_token
 from upstream_api.services.account_audit import try_record_account_audit_log
 from upstream_api.services.camera_package_config import (
+    SERVER_OWNED_METADATA_KEYS,
     build_package_config_response,
+    requested_envelope,
     store_requested_package,
 )
 from upstream_api.services.geometry import (
@@ -111,6 +114,17 @@ _CAMERA_COLUMNS = (
     "created_at, updated_at"
 )
 
+_COUNTING_PACKAGE_ID = "overhead_people_counter.v1"
+_COUNTING_WORKLOAD = "overhead-people-counter-line-crossing"
+
+
+def _has_package(metadata: dict) -> bool:  # type: ignore[type-arg]
+    """Whether the camera already has a package assigned. Mirrors the rule the
+    processor resolves by (``routers/processor._resolve_package_id``): a blank
+    ``package_id`` is no package."""
+    candidate = metadata.get("package_id")
+    return isinstance(candidate, str) and bool(candidate.strip())
+
 
 @router.post("/register", response_model=CameraResponse)
 async def register_camera(
@@ -154,7 +168,7 @@ async def register_camera(
         existing = None
         if body.external_id is not None:
             existing = await conn.fetchrow(
-                "select id from cameras where agent_id = $1 and external_id = $2",
+                "select id, metadata from cameras where agent_id = $1 and external_id = $2",
                 body.agent_id,
                 body.external_id,
             )
@@ -166,19 +180,43 @@ async def register_camera(
             is_new_camera=existing is None,
         )
 
+        # The written metadata is device-owned keys (product, workload, ...)
+        # from the body, plus the server-owned keys carried over from the
+        # stored row. Both writes below replace the column wholesale, so the
+        # carry-over is what keeps a re-register from wiping the operator's
+        # package selection; stripping the body is what stops a device from
+        # self-assigning a package it was never granted.
+        metadata = {k: v for k, v in body.metadata.items() if k not in SERVER_OWNED_METADATA_KEYS}
+        existing_metadata = coerce_jsonb(existing["metadata"]) if existing is not None else {}
+        for key in SERVER_OWNED_METADATA_KEYS:
+            if key in existing_metadata:
+                metadata[key] = existing_metadata[key]
+
         # Auto-apply the CrowdCount counting package: a device on the comped
         # CrowdCount fleet plan that declares the counting workload gets the
         # package stamped onto its camera metadata, so the processor picks it up
         # with no dashboard step. The account plan is the authorization; the
         # device-declared workload is only a hint (a device cannot grant itself
-        # a package its account is not entitled to). Folded into the written
-        # metadata so it survives the re-register overwrite.
-        metadata = dict(body.metadata)
+        # a package its account is not entitled to — server-owned keys are
+        # stripped from the body above). Only ever stamps a camera that has no
+        # package yet: an operator's explicit choice wins, while a camera that
+        # never got one still self-heals on its next register.
         if (
             agent_row["plan"] == "crowdcount"
-            and metadata.get("workload") == "overhead-people-counter-line-crossing"
+            and metadata.get("workload") == _COUNTING_WORKLOAD
+            and not _has_package(metadata)
         ):
-            metadata["package_id"] = "overhead_people_counter.v1"
+            metadata["package_id"] = _COUNTING_PACKAGE_ID
+            # Stamp the P5-G envelope alongside, so the package endpoints
+            # report this auto-applied selection as requested-with-lineage
+            # rather than "unset" while the processor is running it.
+            metadata["processing_config_requested"] = requested_envelope(
+                package_id=_COUNTING_PACKAGE_ID,
+                settings=CameraPackageSettings(),
+                revision=1,
+                updated_by="system:plan-auto-apply",
+                now=datetime.now(UTC),
+            )
 
         if existing is None:
             row = await conn.fetchrow(
