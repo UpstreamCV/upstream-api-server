@@ -117,6 +117,7 @@ async def eligible_sessions(
                 stream_key=stream_key,
                 camera_id=row["camera_id"],
                 account_id=row["account_id"],
+                external_id=row["external_id"],
                 internal_rtsp_url=f"{settings.mediamtx_rtsp_base}/{stream_key}",
                 package_id=_resolve_package_id(row["camera_metadata"]),
                 runtime=_DEFAULT_RUNTIME,

@@ -135,6 +135,10 @@ class EligibleProcessorSession(BaseModel):
     stream_key: str
     camera_id: UUID
     account_id: UUID
+    # The camera's external_id == the CrowdCount device_id, set at camera
+    # registration. Null when the device declared none. The crowdcount runtime
+    # uses it to post counts on behalf of the right device.
+    external_id: str | None = None
     internal_rtsp_url: str
     package_id: str
     runtime: str
