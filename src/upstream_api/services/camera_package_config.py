@@ -42,6 +42,33 @@ async def _fetch_metadata(conn: asyncpg.Connection, camera_id: UUID) -> dict[str
 
 _SETTING_KEYS = ("confidence_threshold", "target_fps", "selected_classes")
 
+# The ``cameras.metadata`` keys the SERVER owns: the operator's package
+# selection and the ``package_id`` the processor's eligible-sessions payload
+# resolves from it. A device never supplies these — ``register_camera`` strips
+# them from the request body and carries the stored values across a
+# re-register.
+SERVER_OWNED_METADATA_KEYS = ("package_id", "processing_config_requested")
+
+
+def requested_envelope(
+    *,
+    package_id: str,
+    settings: CameraPackageSettings,
+    revision: int,
+    updated_by: str | None,
+    now: datetime,
+) -> dict[str, Any]:
+    """The stored ``processing_config_requested`` shape. Shared by
+    ``store_requested_package`` and register-time auto-apply so every writer
+    produces the envelope ``_requested_from_metadata`` reads back."""
+    return {
+        "package_id": package_id,
+        "settings": settings.model_dump(),
+        "revision": revision,
+        "updated_at": now.isoformat(),
+        "updated_by": updated_by,
+    }
+
 
 def _requested_from_metadata(meta: dict[str, Any]) -> RequestedPackageConfig | None:
     """Read the stored requested config, tolerant of drift: unknown settings
@@ -89,13 +116,13 @@ async def store_requested_package(
     meta = await _fetch_metadata(conn, camera_id)
     prior = _requested_from_metadata(meta)
     revision = (prior.revision + 1) if prior is not None else 1
-    requested: dict[str, Any] = {
-        "package_id": package_id,
-        "settings": settings.model_dump(),
-        "revision": revision,
-        "updated_at": now.isoformat(),
-        "updated_by": updated_by,
-    }
+    requested = requested_envelope(
+        package_id=package_id,
+        settings=settings,
+        revision=revision,
+        updated_by=updated_by,
+        now=now,
+    )
     await conn.execute(
         """
         update cameras
