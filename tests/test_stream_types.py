@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID, uuid4
@@ -105,8 +106,9 @@ def test_stream_type_check_rejects_unlisted_type() -> None:
 
 
 class FakeConn:
-    def __init__(self, allowed_stream_types: list[str]) -> None:
+    def __init__(self, allowed_stream_types: list[str], plan: str = "free") -> None:
         self.allowed_stream_types = allowed_stream_types
+        self.plan = plan
         self.insert_args: tuple[Any, ...] | None = None
         self.update_args: tuple[Any, ...] | None = None
         self.update_sql: str = ""
@@ -117,7 +119,7 @@ class FakeConn:
 
     async def fetchrow(self, query: str, *args: Any) -> dict[str, Any] | None:
         if "from agents" in query:
-            return {"account_id": ACCOUNT_ID}
+            return {"account_id": ACCOUNT_ID, "plan": self.plan}
         if "from account_limits" in query:
             return {
                 "max_cameras": 5,
@@ -260,6 +262,30 @@ def test_reregister_without_source_type_uses_coalesce() -> None:
     # UPDATE binds: (id, account_id, name, device_path, source_type, ...)
     assert conn.update_args[4] is None  # None -> coalesce keeps the stored value
     assert "coalesce($5, source_type)" in conn.update_sql
+
+
+def test_register_camera_autoapplies_counting_package_on_crowdcount_plan() -> None:
+    conn = FakeConn(allowed_stream_types=["webcam", "rtsp"], plan="crowdcount")
+    body = _register_body("rtsp")
+    body["metadata"] = {"workload": "overhead-people-counter-line-crossing"}
+    r = _agent_client(conn).post("/v1/cameras/register", json=body)
+    assert r.status_code == 200
+    assert conn.insert_args is not None
+    # INSERT binds: (..., $13 metadata jsonb)
+    stored = json.loads(conn.insert_args[12])
+    assert stored["package_id"] == "overhead_people_counter.v1"
+    assert stored["workload"] == "overhead-people-counter-line-crossing"
+
+
+def test_register_camera_no_autoapply_without_crowdcount_plan() -> None:
+    conn = FakeConn(allowed_stream_types=["webcam", "rtsp"], plan="free")
+    body = _register_body("rtsp")
+    body["metadata"] = {"workload": "overhead-people-counter-line-crossing"}
+    r = _agent_client(conn).post("/v1/cameras/register", json=body)
+    assert r.status_code == 200
+    assert conn.insert_args is not None
+    stored = json.loads(conn.insert_args[12])
+    assert "package_id" not in stored
 
 
 # ----------------------------------------------------------------------------
