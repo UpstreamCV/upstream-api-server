@@ -28,6 +28,7 @@ _LINE = "deepstream.yolox_people_line_crossing_probe.v0"
 _OCC = "deepstream.yolox_people_occupancy_probe.v0"
 _YOLO11S = "deepstream.yolo11s_people_probe.v0"  # AGPL / first_party=false
 _NANO = "deepstream.yolox_nano_people_probe.v0"  # permissive / first_party=true
+_COUNTING = "overhead_people_counter.v1"  # live CrowdCount counting package
 
 _EXPECTED_FIELDS = {
     "package_id",
@@ -136,7 +137,7 @@ def test_list_packages_shape() -> None:
     # Grouping + catalog-level warning for dashboard cards.
     cat_ids = {c["id"] for c in body["categories"]}
     assert "people_analytics" in cat_ids
-    assert any("Catalog only" in w for w in body["warnings"])
+    assert any("next stream session" in w for w in body["warnings"])
 
 
 def test_package_schema_is_stable() -> None:
@@ -270,6 +271,23 @@ def test_p5k_provenance_and_byom_marking() -> None:
     # TAO PeopleNet: covered by a commercial agreement, first-party.
     pn = by_id["deepstream.peoplenet_people_probe.v0"]
     assert pn["license_class"] == "commercial_agreement" and pn["first_party"] is True
+
+
+def test_people_counting_category_has_a_display_name() -> None:
+    body = _caller_client().get("/v1/processing/packages").json()
+    by_cat = {c["id"]: c for c in body["categories"]}
+    assert by_cat["people_counting"]["display_name"] == "People Counting"
+
+
+def test_counting_package_does_not_advertise_observations_it_never_emits() -> None:
+    pkg = _caller_client().get(f"/v1/processing/packages/{_COUNTING}").json()
+    # Live + verified in prod, but counts post to crowdcount-server — the worker
+    # writes no Upstream observations, so none may be advertised.
+    assert pkg["status"] == "supported" and pkg["production_ready"] is True
+    assert pkg["supported_outputs"] == []
+    assert pkg["readiness_notes"]
+    # The bundled-package picker keys off a non-empty supported_triggers.
+    assert pkg["supported_triggers"] == ["line_crossing"]
 
 
 def test_p5l_model_metrics_on_packages() -> None:
