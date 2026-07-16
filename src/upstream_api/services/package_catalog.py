@@ -436,6 +436,29 @@ PACKAGE_CATALOG: tuple[ProcessingPackage, ...] = (
         related_packages=("deepstream.yolox_analytics_probe.v0",),
     ),
     _pkg(
+        package_id="overhead_people_counter.v1",
+        display_name="Overhead People Counter",
+        description=(
+            "Overhead doorway people counter running the CrowdCount pipeline "
+            "(YOLO v6 + BoT-SORT + OSNet ReID + doorway line-crossing) as a "
+            "container per session. Counts of record post to crowdcount-server "
+            "for CrowdCount-account cameras; other accounts get the live overlay "
+            "+ observations only. Inference and the counting line are internal to "
+            "the container — no model/tracker/analytics selection and no geometry "
+            "to draw."
+        ),
+        category="people_counting",
+        status="supported",
+        runtime="crowdcount",
+        supported_classes=("person",),
+        supported_outputs=("processor.line_crossing", "processor.line_crossing_object"),
+        supported_triggers=("line_crossing",),
+        compute_tier="low",
+        observation_volume_risk="low",
+        production_ready=True,
+        best_for=("overhead_doorway_people_counting", "directional_counting"),
+    ),
+    _pkg(
         package_id="deepstream.yolox_people_occupancy_probe.v0",
         display_name="People Occupancy",
         description=(

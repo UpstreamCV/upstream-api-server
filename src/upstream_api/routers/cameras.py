@@ -121,9 +121,12 @@ async def register_camera(
     # Device-scoped tokens may only attach cameras to their bound agent.
     require_agent_access(auth, body.agent_id)
     async with pool.acquire() as conn, conn.transaction():
-        # Confirm agent belongs to this account.
+        # Confirm agent belongs to this account (and read the account plan,
+        # used by the counting-package auto-apply below).
         agent_row = await conn.fetchrow(
-            "select account_id from agents where id = $1",
+            "select ag.account_id, a.plan "
+            "from agents ag join accounts a on a.id = ag.account_id "
+            "where ag.id = $1",
             body.agent_id,
         )
         if agent_row is None:
@@ -163,6 +166,20 @@ async def register_camera(
             is_new_camera=existing is None,
         )
 
+        # Auto-apply the CrowdCount counting package: a device on the comped
+        # CrowdCount fleet plan that declares the counting workload gets the
+        # package stamped onto its camera metadata, so the processor picks it up
+        # with no dashboard step. The account plan is the authorization; the
+        # device-declared workload is only a hint (a device cannot grant itself
+        # a package its account is not entitled to). Folded into the written
+        # metadata so it survives the re-register overwrite.
+        metadata = dict(body.metadata)
+        if (
+            agent_row["plan"] == "crowdcount"
+            and metadata.get("workload") == "overhead-people-counter-line-crossing"
+        ):
+            metadata["package_id"] = "overhead_people_counter.v1"
+
         if existing is None:
             row = await conn.fetchrow(
                 f"""
@@ -186,7 +203,7 @@ async def register_camera(
                 body.default_codec,
                 body.default_bitrate_kbps,
                 body.default_latency_mode,
-                json.dumps(body.metadata),
+                json.dumps(metadata),
             )
             assert row is not None
             await try_record_account_audit_log(
@@ -229,7 +246,7 @@ async def register_camera(
                 body.default_codec,
                 body.default_bitrate_kbps,
                 body.default_latency_mode,
-                json.dumps(body.metadata),
+                json.dumps(metadata),
             )
 
     assert row is not None
