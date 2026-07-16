@@ -42,6 +42,11 @@ class _Candidate:
     metadata: dict[str, Any] = field(default_factory=dict)
     account_id: UUID = field(default_factory=uuid4)
     camera_id: UUID = field(default_factory=uuid4)
+    # The cameras join selects external_id (== CrowdCount device_id); nullable.
+    external_id: str | None = None
+    # A camera normally has a package assigned (folded into camera_metadata by
+    # as_row). None => no package => excluded from eligible-sessions.
+    package_id: str | None = "deepstream.decode_probe.v0"
     session_id: UUID = field(default_factory=uuid4)
     # P6-A: the LEFT JOIN onto camera_geometry_configs. None = no saved row.
     geometry_revision: int | None = None
@@ -71,10 +76,14 @@ class _Candidate:
 
     def as_row(self) -> dict[str, Any]:
         now = datetime.now(tz=UTC)
+        camera_metadata = dict(self.metadata)
+        if self.package_id is not None and "package_id" not in camera_metadata:
+            camera_metadata["package_id"] = self.package_id
         return {
             "session_id": self.session_id,
             "account_id": self.account_id,
             "camera_id": self.camera_id,
+            "external_id": self.external_id,
             "streamid": self.streamid,
             "started_at": now - timedelta(minutes=5),
             "lim_codec": "h264",
@@ -82,7 +91,7 @@ class _Candidate:
             "lim_height": 720,
             "lim_fps": 30,
             "lim_bitrate_kbps": 3000,
-            "camera_metadata": self.metadata,
+            "camera_metadata": camera_metadata,
             "v_passed": self.validations[0],
             "v_observed": {"codec": "h264", "width": 1280},
             "v_expected": {"codec": "h264", "width": 1280},
@@ -391,10 +400,14 @@ def test_response_never_leaks_srt_url_tokens_or_secrets() -> None:
     assert "session_token" not in raw
 
 
-def test_package_id_defaults_to_mock_when_metadata_absent() -> None:
-    conn = FakeEligibleConn([_Candidate("streaming", _FUTURE, [True], metadata={})])
+def test_camera_with_no_package_is_excluded() -> None:
+    # No package assigned -> nothing to process -> excluded from eligible
+    # sessions (no mock placeholder default).
+    conn = FakeEligibleConn(
+        [_Candidate("streaming", _FUTURE, [True], metadata={}, package_id=None)]
+    )
     r = _client(conn).get("/v1/internal/processor/eligible-sessions", headers=_headers())
-    assert r.json()["sessions"][0]["package_id"] == "mock.detect.v0"
+    assert r.json()["sessions"] == []
 
 
 def test_package_id_override_from_camera_metadata() -> None:
@@ -570,7 +583,8 @@ def test_processing_config_does_not_affect_package_id() -> None:
         "confidence_threshold": None,
         "processing_fps": None,
     }
-    # Default package_id (no metadata override) is unchanged by a saved config.
+    # A camera with no package_id is excluded even when it has a saved config
+    # (a config row does not itself assign a package).
     default_conn = FakeEligibleConn(
         [
             _Candidate(
@@ -578,13 +592,14 @@ def test_processing_config_does_not_affect_package_id() -> None:
                 _FUTURE,
                 [True],
                 metadata={},
+                package_id=None,
                 processing_revision=1,
                 processing_config=pcfg,
             )
         ]
     )
     r = _client(default_conn).get("/v1/internal/processor/eligible-sessions", headers=_headers())
-    assert r.json()["sessions"][0]["package_id"] == "mock.detect.v0"
+    assert r.json()["sessions"] == []
     # An explicit metadata override is likewise unaffected by the config row.
     override_conn = FakeEligibleConn(
         [
