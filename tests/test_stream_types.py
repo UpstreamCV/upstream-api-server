@@ -113,6 +113,9 @@ class FakeConn:
         self.update_args: tuple[Any, ...] | None = None
         self.update_sql: str = ""
         self.existing_camera_id: UUID | None = None
+        # The stored metadata of the existing camera, served by the
+        # re-register lookup exactly as the real row would.
+        self.existing_metadata: dict[str, Any] = {}
 
     def transaction(self) -> FakeTransaction:
         return FakeTransaction()
@@ -135,9 +138,9 @@ class FakeConn:
                 "session_ttl_seconds": None,
                 "shared_inference_enabled": False,
             }
-        if "select id from cameras" in query:
+        if "select id, metadata from cameras" in query:
             if self.existing_camera_id is not None:
-                return {"id": self.existing_camera_id}
+                return {"id": self.existing_camera_id, "metadata": self.existing_metadata}
             return None
         if "insert into cameras" in query:
             self.insert_args = args
@@ -286,6 +289,121 @@ def test_register_camera_no_autoapply_without_crowdcount_plan() -> None:
     assert conn.insert_args is not None
     stored = json.loads(conn.insert_args[12])
     assert "package_id" not in stored
+
+
+def test_register_camera_autoapply_stamps_requested_envelope() -> None:
+    # The P5-G endpoints read processing_config_requested; without it an
+    # auto-applied camera reports state="unset" while the processor runs it.
+    conn = FakeConn(allowed_stream_types=["rtsp"], plan="crowdcount")
+    body = _register_body("rtsp")
+    body["metadata"] = {"workload": "overhead-people-counter-line-crossing"}
+    r = _agent_client(conn).post("/v1/cameras/register", json=body)
+    assert r.status_code == 200
+    assert conn.insert_args is not None
+    requested = json.loads(conn.insert_args[12])["processing_config_requested"]
+    assert requested["package_id"] == "overhead_people_counter.v1"
+    assert requested["revision"] == 1
+    assert requested["updated_by"] == "system:plan-auto-apply"
+    assert requested["updated_at"]
+
+
+def test_reregister_autoapplies_counting_package_on_crowdcount_plan() -> None:
+    conn = FakeConn(allowed_stream_types=["rtsp"], plan="crowdcount")
+    conn.existing_camera_id = uuid4()
+    body = _register_body("rtsp")
+    body["metadata"] = {"workload": "overhead-people-counter-line-crossing"}
+    r = _agent_client(conn).post("/v1/cameras/register", json=body)
+    assert r.status_code == 200
+    assert conn.update_args is not None
+    # UPDATE binds: (id, account_id, name, device_path, source_type, ..., $12 metadata)
+    stored = json.loads(conn.update_args[11])
+    assert stored["package_id"] == "overhead_people_counter.v1"
+
+
+def test_register_camera_no_autoapply_without_declared_workload() -> None:
+    conn = FakeConn(allowed_stream_types=["rtsp"], plan="crowdcount")
+    body = _register_body("rtsp")
+    body["metadata"] = {"product": "crowdcount-pi"}
+    r = _agent_client(conn).post("/v1/cameras/register", json=body)
+    assert r.status_code == 200
+    assert conn.insert_args is not None
+    stored = json.loads(conn.insert_args[12])
+    assert "package_id" not in stored
+    assert stored["product"] == "crowdcount-pi"  # device-owned keys still land
+
+
+def test_reregister_preserves_server_owned_metadata() -> None:
+    # A device re-register must not wipe the operator's package selection:
+    # with no-package cameras excluded from eligible-sessions, that would
+    # silently disable processing for the camera.
+    conn = FakeConn(allowed_stream_types=["rtsp"], plan="free")
+    conn.existing_camera_id = uuid4()
+    conn.existing_metadata = {
+        "package_id": "deepstream.yolox_analytics_probe.v0",
+        "processing_config_requested": {
+            "package_id": "deepstream.yolox_analytics_probe.v0",
+            "settings": {},
+            "revision": 3,
+            "updated_at": "2026-07-15T00:00:00+00:00",
+            "updated_by": "user:11111111-1111-1111-1111-111111111111",
+        },
+        "workload": "stale",
+    }
+    body = _register_body("rtsp")
+    body["metadata"] = {"workload": "fresh"}
+    r = _agent_client(conn).post("/v1/cameras/register", json=body)
+    assert r.status_code == 200
+    assert conn.update_args is not None
+    stored = json.loads(conn.update_args[11])
+    assert stored["package_id"] == "deepstream.yolox_analytics_probe.v0"
+    assert stored["processing_config_requested"]["revision"] == 3
+    assert stored["workload"] == "fresh"  # device-owned keys still update
+
+
+def test_reregister_ignores_device_supplied_server_owned_metadata() -> None:
+    # A device token must not be able to self-assign a package: the supervisor
+    # would spawn whatever runtime the eligible-sessions row names.
+    conn = FakeConn(allowed_stream_types=["rtsp"], plan="free")
+    conn.existing_camera_id = uuid4()
+    conn.existing_metadata = {"package_id": "deepstream.yolox_analytics_probe.v0"}
+    body = _register_body("rtsp")
+    body["metadata"] = {
+        "package_id": "overhead_people_counter.v1",
+        "processing_config_requested": {"package_id": "overhead_people_counter.v1"},
+    }
+    r = _agent_client(conn).post("/v1/cameras/register", json=body)
+    assert r.status_code == 200
+    assert conn.update_args is not None
+    stored = json.loads(conn.update_args[11])
+    assert stored["package_id"] == "deepstream.yolox_analytics_probe.v0"  # stored row wins
+    # The forged envelope is dropped, not merged: the stored row had none.
+    assert "processing_config_requested" not in stored
+
+
+def test_register_new_camera_ignores_device_supplied_package_id() -> None:
+    conn = FakeConn(allowed_stream_types=["rtsp"], plan="free")
+    body = _register_body("rtsp")
+    body["metadata"] = {"package_id": "overhead_people_counter.v1"}
+    r = _agent_client(conn).post("/v1/cameras/register", json=body)
+    assert r.status_code == 200
+    assert conn.insert_args is not None
+    stored = json.loads(conn.insert_args[12])
+    assert "package_id" not in stored  # nothing to preserve, nothing granted
+
+
+def test_reregister_does_not_revert_operator_chosen_package_on_crowdcount_plan() -> None:
+    # An operator's explicit choice outranks auto-apply, which only ever
+    # stamps a camera that has no package at all.
+    conn = FakeConn(allowed_stream_types=["rtsp"], plan="crowdcount")
+    conn.existing_camera_id = uuid4()
+    conn.existing_metadata = {"package_id": "deepstream.yolox_analytics_probe.v0"}
+    body = _register_body("rtsp")
+    body["metadata"] = {"workload": "overhead-people-counter-line-crossing"}
+    r = _agent_client(conn).post("/v1/cameras/register", json=body)
+    assert r.status_code == 200
+    assert conn.update_args is not None
+    stored = json.loads(conn.update_args[11])
+    assert stored["package_id"] == "deepstream.yolox_analytics_probe.v0"
 
 
 # ----------------------------------------------------------------------------

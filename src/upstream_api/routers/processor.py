@@ -40,6 +40,7 @@ from upstream_api.security.streamid import extract_stream_key
 from upstream_api.services.detection_metrics import (
     write_detection_metrics_for_perception_snapshot,
 )
+from upstream_api.services.package_catalog import get_package
 from upstream_api.services.processor import (
     coerce_jsonb,
     fetch_eligible_sessions,
@@ -55,9 +56,11 @@ from upstream_api.services.workflow_sequencer import evaluate_sequences
 _logger = get_logger("processor")
 
 # Runtime selection (python/deepstream/crowdcount) is done by the processor
-# supervisor from the package_id via its package registry, not here — this
-# field is vestigial (kept for the wire contract).
-_DEFAULT_RUNTIME = "mock"
+# supervisor from the package_id via its own package registry, not here. This
+# field is advisory (kept for the wire contract) and is reported from the API's
+# catalog mirror; a package the mirror does not carry is reported honestly
+# rather than guessed at.
+_UNKNOWN_RUNTIME = "unknown"
 
 router = APIRouter(prefix="/v1/internal/processor", tags=["processor"])
 
@@ -74,6 +77,17 @@ def _resolve_package_id(camera_metadata: object) -> str | None:
     if isinstance(candidate, str) and candidate.strip():
         return candidate
     return None
+
+
+def _runtime_for_package(package_id: str) -> str:
+    """The runtime the package runs on, per the API's catalog mirror.
+
+    ``first_party_only`` is not applied: this is the processor's own discovery
+    call, and an assigned package must report its runtime whatever the
+    dashboard-visibility gate says.
+    """
+    pkg = get_package(package_id)
+    return pkg.runtime if pkg is not None else _UNKNOWN_RUNTIME
 
 
 @router.get("/eligible-sessions", response_model=ProcessorEligibleSessionsResponse)
@@ -131,7 +145,7 @@ async def eligible_sessions(
                 external_id=row["external_id"],
                 internal_rtsp_url=f"{settings.mediamtx_rtsp_base}/{stream_key}",
                 package_id=package_id,
-                runtime=_DEFAULT_RUNTIME,
+                runtime=_runtime_for_package(package_id),
                 approved=ApprovedStreamSummary(
                     codec=row["lim_codec"],
                     width=row["lim_width"],

@@ -374,7 +374,9 @@ def test_response_contains_internal_rtsp_url_built_from_base_and_streamid() -> N
     s = r.json()["sessions"][0]
     assert s["internal_rtsp_url"] == f"{_RTSP_BASE}/{_STREAM_KEY}"
     assert s["stream_key"] == _STREAM_KEY
-    assert s["runtime"] == "mock"
+    # runtime is reported from the catalog entry for the assigned package
+    # (the default candidate carries deepstream.decode_probe.v0).
+    assert s["runtime"] == "deepstream"
     assert s["geometry_config"] is None
     # M7B: the processing-config envelope sits next to geometry_config and is
     # null on the default (no-saved-row) path, same as geometry.
@@ -416,6 +418,44 @@ def test_package_id_override_from_camera_metadata() -> None:
     )
     r = _client(conn).get("/v1/internal/processor/eligible-sessions", headers=_headers())
     assert r.json()["sessions"][0]["package_id"] == "custom.pkg.v2"
+
+
+def test_runtime_is_resolved_from_the_package_catalog() -> None:
+    # The supervisor derives the real runtime from the package itself; this
+    # field must at least agree with it rather than say "mock" for everything.
+    conn = FakeEligibleConn(
+        [
+            _Candidate(
+                "streaming", _FUTURE, [True], metadata={"package_id": "overhead_people_counter.v1"}
+            )
+        ]
+    )
+    r = _client(conn).get("/v1/internal/processor/eligible-sessions", headers=_headers())
+    assert r.json()["sessions"][0]["runtime"] == "crowdcount"
+
+
+def test_runtime_is_unknown_for_a_package_the_catalog_does_not_carry() -> None:
+    conn = FakeEligibleConn(
+        [_Candidate("streaming", _FUTURE, [True], metadata={"package_id": "custom.pkg.v2"})]
+    )
+    r = _client(conn).get("/v1/internal/processor/eligible-sessions", headers=_headers())
+    s = r.json()["sessions"][0]
+    assert s["package_id"] == "custom.pkg.v2"  # still served
+    assert s["runtime"] == "unknown"  # but not guessed at
+
+
+def test_external_id_is_passed_through() -> None:
+    # external_id is the camera's CrowdCount device_id — the worker needs it to
+    # post counts of record; null for a non-appliance camera.
+    conn = FakeEligibleConn([_Candidate("streaming", _FUTURE, [True], external_id="P9386")])
+    r = _client(conn).get("/v1/internal/processor/eligible-sessions", headers=_headers())
+    assert r.json()["sessions"][0]["external_id"] == "P9386"
+
+
+def test_external_id_is_null_when_the_camera_has_none() -> None:
+    conn = FakeEligibleConn([_Candidate("streaming", _FUTURE, [True])])
+    r = _client(conn).get("/v1/internal/processor/eligible-sessions", headers=_headers())
+    assert r.json()["sessions"][0]["external_id"] is None
 
 
 def test_limit_query_param_is_passed_through() -> None:
