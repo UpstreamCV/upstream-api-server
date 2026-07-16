@@ -161,6 +161,39 @@ Response 200: full camera row matching `schemas/cameras.py:CameraResponse`.
 
 Errors: `agent_not_found`, `agent_account_mismatch`, `limit_exceeded.{codec_not_allowed,fps_too_high,resolution_too_high,bitrate_too_high,max_cameras}`.
 
+#### `metadata` ownership
+
+`cameras.metadata` has two classes of key and this endpoint is where they meet.
+
+- **Device-owned** (e.g. `product`, `workload`): written from `body.metadata` on
+  every register. The written column is a full replacement, so a device sees
+  exactly the device-owned keys it last sent — not a merge of every key it ever
+  sent.
+- **Server-owned** — `package_id` and `processing_config_requested`
+  (`services/camera_package_config.SERVER_OWNED_METADATA_KEYS`): **reserved**.
+  They are STRIPPED from `body.metadata` (a device cannot self-assign a package:
+  eligible-sessions serves any assigned `package_id` to the processor, which
+  spawns the corresponding runtime) and **PRESERVED** from the stored row on
+  re-register. A device re-register therefore never disturbs an operator's
+  package selection. Write them via
+  `PUT /v1/cameras/{id}/processing-config/package` (P5-G).
+
+#### Counting-package auto-apply
+
+A CrowdCount appliance registers itself; no operator ever opens the dashboard for
+it. So register-time auto-apply stamps
+`metadata.package_id = "overhead_people_counter.v1"` plus the matching
+`processing_config_requested` envelope (`revision: 1`,
+`updated_by: "system:plan-auto-apply"`) when ALL of:
+
+1. the agent's account `plan == "crowdcount"` — **this is the authorization**;
+2. the device declared `metadata.workload ==
+   "overhead-people-counter-line-crossing"` — a HINT only, never authorization
+   (any device can send it; on any other plan it does nothing);
+3. the camera does not already have a `package_id` — an operator's explicit
+   selection wins, while a camera that never got one self-heals on its next
+   register.
+
 ### `POST /v1/stream-sessions/start`
 
 Auth: `current_agent`. Validates limits, mints a session JWT, inserts a `stream_sessions` row in state `approved`, returns the SRT URL with the JWT embedded.
@@ -1196,26 +1229,50 @@ rules.
 P5-F. The platform's read-only **processing-package catalog** — what each
 processing package does, what it composes (model / tracker / analytics), what
 it can emit, its readiness status, and whether it is safe/recommended. Powers
-future dashboard "package cards". **Catalog only**: it does NOT assign packages
-to cameras and exposes no requested/applied state (that is P5-G). The data is a
-curated, in-process API-side snapshot of the processor's package registry —
-there is **no DB table** and no runtime dependency on the processor.
+future dashboard "package cards". **Catalog data only**: this endpoint exposes no
+per-camera requested/applied state and assigns nothing — assignment is P5-G
+(`GET/PUT /v1/cameras/{camera_id}/processing-config/package`), which validates an
+operator's selection against this catalog. The data is a curated, in-process
+API-side snapshot of the processor's package registry — there is **no DB table**
+and no runtime dependency on the processor.
 
 Authenticated (any caller), **not** account-scoped (a conservative visibility
 gate hides only retired packages, plus non-first-party packages when the
 `catalog_first_party_only` gate is on — see below). Optional filters (query
 params): `category`, `status`, `runtime`, `test_mode_safe`.
 
-P5-K expanded the catalog from 9 to **23 packages**. Categories now include
-`people_analytics`, the new `vehicle_analytics` (a single TrafficCamNet
-car/bicycle package, `deepstream.trafficcamnet_vehicle_probe.v0`), `diagnostic`,
-and `mock`. The people-analytics group gained 5 YOLOX-S + IOU use-case variants
+The catalog holds **24 packages** (P5-K expanded it from 9 to 23; the CrowdCount
+counting package is the 24th). Categories: `people_analytics` (16), the
+`people_counting` category added with the counting package (1), `vehicle_analytics`
+(1 — a single TrafficCamNet car/bicycle package,
+`deepstream.trafficcamnet_vehicle_probe.v0`), `diagnostic` (5), and `mock` (1).
+The people-analytics group gained 5 YOLOX-S + IOU use-case variants
 (`deepstream.yolox_people_{fast,high_recall,line_crossing,occupancy,dwell}_probe.v0`)
 and 8 per-model packages (`deepstream.{yolox_nano,yolox_tiny,yolox_m,yolo11n,
 yolo11s,yolo11m,yolov8n,peoplenet}_people_probe.v0`). Status spread across the
 new packages: `fast` / `high_recall` / `occupancy` / `dwell` are `probe`;
 everything else new (the vehicle package, `line_crossing`, and all 8 per-model
 packages) is `experimental`.
+
+`overhead_people_counter.v1` ("Overhead People Counter", category
+`people_counting`, `runtime: "crowdcount"`) is the **only `supported` /
+`production_ready: true` package** — the live CrowdCount doorway counter (YOLO v6
++ BoT-SORT + doorway line-crossing), run as a container per session. Note its
+honest shape:
+
+- `supported_outputs: []` — it emits **no Upstream observations**. Counts of
+  record post directly to crowdcount-server and live boxes go to the perception
+  fanout, so `GET /v1/cameras/{id}/observations/recent` stays empty for this
+  package. `readiness_notes` says so; observation emission is authored but
+  unwired.
+- `supported_triggers: ["line_crossing"]` — what it detects, which is what the
+  dashboard's bundled-package picker and Guided matching key off.
+- `requires_geometry: false`, no `model_id` / `tracker_profile_id` /
+  `analytics_profile_id`, empty `allowed_overrides`: inference and the counting
+  line are internal to the container — nothing to select and no geometry to draw.
+
+It reaches a camera via the register-time auto-apply (`POST /v1/cameras/register`)
+rather than a dashboard step, and is selectable like any other package.
 
 Response 200: `{ "packages": [ProcessingPackage, ...], "categories": [{id,
 display_name}], "warnings": [str] }`. Status is one of `probe` /
@@ -1470,6 +1527,11 @@ yet) / `pending_restart` (a session is running an older package) /
 `failed_config` (latest status `failed` + `package_resolution`) /
 `experimental_selected`.
 
+`updated_by` records who made the selection: `user:<uuid>` for a dashboard
+choice, or `system:plan-auto-apply` for a camera auto-applied at register time
+(`POST /v1/cameras/register`) — which writes this same envelope at `revision: 1`,
+so an auto-applied CrowdCount camera reports `active`, not `unset`.
+
 `PUT .../package` body `{package_id, settings?: {confidence_threshold?, target_fps?,
 selected_classes?}, allow_experimental?: bool}` → validated against the P5-F
 catalog: unknown/`deprecated` package, a class not in `supported_classes`, a
@@ -1542,9 +1604,10 @@ Response 200:
       "stream_key": "sess_0123456789abcdef",
       "camera_id": "<uuid>",
       "account_id": "<uuid>",
+      "external_id": "P9386",
       "internal_rtsp_url": "rtsp://host.docker.internal:8554/sess_0123456789abcdef",
-      "package_id": "mock.detect.v0",
-      "runtime": "mock",
+      "package_id": "overhead_people_counter.v1",
+      "runtime": "crowdcount",
       "approved": {"codec": "h264", "width": 1280, "height": 720, "fps": 30, "bitrate_kbps": 3000},
       "validation": {
         "passed": true,
@@ -1562,8 +1625,28 @@ Response 200:
 }
 ```
 
-`package_id` is `mock.detect.v0` unless overridden by `cameras.metadata->>'package_id'`.
-No package-registry table exists yet (deferred).
+`external_id` is the camera's `external_id` — for a CrowdCount appliance camera
+this is the CrowdCount `device_id` (e.g. `P9386`), which the counting worker
+needs to post counts of record to crowdcount-server. It is `null` for any camera
+registered without one (non-appliance cameras), and a worker that requires it
+must fail loudly rather than invent one.
+
+`package_id` is `cameras.metadata->>'package_id'`. **A camera with no
+`package_id` is EXCLUDED from this response entirely** — there is no
+`mock.detect.v0` default (that ran a synthetic detector on every unconfigured
+camera). A package reaches `cameras.metadata` in one of three ways: an operator
+selection (`PUT /v1/cameras/{id}/processing-config/package`), the model picker
+(`PUT /v1/cameras/{id}/processing-config`), or the counting-package auto-apply
+at register time (see `POST /v1/cameras/register`). No package-registry table
+exists — the API's catalog is static in-process data
+(`services/package_catalog.py`), a curated mirror of the processor's own
+registry.
+
+`runtime` is the assigned package's runtime as the API's catalog mirror knows it
+(`crowdcount` / `deepstream` / `mock` / `python`), or `"unknown"` for a
+`package_id` the mirror does not carry. It is ADVISORY: the processor supervisor
+selects the runtime it actually spawns from its own package registry, keyed on
+`package_id`. The field stays on the wire as part of this contract.
 
 `geometry_config` (P6-A) carries the camera's saved geometry config so the
 processor does not need a separate fetch. It is `null` when the camera has no
