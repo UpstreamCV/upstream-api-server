@@ -8,7 +8,8 @@ option (same posture as ``services/models.py``). A schema-stability test guards
 the shape; when the processor packages change, update this file (a future
 processor export script could generate it).
 
-Catalog only: this does NOT assign packages to cameras (P5-G).
+Catalog data only: assignment lives in P5-G (``services/camera_package_config``),
+which validates the operator's selection against this catalog.
 """
 
 from __future__ import annotations
@@ -103,14 +104,15 @@ _ANALYTICS_OVERRIDES = ("confidence_threshold", "selected_classes", "processing_
 
 _CATEGORY_NAMES: dict[str, str] = {
     "people_analytics": "People Analytics",
+    "people_counting": "People Counting",
     "vehicle_analytics": "Vehicle Analytics",
     "diagnostic": "Diagnostic Probes",
     "mock": "Mock",
 }
 
 _CATALOG_WARNINGS = (
-    "Catalog only: packages cannot yet be assigned to cameras (P5-G adds "
-    "requested/applied package state).",
+    "A package selection takes effect on the camera's next stream session — it "
+    "does not reconfigure a running session.",
 )
 
 
@@ -451,12 +453,22 @@ PACKAGE_CATALOG: tuple[ProcessingPackage, ...] = (
         status="supported",
         runtime="crowdcount",
         supported_classes=("person",),
-        supported_outputs=("processor.line_crossing", "processor.line_crossing_object"),
+        # Emits no Upstream observations: counts of record post straight to
+        # crowdcount-server and the live boxes go to the perception fanout.
+        # Observation emission is authored but unwired — advertising
+        # line_crossing here would promise reads that never arrive.
+        supported_outputs=(),
         supported_triggers=("line_crossing",),
         compute_tier="low",
         observation_volume_risk="low",
         production_ready=True,
         best_for=("overhead_doorway_people_counting", "directional_counting"),
+        readiness_notes=(
+            "Live and verified in production for CrowdCount-account cameras. Counts of "
+            "record are posted to crowdcount-server, not written as Upstream "
+            "observations — so the observations read APIs stay empty for this package "
+            "until line_crossing emission is wired."
+        ),
     ),
     _pkg(
         package_id="deepstream.yolox_people_occupancy_probe.v0",
