@@ -46,6 +46,7 @@ select
     ss.lim_fps          as lim_fps,
     ss.lim_bitrate_kbps as lim_bitrate_kbps,
     c.metadata          as camera_metadata,
+    c.external_id       as external_id,
     v.passed            as v_passed,
     v.observed          as v_observed,
     v.expected          as v_expected,
