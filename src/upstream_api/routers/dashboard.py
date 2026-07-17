@@ -87,6 +87,12 @@ async def get_summary(
     join below is what the comment always claimed. `offline_cameras` is now its
     complement (it was total - streaming, which called every idle-but-connected
     camera offline and made the two fields fail to sum to total_cameras).
+
+    Because `online_cameras` USED to hold the agent count, any consumer reading
+    it for agents was reading it correctly-by-accident and this change flips the
+    number under them. `online_agents`/`total_agents` are therefore exposed too
+    (both were already computed here and discarded) so such a consumer has
+    somewhere honest to point.
     """
     scope_account = caller.resolve_account(account_id)
     async with pool.acquire() as conn:
@@ -129,6 +135,8 @@ async def get_summary(
         offline_cameras=row["total_cameras"] - row["online_cameras"],
         streaming_cameras=row["streaming_cameras"],
         cameras_with_errors=row["cameras_with_errors"],
+        online_agents=row["online_agents"],
+        total_agents=row["total_agents"],
         active_streams=row["active_streams"],
         validation_errors_24h=row["validation_errors_24h"],
     )

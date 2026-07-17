@@ -10,10 +10,18 @@ FleetTrendRange = Literal["24h", "7d"]
 
 class DashboardSummaryResponse(BaseModel):
     total_cameras: int
+    #: Cameras whose owning agent reported within 5 minutes.
     online_cameras: int
+    #: Complement of online_cameras — the two sum to total_cameras.
     offline_cameras: int
     streaming_cameras: int
     cameras_with_errors: int
+    #: Agent liveness. Additive (2026-07-16) — both counts were already computed
+    #: for online_cameras and thrown away, while `online_cameras` itself used to
+    #: *be* the online-agent count. A consumer that wants agents must read these
+    #: rather than inferring from the camera fields.
+    online_agents: int
+    total_agents: int
     active_streams: int
     validation_errors_24h: int
 

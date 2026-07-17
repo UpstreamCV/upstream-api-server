@@ -1561,6 +1561,8 @@ Response 200:
   "offline_cameras": 1,
   "streaming_cameras": 3,
   "cameras_with_errors": 0,
+  "online_agents": 2,
+  "total_agents": 3,
   "active_streams": 3,
   "validation_errors_24h": 0
 }
@@ -1570,8 +1572,15 @@ Errors: `account_id_required`, `forbidden_account`.
 
 `online_cameras` counts cameras whose owning agent reported within the last 5
 minutes; `offline_cameras` is its complement, so the two always sum to
-`total_cameras`. (Before 2026-07-16 `online_cameras` returned the online-*agent*
-count and `offline_cameras` was `total - streaming`; neither matched its name.)
+`total_cameras`.
+
+**Changed 2026-07-16 — `online_cameras` moved.** It previously returned the
+online-*agent* count (the name never matched the value), and `offline_cameras`
+was `total - streaming`, which called an idle-but-connected camera offline and
+meant the pair never summed to `total_cameras`. A consumer reading
+`online_cameras` for an agent count was reading it correctly-by-accident and
+**will now see a different number**. `online_agents` / `total_agents` are
+exposed (additively) for exactly that case — read those for agents.
 
 ### `GET /v1/dashboard/fleet-trend`
 
