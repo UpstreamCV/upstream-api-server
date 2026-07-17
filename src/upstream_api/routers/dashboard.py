@@ -16,6 +16,41 @@ from upstream_api.security.deps import CurrentCaller, PoolDep
 
 router = APIRouter(prefix="/v1/dashboard", tags=["dashboard"])
 
+# Account-scoped overview counts. Extracted to a module constant (rather than
+# inlined in the handler) so tests/test_dashboard_sql_integration.py can run the
+# EXACT string against a real database -- the online_cameras join and the
+# offline complement have no other coverage, and a mutation to them must fail a
+# test rather than ship green. $1 = account_id.
+_SUMMARY_SQL = """
+select
+  (select count(*)::int from cameras
+     where account_id = $1) as total_cameras,
+  (select count(*)::int from cameras
+     where account_id = $1 and status = 'streaming') as streaming_cameras,
+  (select count(*)::int from cameras
+     where account_id = $1 and status = 'idle') as idle_cameras,
+  (select count(*)::int from cameras
+     where account_id = $1 and status = 'error') as cameras_with_errors,
+  (select count(*)::int from cameras c
+     join agents a on a.id = c.agent_id
+    where c.account_id = $1
+      and a.last_seen_at > now() - interval '5 minutes') as online_cameras,
+  (select count(*)::int from agents
+     where account_id = $1
+       and last_seen_at > now() - interval '5 minutes') as online_agents,
+  (select count(*)::int from agents
+     where account_id = $1) as total_agents,
+  (select count(*)::int from stream_sessions
+     where account_id = $1 and state in ('approved', 'streaming')
+      ) as active_streams,
+  (select count(*)::int from stream_validations v
+     join stream_sessions s on s.id = v.session_id
+    where s.account_id = $1
+      and v.passed = false
+      and v.created_at > now() - interval '24 hours'
+      ) as validation_errors_24h
+"""
+
 # Hours per supported trend range. Hourly buckets for both, matching the
 # per-camera confidence trend (GET /v1/cameras/{id}/reliability/confidence-trend)
 # so the two trend surfaces stay shaped alike.
@@ -96,38 +131,7 @@ async def get_summary(
     """
     scope_account = caller.resolve_account(account_id)
     async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            """
-            select
-              (select count(*)::int from cameras
-                 where account_id = $1) as total_cameras,
-              (select count(*)::int from cameras
-                 where account_id = $1 and status = 'streaming') as streaming_cameras,
-              (select count(*)::int from cameras
-                 where account_id = $1 and status = 'idle') as idle_cameras,
-              (select count(*)::int from cameras
-                 where account_id = $1 and status = 'error') as cameras_with_errors,
-              (select count(*)::int from cameras c
-                 join agents a on a.id = c.agent_id
-                where c.account_id = $1
-                  and a.last_seen_at > now() - interval '5 minutes') as online_cameras,
-              (select count(*)::int from agents
-                 where account_id = $1
-                   and last_seen_at > now() - interval '5 minutes') as online_agents,
-              (select count(*)::int from agents
-                 where account_id = $1) as total_agents,
-              (select count(*)::int from stream_sessions
-                 where account_id = $1 and state in ('approved', 'streaming')
-                  ) as active_streams,
-              (select count(*)::int from stream_validations v
-                 join stream_sessions s on s.id = v.session_id
-                where s.account_id = $1
-                  and v.passed = false
-                  and v.created_at > now() - interval '24 hours'
-                  ) as validation_errors_24h
-            """,
-            scope_account,
-        )
+        row = await conn.fetchrow(_SUMMARY_SQL, scope_account)
     assert row is not None
     return DashboardSummaryResponse(
         total_cameras=row["total_cameras"],
