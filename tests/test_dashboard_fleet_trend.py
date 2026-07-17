@@ -1,9 +1,35 @@
 """Tests for GET /v1/dashboard/fleet-trend and the summary count fixes.
 
-The trend is derived live from `heartbeats` (no rollup table, no sampler), so
-these fake the connection and assert the handler's bucket -> response mapping,
-the legend/latest-point coupling, and account scoping. The SQL itself is
-exercised against a real database by `scripts/smoke_local.py`.
+SCOPE — read this before trusting a green run. `FakeConn` discards the query
+string and returns pre-shaped rows, so everything here tests the PYTHON layer
+only: the row -> Pydantic mapping, the legend/latest-point coupling, the range
+-> hours lookup, and that the resolved account is the value handed to the
+driver. Replacing `_FLEET_TREND_SQL` with a string literal of nonsense keeps
+this module green. That is a real gap, not an oversight to be inferred away:
+
+  - `_FLEET_TREND_SQL` has NO automated coverage. Neither does the
+    `online_cameras` subquery. This project's CI starts no Postgres (ci.yml sets
+    UPSTREAM_DATABASE_URL at 127.0.0.1:54322 but nothing listens), and
+    `scripts/smoke_local.py` never touches the dashboard router.
+  - So the once-per-bucket `distinct on`, the critical/review/healthy partition,
+    the generate_series zero-fill, the bucket-boundary alignment, and the
+    `account_id = $1` scoping are all verified by HAND, not by this file.
+
+What that hand-verification was, against the production database (2026-07-16),
+so it can be repeated rather than re-derived:
+  - 24 buckets for range=24h and 168 for 7d, spanning 23:54 -> "Last 24 hours"
+    is honest.
+  - An empty hour returns 0/0/0/0: `count(*) filter (where l.status = ...)`
+    does NOT count the left join's null-extended row, and `count(l.camera_id)`
+    ignores it too.
+  - Against the real fleet account the series matched the known bench-Pi
+    history (1 healthy camera streaming from 02:00Z, genuinely quiet hours
+    before it).
+  - EXPLAIN showed the account-wide scan falling back to
+    `heartbeats_agent_recent_idx` with account_id as a post-scan Filter, which
+    is what the new `heartbeats_account_recent_idx` migration addresses.
+
+If a Postgres ever lands in CI, port those checks here and delete this notice.
 """
 
 from __future__ import annotations
@@ -179,7 +205,10 @@ def test_unknown_range_is_rejected() -> None:
     assert client.get("/v1/dashboard/fleet-trend?range=90d").status_code == 422
 
 
-def test_agent_token_is_scoped_to_its_own_account() -> None:
+def test_agent_token_resolves_to_its_own_account_id() -> None:
+    # NB: this asserts caller.resolve_account ignores the stray query param and
+    # that the resolved id is the FIRST bind param. It does NOT prove the query
+    # filters on it — the SQL never runs here (see the module docstring).
     account = uuid4()
     conn = FakeConn(rows=[], scalar=0)
     client = _client(conn, _agent(account))
@@ -187,15 +216,18 @@ def test_agent_token_is_scoped_to_its_own_account() -> None:
     r = client.get(f"/v1/dashboard/fleet-trend?account_id={uuid4()}")
 
     assert r.status_code == 200
-    # The agent's own account wins over the stray query param.
     assert conn.fetch_args[0] == account
 
 
-def test_summary_online_cameras_is_cameras_not_agents() -> None:
-    # Regression: online_cameras used to return the online-AGENT count, so a
-    # 2-agent/40-camera account reported 2 online cameras on the headline tile.
-    # offline_cameras used to be total - streaming, calling every idle-but-
-    # connected camera offline; the pair must now sum to total_cameras.
+def test_summary_maps_camera_and_agent_counts_to_distinct_fields() -> None:
+    # Regression guard for the MAPPING half of the online_cameras fix: the
+    # response must carry the row's camera count and agent count through to
+    # SEPARATE fields. Previously online_cameras was assigned row["online_agents"]
+    # outright, so the two collapsed into one number and any consumer wanting
+    # agents (dashboard-legacy's "Agents online" card) read the camera field.
+    #
+    # The SQL half — that row["online_cameras"] really is a camera count — is
+    # NOT tested here; FakeConn hand-feeds the row. See the module docstring.
     account = uuid4()
     conn = FakeConn(
         row={
@@ -214,6 +246,10 @@ def test_summary_online_cameras_is_cameras_not_agents() -> None:
 
     body = client.get("/v1/dashboard/summary").json()
 
+    # Cameras and agents must not be conflated: 38 != 2.
     assert body["online_cameras"] == 38
+    assert body["online_agents"] == 2
+    assert body["total_agents"] == 3
+    # offline is now the complement of online, not total - streaming.
     assert body["offline_cameras"] == 2
     assert body["online_cameras"] + body["offline_cameras"] == body["total_cameras"]
