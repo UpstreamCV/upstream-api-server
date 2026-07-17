@@ -4,6 +4,23 @@ Reverse chronological. Newest at top. Every meaningful commit gets an entry foll
 
 ---
 
+## 2026-07-17 — dashboard: DB-backed coverage for the fleet-trend + summary SQL
+
+**Subject:** Close the coverage gap flagged in the 2026-07-16 recheck: `_FLEET_TREND_SQL` and the summary's `online_cameras` join had no automated test — `FakeConn` discards the query, so a mutation shipped green. Now the real query strings run against a real Postgres.
+
+**Why:** The recheck proved by mutation that replacing `_FLEET_TREND_SQL` with a nonsense string left the suite green, and that `test_summary_online_cameras_is_cameras_not_agents` only exercised the Python mapping. The SQL was verified by hand against prod but nothing guarded it in code. This project's CI starts no Postgres, so the fix can't be "add it to `make ci`" — it has to be an opt-in DB-backed module that skips cleanly without a database.
+
+**What changed:**
+- `src/upstream_api/routers/dashboard.py` — the inline summary query is extracted to a module constant `_SUMMARY_SQL` (mirroring `_FLEET_TREND_SQL`) so a test can import and run the EXACT string the handler runs. No behavior change; the fake-conn tests are unaffected.
+- `tests/test_dashboard_sql_integration.py` (new) — runs the imported `_FLEET_TREND_SQL` / `_SUMMARY_SQL` against a real Postgres over a faithful minimal schema (a mirror of the migrations for the columns these queries touch — full migrations can't apply to a bare Postgres, which has no supabase auth/roles/RLS scaffolding). Covers what the recheck said was unverified: 24/168 bucket count + generate_series zero-fill; last-heartbeat-per-camera-per-hour wins; the critical/review/healthy partition of `reporting_cameras`; the `count(*) FILTER` over an empty (null-extended) hour yielding 0; cross-tenant account scoping; agent-level (camera_id null) heartbeats excluded; and for the summary, `online_cameras` counting cameras via a fresh-agent join (not agents), stale-agent cameras excluded, and a null-`agent_id` camera excluded from online but present in total. The reviewer's three mutations (drop `account_id = $1`, cartesian `join on account_id`, nonsense SQL) each now fail a test.
+- Skip-safety: the whole module SKIPS unless `UPSTREAM_TEST_DATABASE_URL` (or `UPSTREAM_DATABASE_URL`) points at a reachable server, so `make ci` and `make test` stay green with no database, exactly as before. Everything is built in a dedicated `ft_test` schema and dropped per test, so it never touches an existing database's data even if pointed at a shared one.
+- `Makefile` — `make test-db` target + the throwaway-container recipe.
+- `tests/test_dashboard_fleet_trend.py` — docstring updated: it no longer claims the SQL has *no* coverage; it points at the integration module and notes the two are complementary (Python layer vs SQL layer), since CI still runs no Postgres.
+
+**Validation:** `make ci` is fully green — ruff, ruff-format, mypy (239 files), and 1620 pytest passing with the 9 integration tests skipping (the module imports and its fixture skip-logic fire, so the Python/collection wiring is proven). The refactor is behavior-neutral (the fake-conn suite stays green). The SQL semantics were validated read-only against the production database (24/168 bucket counts, the null-row FILTER yielding 0, the real bench-Pi series, and the EXPLAIN that motivated the `heartbeats_account_recent_idx` index). The DB-backed module's live asyncpg round-trip was NOT executed at author time — Docker would not finish booting in the authoring environment and no native Postgres was available — so run `make test-db` against any reachable Postgres to confirm it green before relying on it.
+
+**Docs updated:** `docs/commit-log.md` (this entry). The endpoint contract in `docs/api-contracts.md` is unchanged by this commit (SQL refactor + tests only).
+
 ## 2026-07-16 - fix/sweep-register-metadata: server-owned camera metadata, catalog honesty
 
 ### Summary

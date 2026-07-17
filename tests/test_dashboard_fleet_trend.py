@@ -5,31 +5,25 @@ string and returns pre-shaped rows, so everything here tests the PYTHON layer
 only: the row -> Pydantic mapping, the legend/latest-point coupling, the range
 -> hours lookup, and that the resolved account is the value handed to the
 driver. Replacing `_FLEET_TREND_SQL` with a string literal of nonsense keeps
-this module green. That is a real gap, not an oversight to be inferred away:
+THIS module green.
 
-  - `_FLEET_TREND_SQL` has NO automated coverage. Neither does the
-    `online_cameras` subquery. This project's CI starts no Postgres (ci.yml sets
-    UPSTREAM_DATABASE_URL at 127.0.0.1:54322 but nothing listens), and
-    `scripts/smoke_local.py` never touches the dashboard router.
-  - So the once-per-bucket `distinct on`, the critical/review/healthy partition,
-    the generate_series zero-fill, the bucket-boundary alignment, and the
-    `account_id = $1` scoping are all verified by HAND, not by this file.
+The SQL itself — the once-per-bucket `distinct on`, the critical/review/healthy
+partition, the generate_series zero-fill, the empty-hour zeros, the account
+scoping, and the online_cameras cameras-not-agents join — is covered by
+`test_dashboard_sql_integration.py`, which runs the imported query strings
+against a real Postgres. That module needs a database (`make test-db`) and SKIPS
+otherwise, because this project's CI starts no Postgres: ci.yml points
+UPSTREAM_DATABASE_URL at 127.0.0.1:54322 with nothing listening, and
+`scripts/smoke_local.py` never touches the dashboard router. So under `make ci`
+the SQL is still unexercised — the two files are complementary, not redundant.
 
-What that hand-verification was, against the production database (2026-07-16),
-so it can be repeated rather than re-derived:
-  - 24 buckets for range=24h and 168 for 7d, spanning 23:54 -> "Last 24 hours"
-    is honest.
-  - An empty hour returns 0/0/0/0: `count(*) filter (where l.status = ...)`
-    does NOT count the left join's null-extended row, and `count(l.camera_id)`
-    ignores it too.
-  - Against the real fleet account the series matched the known bench-Pi
-    history (1 healthy camera streaming from 02:00Z, genuinely quiet hours
-    before it).
-  - EXPLAIN showed the account-wide scan falling back to
-    `heartbeats_agent_recent_idx` with account_id as a post-scan Filter, which
-    is what the new `heartbeats_account_recent_idx` migration addresses.
-
-If a Postgres ever lands in CI, port those checks here and delete this notice.
+The integration tests were validated against a throwaway postgres:16 (green),
+and the shapes were separately spot-checked against the production database
+(2026-07-16): 24/168 buckets spanning 23:54 -> "Last 24 hours" is honest; the
+real fleet account matched the known bench-Pi history; and EXPLAIN showed the
+account-wide scan falling back to `heartbeats_agent_recent_idx` with account_id
+as a post-scan Filter, which the new `heartbeats_account_recent_idx` migration
+addresses.
 """
 
 from __future__ import annotations
