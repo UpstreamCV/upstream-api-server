@@ -9,6 +9,15 @@ dev:
 test:
 	uv run pytest -q
 
+# DB-backed dashboard SQL integration tests. These SKIP unless a Postgres is
+# reachable, so `make ci`/`make test` never need one. Point them at any
+# throwaway server (they build + drop their own `ft_test` schema):
+#   docker run --rm -d -p 5433:5432 -e POSTGRES_PASSWORD=postgres --name ft-pg postgres:16
+#   UPSTREAM_TEST_DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5433/postgres make test-db
+#   docker rm -f ft-pg
+test-db:
+	uv run pytest -q tests/test_dashboard_sql_integration.py
+
 # Throwaway secrets GitHub Actions injects for the test job (see
 # .github/workflows/ci.yml). `make ci` runs pytest under THESE instead of your
 # local .env, so tests that only pass because of a value in your .env (a

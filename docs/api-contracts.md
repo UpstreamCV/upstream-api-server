@@ -1561,8 +1561,79 @@ Response 200:
   "offline_cameras": 1,
   "streaming_cameras": 3,
   "cameras_with_errors": 0,
+  "online_agents": 2,
+  "total_agents": 3,
   "active_streams": 3,
   "validation_errors_24h": 0
+}
+```
+
+Errors: `account_id_required`, `forbidden_account`.
+
+`online_cameras` counts cameras whose owning agent reported within the last 5
+minutes; `offline_cameras` is its complement, so the two always sum to
+`total_cameras`.
+
+**Changed 2026-07-16 — `online_cameras` moved.** It previously returned the
+online-*agent* count (the name never matched the value), and `offline_cameras`
+was `total - streaming`, which called an idle-but-connected camera offline and
+meant the pair never summed to `total_cameras`. A consumer reading
+`online_cameras` for an agent count was reading it correctly-by-accident and
+**will now see a different number**. `online_agents` / `total_agents` are
+exposed (additively) for exactly that case — read those for agents.
+
+### `GET /v1/dashboard/fleet-trend`
+
+Account-scoped fleet health over time, for the dashboard's Home chart.
+
+Query: `account_id`, `range` (`24h` | `7d`, default `24h`; anything else → 422).
+
+Hourly buckets, oldest first, derived live from `heartbeats` — there is no
+rollup table and no sampler process, so the series reflects existing history
+immediately rather than starting empty. Each camera is counted **once per
+bucket**, by the status of its **last** heartbeat in that hour, so
+`critical` + `review` + `healthy` == `reporting_cameras` exactly:
+
+| series | heartbeat status |
+|---|---|
+| `critical` | `error` |
+| `review` | `reconnecting` |
+| `healthy` | `online`, `streaming` |
+
+Every hour in the window is returned, including quiet ones (all-zero) and the
+**current partial hour** — the chart's axis ends at "now" and a latest-status
+count carries no partial-window distortion (unlike the confidence trend, which
+averages and therefore drops its partial hour).
+
+**Scope:** this reports cameras that *heartbeat*. A camera that is idle or
+disconnected emits nothing and is absent from all three series by construction —
+compare `summary.total_cameras` to see "3 healthy of 40" vs "3 healthy of 3".
+`summary.latest_*` read the newest bucket, so a caller's legend and the plotted
+line cannot disagree.
+
+Response 200:
+```json
+{
+  "range": "24h",
+  "bucket_size": "1h",
+  "points": [
+    {
+      "bucket_start": "2026-07-16T21:00:00Z",
+      "bucket_end": "2026-07-16T22:00:00Z",
+      "critical": 0,
+      "review": 0,
+      "healthy": 1,
+      "reporting_cameras": 1
+    }
+  ],
+  "summary": {
+    "point_count": 24,
+    "latest_bucket_start": "2026-07-16T22:00:00Z",
+    "latest_critical": 0,
+    "latest_review": 0,
+    "latest_healthy": 1,
+    "total_cameras": 3
+  }
 }
 ```
 

@@ -40,6 +40,7 @@ def test_expected_routes_are_mounted() -> None:
         "/v1/account:GET",
         "/v1/account/limits:GET",
         "/v1/dashboard/summary:GET",
+        "/v1/dashboard/fleet-trend:GET",
         "/v1/ingest/validate-stream:POST",
         "/v1/ingest/stream-started:POST",
         "/v1/ingest/stream-ended:POST",
