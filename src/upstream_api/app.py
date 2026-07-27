@@ -37,6 +37,7 @@ from upstream_api.routers import (
     events,
     heartbeats,
     ingest,
+    internal_tokens,
     metrics,
     models,
     platform_admin,
@@ -263,6 +264,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(event_delivery_attempts.router)  # /v1/event-delivery-attempts (M6.4)
     app.include_router(workflow_evaluator.router)  # /v1/internal/workflow-evaluator (M4)
     app.include_router(session_maintenance.router)  # /v1/internal/session-maintenance (M10)
+    app.include_router(internal_tokens.router)  # /v1/internal/tokens (device self-enrollment)
     app.include_router(workflows.router)  # /v1/workflows (Workflow Engine M5)
     app.include_router(usage.router)  # /v1/usage (Module 7 M1)
     app.include_router(audit_logs.router)  # /v1/audit-logs (Module 7 M3)

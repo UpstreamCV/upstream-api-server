@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import secrets
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from argon2 import PasswordHasher
 from argon2 import exceptions as argon2_exc
@@ -64,9 +64,12 @@ DEVICE_SCOPE = "device"
 
 @dataclass(frozen=True, slots=True)
 class IssuedToken:
-    plaintext: str  # full token shown to the user exactly once
+    # plaintext/hash are repr=False: an IssuedToken caught in an exception
+    # frame (e.g. Sentry's local-variable capture) must expose the prefix
+    # and last_four at most, never the secret.
+    plaintext: str = field(repr=False)  # full token shown to the user exactly once
     prefix: str  # e.g. "ups_live_AB12CDEF" — unique per token
-    hash: str  # argon2id encoded
+    hash: str = field(repr=False)  # argon2id encoded
     last_four: str  # display: "...AB12"
 
 

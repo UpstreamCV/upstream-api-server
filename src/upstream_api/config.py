@@ -29,6 +29,18 @@ class Settings(BaseSettings):
 
     mediamtx_webhook_secret: SecretStr
     processor_webhook_secret: SecretStr
+    # Device self-enrollment (migration design doc 15): gates the internal
+    # POST /v1/internal/tokens/provision mint endpoint called by
+    # crowdcount-server. Deliberately a dedicated secret — NOT
+    # processor_webhook_secret — so the broker's token-minting ability stays
+    # isolated from the processor's ingest trust. Optional so the server
+    # boots without it; unset (or empty) rejects every provision call.
+    token_provision_secret: SecretStr | None = None
+    # Account the fleet's device tokens are minted under
+    # (UPSTREAM_FLEET_ACCOUNT_ID). Lives here rather than on the broker so
+    # crowdcount-server only ever sends {external_id}. Optional: unset means
+    # provision returns 503 provision_not_configured.
+    fleet_account_id: str | None = None
     # M9.3: optional — when unset, GET /metrics 404s (the endpoint does not
     # exist for that deployment). Deployed envs keep it set.
     prometheus_auth_token: SecretStr | None = None
