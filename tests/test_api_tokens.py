@@ -36,6 +36,18 @@ def test_issue_token_returns_unique_plaintext_and_prefix() -> None:
     assert len(a.last_four) == 4
 
 
+def test_issued_token_repr_never_exposes_secret_material() -> None:
+    """The auto-repr lands in exception frames (e.g. Sentry's local-variable
+    capture) — it must show the prefix and last_four at most."""
+    issued = issue_token()
+    _, secret = split_token(issued.plaintext)
+    shown = repr(issued)
+    assert issued.plaintext not in shown
+    assert secret not in shown
+    assert issued.hash not in shown
+    assert issued.prefix in shown
+
+
 def test_split_token_recovers_prefix_and_secret() -> None:
     issued = issue_token(environment="test")
     prefix, secret = split_token(issued.plaintext)
