@@ -261,6 +261,32 @@ async def current_processor(
 CurrentProcessor = Annotated[ProcessorAuth, Depends(current_processor)]
 
 
+@dataclass(frozen=True, slots=True)
+class ProvisionerAuth:
+    pass
+
+
+async def current_provisioner(
+    settings: SettingsDep,
+    x_upstream_provision_secret: Annotated[str | None, Header()] = None,
+) -> ProvisionerAuth:
+    # Unset (or empty-string env) secret means this deployment has not
+    # enabled device-token provisioning — reject every call rather than let
+    # an empty presented header match an empty configured secret.
+    expected = settings.token_provision_secret
+    if expected is None or not expected.get_secret_value():
+        raise UnauthorizedError("Invalid provision secret.", code="invalid_provision_secret")
+    if not verify_shared_secret(
+        x_upstream_provision_secret,
+        expected.get_secret_value(),
+    ):
+        raise UnauthorizedError("Invalid provision secret.", code="invalid_provision_secret")
+    return ProvisionerAuth()
+
+
+CurrentProvisioner = Annotated[ProvisionerAuth, Depends(current_provisioner)]
+
+
 # ---------------------------------------------------------------------------
 # Dual auth: agent token OR dashboard user JWT.
 #
