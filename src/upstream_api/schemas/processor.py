@@ -312,3 +312,52 @@ class PerceptionStreamTokenResponse(BaseModel):
     token: str
     ws_url: str
     expires_at: datetime
+
+
+# ── Pull-based MediaMTX provisioning (see services/pull_provisioning.py) ─────
+#
+# These carry the ONE secret the box legitimately needs: the session's SRT
+# publish passphrase, which it must write into its local MediaMTX path config.
+# It is the same value the agent already receives inside `srt_url`, and the
+# endpoint is processor-authenticated, so this widens no trust boundary — but
+# it is the only `/v1/internal/processor/*` payload that carries a secret at
+# all, so it must never be logged.
+
+
+class PendingProvision(BaseModel):
+    """One session awaiting local MediaMTX path creation on the box."""
+
+    session_id: UUID
+    camera_id: UUID
+    stream_key: str = Field(
+        description="MediaMTX path name — the `publish:` prefix stripped from "
+        "streamid, e.g. `sess_2a88f3405d513c05`.",
+    )
+    srt_publish_passphrase: str = Field(
+        description="libsrt passphrase to set on the path. Secret — never log.",
+    )
+    created_at: datetime
+
+
+class PendingProvisionsResponse(BaseModel):
+    items: list[PendingProvision]
+
+
+class ProvisionAckRequest(BaseModel):
+    """Box's report on one provisioning attempt.
+
+    ``ok=false`` is a real signal, not just an absence: it lets the start
+    handler fail immediately with the box's own error instead of blocking for
+    the full wait budget on a path that will never appear.
+    """
+
+    ok: bool
+    error_code: str | None = Field(default=None, max_length=64)
+    error_message: str | None = Field(default=None, max_length=512)
+
+
+class ProvisionAckResponse(BaseModel):
+    applied: bool = Field(
+        description="False when the row was already acked/failed/gone — a "
+        "duplicate ack is benign, not an error.",
+    )
