@@ -104,17 +104,13 @@ def _client(conn: Any, *, mode: str = "pull") -> TestClient:
     app = create_app()
     app.dependency_overrides[get_pool] = lambda: FakePool(conn)
     base = get_settings()
-    overridden: Settings = base.model_copy(
-        update={"mediamtx_provisioning_mode": mode}
-    )
+    overridden: Settings = base.model_copy(update={"mediamtx_provisioning_mode": mode})
     app.dependency_overrides[get_settings] = lambda: overridden
     return TestClient(app)
 
 
 def _headers() -> dict[str, str]:
-    return {
-        "X-Upstream-Webhook-Secret": get_settings().processor_webhook_secret.get_secret_value()
-    }
+    return {"X-Upstream-Webhook-Secret": get_settings().processor_webhook_secret.get_secret_value()}
 
 
 # --- auth -------------------------------------------------------------------
@@ -153,9 +149,7 @@ def test_push_mode_returns_empty_even_with_pending_rows() -> None:
 def test_pull_mode_returns_pending_rows() -> None:
     sid, cid = uuid4(), uuid4()
     conn = FakeProvisionConn([_Pending(sid, cid)])
-    r = _client(conn).get(
-        "/v1/internal/processor/pending-provisions", headers=_headers()
-    )
+    r = _client(conn).get("/v1/internal/processor/pending-provisions", headers=_headers())
     assert r.status_code == 200
     items = r.json()["items"]
     assert len(items) == 1
@@ -171,9 +165,7 @@ def test_pull_mode_returns_pending_rows() -> None:
 def test_row_without_passphrase_is_skipped() -> None:
     """A path with no passphrase would accept any publisher — never emit it."""
     conn = FakeProvisionConn([_Pending(uuid4(), uuid4(), passphrase=None)])
-    r = _client(conn).get(
-        "/v1/internal/processor/pending-provisions", headers=_headers()
-    )
+    r = _client(conn).get("/v1/internal/processor/pending-provisions", headers=_headers())
     assert r.status_code == 200
     assert r.json()["items"] == []
 
@@ -186,9 +178,7 @@ def test_malformed_streamid_is_skipped_not_500() -> None:
             _Pending(uuid4(), uuid4()),
         ]
     )
-    r = _client(conn).get(
-        "/v1/internal/processor/pending-provisions", headers=_headers()
-    )
+    r = _client(conn).get("/v1/internal/processor/pending-provisions", headers=_headers())
     assert r.status_code == 200
     assert len(r.json()["items"]) == 1
 

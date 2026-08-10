@@ -137,8 +137,7 @@ async def _await_pull_provisioning(
             mismatch_fields=[],
             failure_code="mediamtx_provision_failed",
             failure_message=(
-                f"reason=provision_timeout waited={timeout_seconds:.1f}s "
-                "(no streaming-box ack)"
+                f"reason=provision_timeout waited={timeout_seconds:.1f}s (no streaming-box ack)"
             )[:512],
         )
     failed_state.transition.record()
