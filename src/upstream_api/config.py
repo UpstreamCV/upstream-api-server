@@ -190,6 +190,37 @@ class Settings(BaseSettings):
     # AWS api-server's Elastic IP).
     mediamtx_api_base_url: str = "http://localhost:9997"
 
+    # How a session's MediaMTX path gets created.
+    #
+    #   "push" (default, legacy): the api-server calls `mediamtx_api_base_url`
+    #       inline during POST /v1/stream-sessions/start. Requires INBOUND
+    #       reachability into the streaming box's network.
+    #   "pull": the api-server only records the intent; the box's processor
+    #       picks the row up on its existing OUTBOUND poll
+    #       (GET /v1/internal/processor/pending-provisions), configures its own
+    #       local MediaMTX, and acks. No inbound path, no dependency on the
+    #       box's DNS record / port-forward / WAN IP.
+    #
+    # Pull mode is what survives a residential lease roll — see the 2026-08-05
+    # incident, where a changed Comcast IP silently broke every session start
+    # for four days. Default stays "push" so enabling it is a deliberate,
+    # revertible env change rather than a deploy-time surprise.
+    mediamtx_provisioning_mode: Literal["push", "pull"] = "push"
+
+    # Pull mode only. How long POST /v1/stream-sessions/start blocks waiting
+    # for the box to ack provisioning before giving up and failing the
+    # session. This preserves the SYNCHRONOUS wire contract the firmware
+    # already depends on: the agent still receives either a working srt_url or
+    # a clean error, so no fleet OTA is required to adopt pull mode.
+    #
+    # Budget it above the box's provision poll interval (default 1.0s there)
+    # plus one MediaMTX round trip, and below the agent's own start timeout.
+    provision_wait_seconds: float = 6.0
+
+    # Pull mode only. How often the start handler re-checks the row while
+    # waiting. Small enough to not add meaningful latency once the box acks.
+    provision_poll_interval_seconds: float = 0.15
+
     # M8.0 — base of the internal MediaMTX RTSP read path advertised to a
     # processor in `GET /v1/internal/processor/eligible-sessions`. The full
     # URL is built as ``{mediamtx_rtsp_base}/{stream_key}`` where stream_key

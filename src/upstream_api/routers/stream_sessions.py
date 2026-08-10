@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import re
+import time
 from typing import Annotated, Any
 from uuid import UUID
 
@@ -45,6 +47,7 @@ from upstream_api.services.mediamtx_provisioning import (
     deprovision_path,
     provision_path,
 )
+from upstream_api.services.pull_provisioning import get_provision_state
 from upstream_api.services.session_lifecycle import (
     StreamSessionRow,
     start_session,
@@ -66,6 +69,82 @@ _RESOURCE_ID_RE = re.compile(r"^[A-Za-z0-9_~-]{1,128}$")
 _STREAMID_PUBLISH_PREFIX = "publish:"
 
 router = APIRouter(prefix="/v1/stream-sessions", tags=["stream-sessions"])
+
+
+async def _await_pull_provisioning(
+    pool: Any,
+    *,
+    session_id: UUID,
+    timeout_seconds: float,
+    poll_interval: float,
+) -> None:
+    """Block until the streaming box acks the session's MediaMTX path.
+
+    Pull mode's whole point is that the api-server never dials into the box's
+    network. The cost is that provisioning becomes asynchronous, and the
+    firmware's `/start` contract is synchronous. Rather than change the
+    contract (which would mean an OTA to every Pi in the field), we absorb the
+    asynchrony here: the caller still gets a usable `srt_url` or a real error.
+
+    Terminates on whichever comes first:
+      - the box acked            -> return, the path exists
+      - the row went `failed`    -> 502 carrying the box's own reason
+      - the budget expired       -> mark failed, 502
+
+    The timeout branch marks the session `failed` so an ack that lands late
+    cannot resurrect it — otherwise the box would create a path for a session
+    the agent has already abandoned, which is precisely the orphan-path leak
+    that left ten stale `sess_*` entries behind in the 2026-08 incident.
+    """
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        async with pool.acquire() as conn:
+            current = await get_provision_state(conn, session_id=session_id)
+
+        if current is None:
+            raise NotFoundError("Session not found.", code="session_not_found")
+
+        state, provisioned = current
+        if provisioned:
+            return
+        if state != "approved":
+            # The box acked a failure (or a sweeper terminated the row). The
+            # ack handler already wrote failure_code/message; don't overwrite.
+            _provisionlog.error(
+                "mediamtx_provision_failed_pull_observed",
+                session_id=str(session_id),
+                state=state,
+            )
+            raise BadGatewayError(
+                "Streaming server could not provision the path; session marked failed.",
+                code="upstream_unavailable",
+            )
+
+        if time.monotonic() >= deadline:
+            break
+        await asyncio.sleep(poll_interval)
+
+    _provisionlog.error(
+        "mediamtx_provision_timeout_pull",
+        session_id=str(session_id),
+        waited_seconds=timeout_seconds,
+    )
+    async with pool.acquire() as conn2, conn2.transaction():
+        failed_state = await mark_failed(
+            conn2,
+            session_id=session_id,
+            observed=None,
+            mismatch_fields=[],
+            failure_code="mediamtx_provision_failed",
+            failure_message=(
+                f"reason=provision_timeout waited={timeout_seconds:.1f}s (no streaming-box ack)"
+            )[:512],
+        )
+    failed_state.transition.record()
+    raise BadGatewayError(
+        "Streaming server did not provision the path in time; session marked failed.",
+        code="upstream_unavailable",
+    )
 
 
 def _row_to_response(row: StreamSessionRow) -> StreamSessionResponse:
@@ -205,6 +284,29 @@ async def start(
     # `failed` in a separate transaction and return 502; the agent will
     # retry `/start` and get a fresh attempt.
     stream_key = extract_stream_key(result.session.streamid)
+
+    if settings.mediamtx_provisioning_mode == "pull":
+        # Pull mode: the row is already the work order (provisioned_at IS
+        # NULL). The box collects it on its own outbound poll and configures
+        # its local MediaMTX, so we make no inbound call at all.
+        #
+        # We still BLOCK here until the box acks, which keeps this endpoint's
+        # wire contract byte-identical to push mode: the agent receives either
+        # a working srt_url or a clean error. That is what lets pull mode ship
+        # without an OTA to the fleet — firmware behaviour is unchanged.
+        await _await_pull_provisioning(
+            pool,
+            session_id=result.session.id,
+            timeout_seconds=settings.provision_wait_seconds,
+            poll_interval=settings.provision_poll_interval_seconds,
+        )
+        return StreamSessionStartResponse(
+            session=_row_to_response(result.session),
+            srt_url=result.srt_url,
+            session_token=result.session_token,
+            expires_at=result.claims.expires_at,
+        )
+
     try:
         await provision_path(
             http,

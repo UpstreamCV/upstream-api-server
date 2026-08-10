@@ -26,6 +26,8 @@ from upstream_api.schemas.processor import (
     EligibleProcessingConfig,
     EligibleProcessorSession,
     LatestPerceptionSnapshotResponse,
+    PendingProvision,
+    PendingProvisionsResponse,
     PerceptionSnapshotIngestRequest,
     PerceptionSnapshotRecord,
     ProcessorEligibleSessionsResponse,
@@ -34,6 +36,8 @@ from upstream_api.schemas.processor import (
     ProcessorStatusRequest,
     ProcessorStatusResponse,
     ProcessorValidationSummary,
+    ProvisionAckRequest,
+    ProvisionAckResponse,
 )
 from upstream_api.security.deps import CurrentProcessor, PoolDep, SettingsDep
 from upstream_api.security.streamid import extract_stream_key
@@ -49,8 +53,16 @@ from upstream_api.services.processor import (
     upsert_perception_snapshot,
     upsert_processor_status,
 )
+from upstream_api.services.pull_provisioning import (
+    ack_provision,
+    fetch_pending_provisions,
+)
 from upstream_api.services.rules import evaluate_observation
-from upstream_api.services.stream_validation import SessionStateRow, load_session_state
+from upstream_api.services.stream_validation import (
+    SessionStateRow,
+    load_session_state,
+    mark_failed,
+)
 from upstream_api.services.workflow_sequencer import evaluate_sequences
 
 _logger = get_logger("processor")
@@ -414,3 +426,135 @@ async def post_perception_snapshot(
             updated_at=parse_iso_datetime(row["updated_at"]),
         )
     )
+
+
+# ── Pull-based MediaMTX provisioning ────────────────────────────────────────
+#
+# The inverse of `services/mediamtx_provisioning.py`. Instead of the
+# api-server reaching INTO the streaming box to create a path, the box
+# collects the work on its own outbound poll and configures its local
+# MediaMTX at 127.0.0.1:9997.
+#
+# This removes the api-server's dependency on the box's DNS record, router
+# port-forward and WAN IP — the three things that broke together on
+# 2026-08-05 and took every session start down for four days while the box
+# itself was perfectly healthy.
+#
+# Only active when `settings.mediamtx_provisioning_mode == "pull"`; in push
+# mode the pending list is always empty, so a box running the newer poller
+# against an older api-server simply no-ops.
+
+
+@router.get("/pending-provisions", response_model=PendingProvisionsResponse)
+async def pending_provisions(
+    _auth: CurrentProcessor,
+    pool: PoolDep,
+    settings: SettingsDep,
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+) -> PendingProvisionsResponse:
+    """Sessions whose MediaMTX path the caller should create locally.
+
+    Returns `[]` in push mode so the endpoint is safe to poll regardless of
+    which mode the server is running — the box needs no coordination to be
+    upgraded first.
+
+    Unlike every other `/v1/internal/processor/*` response, items carry a
+    secret (`srt_publish_passphrase`). It is the same value already embedded
+    in the agent's `srt_url` and the route is processor-authenticated, so no
+    trust boundary widens — but it must not be logged.
+    """
+    if settings.mediamtx_provisioning_mode != "pull":
+        return PendingProvisionsResponse(items=[])
+
+    async with pool.acquire() as conn:
+        rows = await fetch_pending_provisions(conn, limit=limit)
+
+    items: list[PendingProvision] = []
+    for row in rows:
+        try:
+            stream_key = extract_stream_key(row["streamid"])
+        except ValueError:
+            # Same posture as eligible-sessions: a malformed streamid is our
+            # own data corruption, so drop the row rather than 500 the poll.
+            _logger.warning(
+                "pending_provision_bad_streamid",
+                session_id=str(row["session_id"]),
+            )
+            continue
+        passphrase = row["passphrase"]
+        if not passphrase:
+            # Without a passphrase the box cannot build a usable path, and a
+            # path without one would accept anybody's publisher.
+            _logger.warning(
+                "pending_provision_missing_passphrase",
+                session_id=str(row["session_id"]),
+            )
+            continue
+        items.append(
+            PendingProvision(
+                session_id=row["session_id"],
+                camera_id=row["camera_id"],
+                stream_key=stream_key,
+                srt_publish_passphrase=passphrase,
+                created_at=row["created_at"],
+            )
+        )
+
+    return PendingProvisionsResponse(items=items)
+
+
+@router.post(
+    "/pending-provisions/{session_id}/ack",
+    response_model=ProvisionAckResponse,
+)
+async def ack_pending_provision(
+    session_id: UUID,
+    body: ProvisionAckRequest,
+    _auth: CurrentProcessor,
+    pool: PoolDep,
+) -> ProvisionAckResponse:
+    """Report the outcome of one local provisioning attempt.
+
+    `ok=true`  -> stamps `provisioned_at`, releasing the waiting start handler.
+    `ok=false` -> fails the session immediately with the box's own error, so
+    the agent gets a real reason instead of a wait-budget timeout.
+
+    Idempotent: a retried ack after a lost response updates nothing and
+    returns `applied=false`.
+    """
+    session_id_var.set(session_id)
+
+    if body.ok:
+        async with pool.acquire() as conn, conn.transaction():
+            applied = await ack_provision(conn, session_id=session_id)
+        return ProvisionAckResponse(applied=applied)
+
+    # Failure path. Mirror push mode's failure_code so dashboards, alerting
+    # and the stream_sessions audit trail stay uniform across both modes;
+    # the box's specific code travels in the message.
+    detail = f"reason={body.error_code or 'unknown'}"
+    if body.error_message:
+        detail = f"{detail} {body.error_message}"
+    _logger.error(
+        "mediamtx_provision_failed_pull",
+        session_id=str(session_id),
+        reason=body.error_code,
+    )
+    async with pool.acquire() as conn, conn.transaction():
+        state = await load_session_state(conn, session_id=session_id)
+        if state is None:
+            raise NotFoundError("Session not found.", code="session_not_found")
+        if state.state != "approved":
+            # Already terminal (expired sweeper, agent stop, duplicate ack).
+            # Nothing to fail; report not-applied rather than clobbering it.
+            return ProvisionAckResponse(applied=False)
+        failed = await mark_failed(
+            conn,
+            session_id=session_id,
+            observed=None,
+            mismatch_fields=[],
+            failure_code="mediamtx_provision_failed",
+            failure_message=detail[:512],
+        )
+    failed.transition.record()
+    return ProvisionAckResponse(applied=True)
