@@ -3,7 +3,7 @@
 -- Motivation (incident 2026-08-05 → 2026-08-09): session start pushed a
 -- provisioning call from the api-server INTO the streaming box
 -- (`mediamtx_api_base_url`, tcp/19997). That inbound path depends on three
--- things that all broke at once when the box's Comcast lease rolled: a
+-- things that all broke at once when the box's WAN IP lease rolled: a
 -- current `ingest.upstreamcv.com` A record, a router port-forward, and a
 -- stable WAN IP. Every session start failed with
 -- `mediamtx_provision_failed / reason=transport status=None` for four days.

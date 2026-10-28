@@ -2,32 +2,25 @@
 
 Where this service runs in production and how to reach it. Keep this file in sync with reality — if you destroy or rebuild infra, update here in the same commit.
 
+The concrete inventory (AWS account, instance / security-group / Elastic IP IDs, SSH key, security-group rules) is kept in the team's private ops notes, not in git. Commands below use `<placeholders>` for those values.
+
 ## Current production target
 
 | Resource | Value |
 |---|---|
-| Cloud | AWS |
-| Region | `us-east-2` (Ohio) |
-| Account | `<aws-account-id>` |
-| Instance | `<instance-id>` (t4g.small, ARM64) |
-| AMI | `<ami-id>` — `al2023-ami-2023.11.20260509.0-kernel-6.1-arm64` |
-| Public IP (Elastic) | `<api-ip>` |
-| DNS (default) | `<ec2-public-dns>` |
-| Custom domain | `api.upstreamcv.com` → `<api-ip>` (A record) |
-| Availability zone | `us-east-2b` |
+| Cloud | AWS EC2, single instance |
+| Instance | t4g.small (ARM64), Amazon Linux 2023 |
+| Public IP | Elastic IP (`<api-ip>`) |
+| Custom domain | `api.upstreamcv.com` → the Elastic IP (A record) |
 | Root volume | 16 GiB gp3, encrypted, delete-on-termination |
-| Security group | `<security-group-id>` (`upstream-api-sg`): 22 / 80 / 443 from `0.0.0.0/0` |
-| Key pair (AWS) | `upstream-api` (ed25519) |
-| Key pair (local private) | `<ssh-key>` (mode 0400) |
-| Elastic IP allocation | `<eip-allocation-id>` |
-| Tags | `Name=upstream-api`, `Project=upstream` |
+| Instance metadata | IMDSv2 only |
 
 Estimated monthly cost: ~$13 (instance ~$12 + EBS ~$1.30 + EIP free while attached).
 
 ## SSH
 
 ```sh
-ssh -i <ssh-key> ec2-user@<api-ip>
+ssh -i <ssh-key> ec2-user@api.upstreamcv.com
 ```
 
 User is `ec2-user`. Password authentication is disabled by default on AL2023.
@@ -56,7 +49,7 @@ Not yet installed (planned):
 After `deploy/.env` has all real values (random secrets are pre-filled; Supabase values come from the dashboard):
 
 ```sh
-ssh -i <ssh-key> ec2-user@<api-ip>
+ssh -i <ssh-key> ec2-user@api.upstreamcv.com
 cd ~/upstream-api-server/deploy
 docker compose build api
 docker compose up -d
@@ -67,7 +60,7 @@ In a separate shell:
 
 ```sh
 # DNS check
-dig +short api.upstreamcv.com  # → <api-ip>
+dig +short api.upstreamcv.com  # → the Elastic IP
 
 # TLS cert is acquired automatically on the first https request
 curl -v https://api.upstreamcv.com/healthz
@@ -86,11 +79,11 @@ Caddy keeps running; only the `api` container restarts.
 
 ## Pointing a domain
 
-`api.upstreamcv.com` is currently pointed at `<api-ip>` via an A record. Until Caddy is installed on the box, that hostname will fail to connect on ports 80/443 — that's expected, not a DNS issue.
+`api.upstreamcv.com` is currently pointed at the instance's Elastic IP via an A record. Until Caddy is installed on the box, that hostname will fail to connect on ports 80/443 — that's expected, not a DNS issue.
 
 To verify DNS propagation:
 ```sh
-dig +short api.upstreamcv.com   # should return <api-ip>
+dig +short api.upstreamcv.com   # should return the Elastic IP
 ```
 
 When Caddy is set up, its Caddyfile will reference `api.upstreamcv.com` and Caddy will auto-fetch a Let's Encrypt cert on first request to port 80.
@@ -99,9 +92,10 @@ When Caddy is set up, its Caddyfile will reference `api.upstreamcv.com` and Cadd
 
 - The Elastic IP is what makes the public IP stable across stop/start cycles. **Do not release the EIP unless you also remove the DNS record** — otherwise the next account to allocate that IP could MITM your domain.
 - `HttpTokens=required` is set on the instance — IMDSv2-only. Old SDKs / SSRF probes that hit IMDSv1 will fail; this is intentional.
-- The account is currently signed in as the **root user**, which is an AWS antipattern. Follow-up: create an IAM user `upstream-deploy` with scoped permissions and rotate the credentials in `~/.aws/`.
 
 ## Destroying / rebuilding
+
+IDs come from the private ops notes.
 
 ```sh
 # Stop billing — keeps disk + EIP, can restart later
@@ -111,7 +105,7 @@ aws ec2 stop-instances --instance-ids <instance-id>
 aws ec2 terminate-instances --instance-ids <instance-id>
 aws ec2 release-address --allocation-id <eip-allocation-id>
 aws ec2 delete-security-group --group-id <security-group-id>
-aws ec2 delete-key-pair --key-name upstream-api
+aws ec2 delete-key-pair --key-name <key-pair-name>
 rm <ssh-key>
 ```
 

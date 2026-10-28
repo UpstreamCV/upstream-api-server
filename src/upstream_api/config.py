@@ -201,8 +201,8 @@ class Settings(BaseSettings):
     #       local MediaMTX, and acks. No inbound path, no dependency on the
     #       box's DNS record / port-forward / WAN IP.
     #
-    # Pull mode is what survives a residential lease roll — see the 2026-08-05
-    # incident, where a changed Comcast IP silently broke every session start
+    # Pull mode is what survives a WAN IP lease roll — see the 2026-08-05
+    # incident, where a changed WAN IP silently broke every session start
     # for four days. Default stays "push" so enabling it is a deliberate,
     # revertible env change rather than a deploy-time surprise.
     mediamtx_provisioning_mode: Literal["push", "pull"] = "push"

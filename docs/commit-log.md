@@ -4,6 +4,19 @@ Reverse chronological. Newest at top. Every meaningful commit gets an entry foll
 
 ---
 
+## 2026-10-27 — chore: public-release prep (license, infra identifiers out of tracked files)
+
+**Subject:** Prepare the repo for being made public: add an all-rights-reserved LICENSE and remove production infrastructure identifiers from tracked files. No behavior change.
+
+- `LICENSE` (new) — copyright Upstream Vision, Inc., all rights reserved; visible for reference only.
+- `docs/deployment.md` — the production inventory table (account, instance / AMI / security-group / Elastic IP IDs, key pair names, raw IPs) is replaced by a generic description; SSH and teardown commands use `api.upstreamcv.com` and `<placeholders>`. The concrete values now live in the team's private ops notes.
+- `docs/commit-log.md` — historical entries: raw API and ingest IPs, the SSH key path, and AWS resource IDs replaced with `<api-ip>`, `<ingest-ip>`, `<ssh-key>`, `<instance-id>`, `<security-group-id>`, `<eip-allocation-id>`; ISP name dropped.
+- `src/upstream_api/config.py`, `src/upstream_api/services/pull_provisioning.py`, `src/upstream_api/services/mediamtx_provisioning.py`, `supabase/migrations/20260810000000_pull_provisioning.sql` — comments and docstrings only: ISP-specific wording → "WAN IP lease", raw IP → `<api-server-ip>`.
+
+**Not covered:** git history still contains the removed values; that needs its own step before the repo goes public.
+
+**Tests:** none — comments, docs, and a new LICENSE file only.
+
 ## 2026-07-17 — dashboard: DB-backed coverage for the fleet-trend + summary SQL
 
 **Subject:** Close the coverage gap flagged in the 2026-07-16 recheck: `_FLEET_TREND_SQL` and the summary's `online_cameras` join had no automated test — `FakeConn` discards the query, so a mutation shipped green. Now the real query strings run against a real Postgres.
@@ -3575,7 +3588,7 @@ UPSTREAM_MEDIAMTX_BASE_URL=http://upstream-streaming-server:8889  # private netw
 ## 2026-05-14 - Default SRT ingest host to ingest.upstreamcv.com
 
 ### Summary
-DNS now points `ingest.upstreamcv.com` at `<ingest-ip>` (the same Comcast box running MediaMTX). Switching the API's default `srt_ingest_host` from the raw IP to the hostname removes the IP from agent-visible URLs and means the next time the streaming server moves boxes we just update DNS — no code commit, no API redeploy. Env-var override (`UPSTREAM_SRT_INGEST_HOST`) still works for dev/staging that point at a local IP.
+DNS now points `ingest.upstreamcv.com` at `<ingest-ip>` (the same box running MediaMTX). Switching the API's default `srt_ingest_host` from the raw IP to the hostname removes the IP from agent-visible URLs and means the next time the streaming server moves boxes we just update DNS — no code commit, no API redeploy. Env-var override (`UPSTREAM_SRT_INGEST_HOST`) still works for dev/staging that point at a local IP.
 
 ### Files touched
 - `src/upstream_api/config.py` — default `srt_ingest_host` flipped to `"ingest.upstreamcv.com"`.
@@ -3600,7 +3613,7 @@ uv run pytest tests/test_session_lifecycle.py::test_start_session_srt_url_uses_s
 ```
 
 ### Note on the streaming server's IP
-`<ingest-ip>` is a residential Comcast range. If it isn't actually static, DNS will go stale at the next lease rotation — set up a DDNS updater on the streaming-server box or pin a static IP through Comcast Business. UDP `18890` on that IP must continue to be forwarded to whichever host runs MediaMTX.
+`<ingest-ip>` is a dynamically assigned ISP address. If it isn't actually static, DNS will go stale at the next lease rotation — set up a DDNS updater on the streaming-server box or pin a static IP through the ISP. UDP `18890` on that IP must continue to be forwarded to whichever host runs MediaMTX.
 
 ---
 

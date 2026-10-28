@@ -17,7 +17,7 @@ Rationale for using the HTTP API instead of static YAML:
 Why no URL token:
 - The api-server reaches MediaMTX's HTTP API over the public internet
   (different physical hosts), but the streaming-server's `authHTTPExclude`
-  carves out `{action: api, ip: <api-ip>/32}` so MediaMTX accepts the
+  carves out `{action: api, ip: <api-server-ip>/32}` so MediaMTX accepts the
   api-server's calls without the authHTTP callback firing. Additionally,
   the host-level firewall on the streaming-server only allows TCP 9997
   from the api-server's Elastic IP. Two layers of network-gate; no need

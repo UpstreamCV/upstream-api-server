@@ -6,7 +6,7 @@ provisioning intent and lets the box collect it on its own outbound poll.
 
 Why this exists: the push path needs inbound reachability into the box's
 network — a live DNS record, a router port-forward, and a stable WAN IP. When
-the box's residential lease rolled on 2026-08-05 all three broke at once and
+the box's WAN IP lease rolled on 2026-08-05 all three broke at once and
 every session start failed `mediamtx_provision_failed / reason=transport
 status=None` until the DNS was corrected four days later. Nothing about that
 failure was visible to the box, which was healthy the whole time.
